@@ -439,7 +439,7 @@ steps:
     key: nightly-hunyuan-image-performance
     timeout_in_minutes: 300
     depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1"
+    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
       - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
