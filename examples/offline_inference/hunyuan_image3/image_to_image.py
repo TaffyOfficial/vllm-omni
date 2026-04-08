@@ -8,6 +8,8 @@ from PIL import Image
 
 from vllm_omni.entrypoints.omni import Omni
 
+from prompt_utils import build_prompt
+
 """
 HunyuanImage-3.0-Instruct Image-to-Image (IT2I / TI2I) example.
 
@@ -15,14 +17,9 @@ This uses a 2-stage pipeline:
   Stage 0 (AR): reads (image + edit instruction), generates CoT + latent tokens
   Stage 1 (DiT): denoises latents → edited image
 
-The unified system prompt enables <think> mode for reasoning before generation.
-See upstream README for details on prompt templates and bot_task modes.
+System prompt and <think>/<recaption> tags are auto-constructed by
+prompt_utils.build_prompt() based on --bot-task.
 """
-
-DEFAULT_SYSTEM_PROMPT = (
-    "You are an advanced multimodal model whose core mission is to "
-    "analyze user intent and generate high-quality text and images."
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +55,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to stage config YAML. Defaults to hunyuan_image3_it2i.yaml.",
     )
+    parser.add_argument(
+        "--bot-task",
+        type=str,
+        default="it2i_think",
+        choices=["it2i_think", "it2i_recaption"],
+        help="Prompt mode: it2i_think (CoT+recaption) or it2i_recaption (recaption only).",
+    )
     return parser.parse_args()
 
 
@@ -78,11 +82,8 @@ def main(args: argparse.Namespace) -> None:
         stage_configs_path=stage_configs_path,
     )
 
-    # Build IT2I prompt: system + <img> placeholder + edit instruction
-    prompt = (
-        f"<|startoftext|>{DEFAULT_SYSTEM_PROMPT}"
-        f"<img><think>{args.prompt}"
-    )
+    # Build IT2I prompt with auto-selected system prompt and mode tags
+    prompt = build_prompt(args.prompt, task=args.bot_task)
 
     input_image = load_image(args.image)
 

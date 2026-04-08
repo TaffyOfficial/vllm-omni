@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Smoke test for HunyuanImage-3.0 Image+Text-to-Image (IT2I) pipeline."""
 
+import sys
 from collections.abc import Generator
 from pathlib import Path
 
@@ -14,6 +15,10 @@ from vllm_omni import Omni
 MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 STAGE_CONFIG_PATH = REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "hunyuan_image3_it2i.yaml"
+
+# Allow importing prompt_utils from examples
+sys.path.insert(0, str(REPO_ROOT / "examples" / "offline_inference" / "hunyuan_image3"))
+from prompt_utils import build_prompt
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
 
@@ -63,11 +68,7 @@ def test_it2i_generates_image(omni: Omni) -> None:
     # Use a simple solid-color image as input (no external file dependency)
     input_image = Image.new("RGB", (512, 512), color=(200, 100, 50))
 
-    prompt = (
-        "<|startoftext|>You are an advanced multimodal model whose core "
-        "mission is to analyze user intent and generate high-quality text "
-        "and images.<img><think>Change the color to bright blue."
-    )
+    prompt = build_prompt("Change the color to bright blue.", task="it2i_think")
     prompt_dict = {
         "prompt": prompt,
         "modalities": ["image"],

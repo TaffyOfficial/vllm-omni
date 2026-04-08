@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Smoke test for HunyuanImage-3.0 Image-to-Text (I2T) pipeline."""
 
+import sys
 from collections.abc import Generator
 from pathlib import Path
 
@@ -13,6 +14,10 @@ from vllm_omni import Omni
 MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 STAGE_CONFIG_PATH = REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "hunyuan_image3_i2t.yaml"
+
+# Allow importing prompt_utils from examples
+sys.path.insert(0, str(REPO_ROOT / "examples" / "offline_inference" / "hunyuan_image3"))
+from prompt_utils import build_prompt
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
 
@@ -38,10 +43,7 @@ def test_i2t_generates_text(omni: Omni) -> None:
     from PIL import Image
     input_image = Image.new("RGB", (256, 256), color=(128, 200, 100))
 
-    prompt = (
-        "<|startoftext|>You are an assistant that understands images "
-        "and outputs text.<img>Describe the content of the picture."
-    )
+    prompt = build_prompt("Describe the content of the picture.", task="i2t")
     prompt_dict = {
         "prompt": prompt,
         "modalities": ["text"],
