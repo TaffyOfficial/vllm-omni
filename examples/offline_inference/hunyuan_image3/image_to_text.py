@@ -42,9 +42,10 @@ def parse_args() -> argparse.Namespace:
         help="Pretrain template prompt: <|startoftext|>{system}<img>{question}",
     )
     parser.add_argument(
-        "--enable-diffusion-pipeline-profiler",
-        action="store_true",
-        help="Enable diffusion pipeline profiler to display stage durations.",
+        "--stage-configs-path",
+        type=str,
+        default=None,
+        help="Path to stage config YAML. Defaults to auto-resolve hunyuan_image3_i2t.yaml.",
     )
     return parser.parse_args()
 
@@ -57,10 +58,10 @@ def load_image(image_path: str) -> Image.Image:
 
 
 def main(args: argparse.Namespace) -> None:
+    stage_configs_path = args.stage_configs_path or "vllm_omni/model_executor/stage_configs/hunyuan_image3_i2t.yaml"
     omni = Omni(
         model=args.model,
-        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
-        mode="image-to-text",
+        stage_configs_path=stage_configs_path,
     )
 
     prompt = "<|startoftext|>You are an assistant that understands images and outputs text.<img>" + args.prompt

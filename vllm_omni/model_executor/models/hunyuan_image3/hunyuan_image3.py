@@ -175,8 +175,11 @@ class HunyuanModel(HunYuanModel):
                     return True
             return False
 
+        skipped_unexpected: set[str] = set()
+
         for name, loaded_weight in weights:
             if contains_unexpected_keyword(name, unexpected_keywords):
+                skipped_unexpected.add(name)
                 continue
 
             if "rotary_emb.inv_freq" in name:
@@ -362,6 +365,17 @@ class HunyuanModel(HunYuanModel):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
+
+        if skipped_unexpected:
+            logger.warning_once(
+                "Skipped %d weights matching unexpected_keywords "
+                "(e.g. vae, vision_model, patch_embed, timestep_emb). "
+                "If upstream renamed components, these may be silently "
+                "lost. Skipped names: %s",
+                len(skipped_unexpected),
+                sorted(skipped_unexpected)[:10],
+            )
+
         return loaded_params
 
 
@@ -1199,6 +1213,10 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         else:
             self.lm_head = PPMissingLayer()
 
+        # --- AR-stage components ---
+        # These are needed for image encoding in the AR stage.
+        # If a future text-only stage is added, gate on vllm_config.model_config.model_stage.
+
         # vae
         self.vae = AutoencoderKLConv3D.from_config(config.vae)
         self.patch_embed = UNetDown(
@@ -1257,6 +1275,12 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             head_dim,
             rope_theta,
         )
+        if replaced == 0:
+            raise RuntimeError(
+                "HunyuanImage3: _replace_rotary_embeddings replaced 0 layers. "
+                "The custom interleaved 2D mRoPE is not active — model outputs "
+                "will be incorrect. Check that model.layers[*].self_attn.rotary_emb exists."
+            )
 
     def _parse_and_validate_image_input(
         self,

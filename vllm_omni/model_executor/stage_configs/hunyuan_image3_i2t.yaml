@@ -13,6 +13,8 @@ stage_args:
     runtime:
       process: true  # Run this stage in a separate process
       devices: "0,1,2,3,4,5,6,7"  # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
+      max_batch_size: 1
+      requires_multimodal_data: true  # AR needs the original image
     engine_args:
       model_stage: AR
       max_num_seqs: 1
@@ -22,7 +24,7 @@ stage_args:
       gpu_memory_utilization: 0.3
       enforce_eager: true  # Now we only support eager mode
       trust_remote_code: true
-      engine_output_type: latent
+
       enable_prefix_caching: false
       max_num_batched_tokens: 32768
       tensor_parallel_size: 8
