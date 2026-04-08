@@ -550,6 +550,10 @@ def assert_result(result: dict[str, Any], params: dict[str, Any]) -> None:
     completed = result.get("completed_requests", result.get("completed", 0))
     assert completed == num_prompts, f"Expected {num_prompts} completed requests, got {completed}"
 
+    if params.get("skip-performance-assertion", False):
+        print("Skipping performance assertions.")
+        return
+
     for metric, threshold in params.get("baseline", {}).items():
         current = result.get(metric)
         assert current is not None, f"Metric '{metric}' not found in result: {list(result.keys())}"

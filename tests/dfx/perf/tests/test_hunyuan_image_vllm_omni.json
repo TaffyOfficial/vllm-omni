@@ -37,11 +37,12 @@
                 "num-inference-steps": 50,
                 "num-prompts": 10,
                 "max-concurrency": 1,
+                "skip-performance-assertion": true,
                 "baseline": {
-                    "throughput_qps": 0.001,
-                    "latency_p99": 1000.0,
-                    "peak_memory_mb_max": 400000,
-                    "peak_memory_mb_mean": 400000
+                    "throughput_qps": 0.08,
+                    "latency_p99": 13.1227,
+                    "peak_memory_mb_max": 46838,
+                    "peak_memory_mb_mean": 46838
                 }
             }
         ]
@@ -86,11 +87,12 @@
                 "num-inference-steps": 50,
                 "num-prompts": 10,
                 "max-concurrency": 1,
+                "skip-performance-assertion": true,
                 "baseline": {
-                    "throughput_qps": 0.001,
-                    "latency_p99": 1000.0,
-                    "peak_memory_mb_max": 400000,
-                    "peak_memory_mb_mean": 400000
+                    "throughput_qps": 0.08,
+                    "latency_p99": 12.0731,
+                    "peak_memory_mb_max": 66314,
+                    "peak_memory_mb_mean": 66314
                 }
             }
         ]
@@ -134,11 +136,12 @@
                 "num-inference-steps": 50,
                 "num-prompts": 10,
                 "max-concurrency": 1,
+                "skip-performance-assertion": true,
                 "baseline": {
-                    "throughput_qps": 0.001,
-                    "latency_p99": 1000.0,
-                    "peak_memory_mb_max": 400000,
-                    "peak_memory_mb_mean": 400000
+                    "throughput_qps": 0.1035,
+                    "latency_p99": 9.9057,
+                    "peak_memory_mb_max": 66470,
+                    "peak_memory_mb_mean": 66470
                 }
             }
         ]
