@@ -1,6 +1,8 @@
 import sys
+from functools import cached_property
 
 from aenum import extend_enum
+from vllm.config import ModelConfig as _OriginalModelConfig
 from vllm.inputs import TokensPrompt as _OriginalTokensPrompt
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding as _OriginalMRotaryEmbedding,
@@ -16,6 +18,26 @@ from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEn
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
 from vllm_omni.request import OmniRequest
+
+# =============================================================================
+# Patch ModelConfig.is_mm_prefix_lm to support omni-specific models
+# =============================================================================
+# HunyuanImage-3.0 uses bidirectional attention for image token positions
+# (cond_token_attn_type: "joint_full" in config.json), but its model_type
+# "hunyuan_image_3_moe" is not in vllm's built-in MM_PREFIX_LM_MODELS list.
+# This patch extends the check to include omni-specific models.
+_OMNI_MM_PREFIX_LM_MODELS = ("hunyuan_image_3_moe",)
+_original_is_mm_prefix_lm = _OriginalModelConfig.is_mm_prefix_lm.func
+
+
+def _patched_is_mm_prefix_lm(self):
+    if _original_is_mm_prefix_lm(self):
+        return True
+    model_type = getattr(self.hf_config, "model_type", "")
+    return model_type in _OMNI_MM_PREFIX_LM_MODELS
+
+
+_OriginalModelConfig.is_mm_prefix_lm = cached_property(_patched_is_mm_prefix_lm)
 
 # =============================================================================
 # Patch GlmImageTextConfig to expose mrope_section in rope_parameters
