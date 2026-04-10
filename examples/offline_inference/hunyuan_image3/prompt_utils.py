@@ -26,6 +26,8 @@ from vllm_omni.diffusion.models.hunyuan_image3.system_prompt import (
 # task → (sys_type, bot_task, trigger_tag)
 # trigger_tag: "<think>", "<recaption>", or None
 _TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
+    # Pure text generation (text → text, no image)
+    "t2t": ("en_unified", None, None),
     # Image understanding (image → text)
     "i2t": ("en_unified", None, None),
     # Image editing (image+text → image), think+recaption mode

@@ -31,10 +31,11 @@ stage_args:
     is_comprehension: false  # Generation task, not comprehension
     final_output: false  # AR is not the final output
     default_sampling_params:
-      temperature: 1.0
+      temperature: 0.6
       top_p: 0.95
+      top_k: 1024
       max_tokens: 4096
-      seed: 42
+      stop_token_ids: [127957]  # <|endoftext|>
       detokenize: false
 
   # Stage 1: Diffusion (DiT + VAE)
@@ -66,9 +67,8 @@ stage_args:
     final_output: true
     final_output_type: image
     default_sampling_params:
-      seed: 42
       num_inference_steps: 50
-      guidance_scale: 7.5
+      guidance_scale: 2.5
 
 # Top-level runtime config
 runtime:

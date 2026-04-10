@@ -1,5 +1,6 @@
-# Stage config for HunyuanImage-3.0 Image-to-Text (I2T / image understanding).
-# Single LLM stage: AR model reads image + text prompt, generates text output.
+# Stage config for HunyuanImage-3.0 Text-to-Text (T2T / pure text generation).
+# Single LLM stage: AR model reads text prompt only, generates text output.
+# Sampling params aligned with official generation_config.json.
 
 stage_args:
   - stage_id: 0
@@ -8,7 +9,7 @@ stage_args:
       process: true
       devices: "2,3,4,5"
       max_batch_size: 1
-      requires_multimodal_data: true
+      requires_multimodal_data: false
     engine_args:
       model_stage: AR
       max_num_seqs: 1
