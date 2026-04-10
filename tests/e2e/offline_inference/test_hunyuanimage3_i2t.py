@@ -36,7 +36,7 @@ def omni() -> Generator[Omni, None, None]:
         engine.close()
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="Need at least 8 CUDA GPUs.")
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Need at least 4 CUDA GPUs.")
 def test_i2t_generates_text(omni: Omni) -> None:
     """Verify that the I2T pipeline produces non-empty text output."""
     # Use a simple solid-color image as input (no external file dependency)
