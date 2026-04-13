@@ -76,13 +76,10 @@ def build_prompt(
     parts = ["<|startoftext|>"]
     if sys_text:
         parts.append(sys_text)
-    # Instruct conversation template: \n\nUser: ... \n\nAssistant:
-    parts.append("\n\nUser: ")
     if has_image_input:
         parts.append("<img>")
-    parts.append(user_prompt)
-    parts.append("\n\nAssistant: ")
     if trigger_tag:
         parts.append(trigger_tag)
+    parts.append(user_prompt)
 
     return "".join(parts)

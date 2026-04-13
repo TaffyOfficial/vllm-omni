@@ -8,17 +8,13 @@ from PIL import Image
 
 from vllm_omni.entrypoints.omni import Omni
 
+from prompt_utils import build_prompt
+
 """
-The tencent/HunyuanImage-3.0-Instruct base model uses the tencent/Hunyuan-A13B-Instruct backbone. It utilizes two tokenizer delimiter templates:
+HunyuanImage-3.0-Instruct Image-to-Text (I2T) example.
 
-1) Pretrained template (default for gen_text mode), which concatenates system, image
-   tokens, and user question WITHOUT role delimiters:
-"<|startoftext|>{system_prompt}{image_tokens}{user_question}"
-
-   Example (before image token expansion):
-"<|startoftext|>You are an assistant that understands images and outputs text.<img>Describe the content of the picture."
-
-2) Instruct template, which uses explicit role prefixes and separators.
+System prompt is auto-selected by prompt_utils.build_prompt(task="i2t").
+Prompt format: <|startoftext|>{system_prompt}<img>{user_question}
 """
 
 
@@ -39,12 +35,13 @@ def parse_args() -> argparse.Namespace:
         "--prompt",
         type=str,
         required=True,
-        help="Pretrain template prompt: <|startoftext|>{system}<img>{question}",
+        help="Question about the image, e.g. 'Describe the content of the picture.'",
     )
     parser.add_argument(
-        "--enable-diffusion-pipeline-profiler",
-        action="store_true",
-        help="Enable diffusion pipeline profiler to display stage durations.",
+        "--stage-configs-path",
+        type=str,
+        default=None,
+        help="Path to stage config YAML. Defaults to auto-resolve hunyuan_image3_i2t.yaml.",
     )
     return parser.parse_args()
 
@@ -57,13 +54,13 @@ def load_image(image_path: str) -> Image.Image:
 
 
 def main(args: argparse.Namespace) -> None:
+    stage_configs_path = args.stage_configs_path or "vllm_omni/model_executor/stage_configs/hunyuan_image3_i2t.yaml"
     omni = Omni(
         model=args.model,
-        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
-        mode="image-to-text",
+        stage_configs_path=stage_configs_path,
     )
 
-    prompt = "<|startoftext|>You are an assistant that understands images and outputs text.<img>" + args.prompt
+    prompt = build_prompt(args.prompt, task="i2t")
 
     prompt_dict = {
         "prompt": prompt,
