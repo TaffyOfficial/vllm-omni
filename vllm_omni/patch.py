@@ -1,6 +1,8 @@
 import sys
+from functools import cached_property
 
 from aenum import extend_enum
+from vllm.config import ModelConfig as _OriginalModelConfig
 from vllm.inputs import TokensPrompt as _OriginalTokensPrompt
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding as _OriginalMRotaryEmbedding,
@@ -16,6 +18,38 @@ from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEn
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
 from vllm_omni.request import OmniRequest
+
+# =============================================================================
+# Patch ModelConfig.is_mm_prefix_lm to support omni-specific models
+# =============================================================================
+# HunyuanImage-3.0 uses bidirectional attention for image token positions
+# (cond_token_attn_type: "joint_full" in config.json), but its model_type
+# "hunyuan_image_3_moe" is not in vllm's built-in MM_PREFIX_LM_MODELS list.
+# This patch extends the check to include omni-specific models.
+_OMNI_MM_PREFIX_LM_MODELS = ("hunyuan_image_3_moe",)
+# Access via __dict__ to avoid triggering cached_property.__get__ which fails
+# with "Cannot use cached_property instance without calling __set_name__" in
+# pydantic dataclasses (vllm 0.19.0+).
+_cp = _OriginalModelConfig.__dict__["is_mm_prefix_lm"]
+_original_is_mm_prefix_lm = _cp.func if hasattr(_cp, "func") else _cp.fget
+
+
+def _patched_is_mm_prefix_lm(self):
+    if _original_is_mm_prefix_lm(self):
+        return True
+    model_type = getattr(self.hf_config, "model_type", "")
+    return model_type in _OMNI_MM_PREFIX_LM_MODELS
+
+
+_patched_cp = cached_property(_patched_is_mm_prefix_lm)
+_patched_cp.__set_name__(_OriginalModelConfig, "is_mm_prefix_lm")
+_OriginalModelConfig.is_mm_prefix_lm = _patched_cp
+
+# Also fix the original cached_property if __set_name__ was never called (vllm 0.19.0+)
+_orig_cp = _OriginalModelConfig.__dict__.get("is_mm_prefix_lm")
+if _orig_cp is not _patched_cp:
+    # Our assignment above should have replaced it, but just in case
+    pass
 
 # =============================================================================
 # Patch GlmImageTextConfig to expose mrope_section in rope_parameters
