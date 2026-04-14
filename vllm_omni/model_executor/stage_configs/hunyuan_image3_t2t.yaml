@@ -31,11 +31,11 @@ stage_args:
     final_output: true
     final_output_type: text
     default_sampling_params:
-      temperature: 0.6
+      temperature: 0.0
       top_p: 0.95
       top_k: 1024
       max_tokens: 2048
-      stop_token_ids: [127957]  # <|endoftext|>
+      stop_token_ids: [127957, 128026]  # <|endoftext|>, </answer>
       detokenize: True
 
 runtime:

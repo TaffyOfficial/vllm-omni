@@ -76,9 +76,12 @@ def ar2diffusion(
         text_prompt = original_prompt.get("prompt", "")
 
         logger.info(
-            "[ar2diffusion] Request %d: AR generated %d tokens, "
-            "text length=%d, target size=%dx%d",
-            i, len(generated_token_ids), len(generated_text), height, width,
+            "[ar2diffusion] Request %d: AR generated %d tokens, text length=%d, target size=%dx%d",
+            i,
+            len(generated_token_ids),
+            len(generated_text),
+            height,
+            width,
         )
 
         token_tensor = torch.tensor(generated_token_ids, dtype=torch.long)
@@ -111,8 +114,7 @@ def ar2diffusion(
                 diffusion_input["extra"]["ar_multimodal_output"] = mm_output
 
         # Forward sampling params
-        for key in ["seed", "num_inference_steps", "guidance_scale",
-                     "negative_prompt"]:
+        for key in ["seed", "num_inference_steps", "guidance_scale", "negative_prompt"]:
             if key in original_prompt:
                 diffusion_input[key] = original_prompt[key]
 

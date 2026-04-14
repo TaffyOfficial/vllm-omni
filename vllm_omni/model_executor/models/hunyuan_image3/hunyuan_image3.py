@@ -1256,18 +1256,14 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self._answer_id = tokenizer.convert_tokens_to_ids("<answer>")
         self._end_of_answer_id = tokenizer.convert_tokens_to_ids("</answer>")
         image_base_size = getattr(config, "image_base_size", 1024)
-        self._size_token_id = tokenizer.convert_tokens_to_ids(
-            f"<img_size_{image_base_size}>"
-        )
+        self._size_token_id = tokenizer.convert_tokens_to_ids(f"<img_size_{image_base_size}>")
         self._start_ratio_id = tokenizer.convert_tokens_to_ids("<img_ratio_0>")
         self._end_ratio_id = tokenizer.convert_tokens_to_ids("<img_ratio_32>")
         ratio_33 = tokenizer.convert_tokens_to_ids("<img_ratio_33>")
         ratio_36 = tokenizer.convert_tokens_to_ids("<img_ratio_36>")
         self._ratio_other_slices = [(ratio_33, ratio_36 + 1)]
         # Build the full set of ratio token IDs for use as stop tokens.
-        self._all_ratio_ids = set(
-            range(self._start_ratio_id, self._end_ratio_id + 1)
-        )
+        self._all_ratio_ids = set(range(self._start_ratio_id, self._end_ratio_id + 1))
         for s, e in self._ratio_other_slices:
             self._all_ratio_ids.update(range(s, e))
 
@@ -1276,21 +1272,22 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self._transition_state: dict[int, tuple[list[int], set[int]]] = {}
 
         # Determine mode: comprehension (I2T/T2T) vs generation (IT2I/T2I).
-        engine_output_type = getattr(
-            vllm_config.model_config, "engine_output_type", None
-        )
+        engine_output_type = getattr(vllm_config.model_config, "engine_output_type", None)
         self._is_comprehension = engine_output_type in (None, "text")
 
-        # For comprehension mode, block generation-specific special tokens.
+        # For comprehension mode, block image generation tokens but allow
+        # text structure tokens (<think>, <answer>, etc.) so the model can
+        # follow its natural generation pattern. Stop tokens in YAML will
+        # terminate at </answer> or EOS.
         self._blocked_token_ids: set[int] = set()
         if self._is_comprehension:
-            self._blocked_token_ids.update([
-                self._mrope_boi_token_id,    # <boi>
-                self._mrope_eoi_token_id,    # <eoi>
-                self._size_token_id,         # <img_size_*>
-                self._answer_id,             # <answer>
-                self._end_of_answer_id,      # </answer>
-            ])
+            self._blocked_token_ids.update(
+                [
+                    self._mrope_boi_token_id,  # <boi>
+                    self._mrope_eoi_token_id,  # <eoi>
+                    self._size_token_id,  # <img_size_*>
+                ]
+            )
             self._blocked_token_ids.update(self._all_ratio_ids)
 
         # For generation mode, build stage transition map.
@@ -1597,9 +1594,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         for req_idx in range(logits.shape[0]):
             decoded_tokens: list[int] = (
-                sampling_metadata.output_token_ids[req_idx]
-                if req_idx < len(sampling_metadata.output_token_ids)
-                else []
+                sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
             )
             last_token = decoded_tokens[-1] if decoded_tokens else -1
 
@@ -1609,14 +1604,10 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                     logits[req_idx, tid] = min_score
             else:
                 # Generation: apply stage-transition logic.
-                self._apply_stage_transition(
-                    logits, req_idx, last_token, min_score
-                )
+                self._apply_stage_transition(logits, req_idx, last_token, min_score)
                 # After size token → restrict to ratio tokens.
                 if last_token == self._size_token_id:
-                    self._apply_ratio_restriction(
-                        logits, req_idx, min_score
-                    )
+                    self._apply_ratio_restriction(logits, req_idx, min_score)
                 # After ratio token → force EOS (official uses ratio as
                 # final_stop_tokens; vLLM stop_token_ids may not include
                 # all ratio IDs, so we force EOS here).
@@ -1624,9 +1615,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                     logits[req_idx].fill_(min_score)
                     logits[req_idx, self._eos_token_id] = 0
 
-        return self._sampler(
-            logits=logits, sampling_metadata=sampling_metadata
-        )
+        return self._sampler(logits=logits, sampling_metadata=sampling_metadata)
 
     def _apply_stage_transition(
         self,
@@ -1653,10 +1642,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             return
 
         # Check if last_token triggers a new transition.
-        if (
-            last_token in self._stage_transitions
-            and last_token not in completed
-        ):
+        if last_token in self._stage_transitions and last_token not in completed:
             completed.add(last_token)
             next_tokens = self._stage_transitions[last_token]
             if next_tokens:
@@ -1677,9 +1663,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         original = logits[req_idx].clone()
         logits[req_idx].fill_(min_score)
         # Allow primary ratio range.
-        logits[req_idx, self._start_ratio_id : self._end_ratio_id + 1] = (
-            original[self._start_ratio_id : self._end_ratio_id + 1]
-        )
+        logits[req_idx, self._start_ratio_id : self._end_ratio_id + 1] = original[
+            self._start_ratio_id : self._end_ratio_id + 1
+        ]
         # Allow extra ratio slices.
         for s, e in self._ratio_other_slices:
             logits[req_idx, s:e] = original[s:e]
