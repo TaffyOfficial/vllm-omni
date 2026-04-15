@@ -22,10 +22,25 @@ from vllm_omni.request import OmniRequest
 # =============================================================================
 # Patch ModelConfig.is_mm_prefix_lm to support omni-specific models
 # =============================================================================
-# HunyuanImage-3.0 uses bidirectional attention for image token positions
-# (cond_token_attn_type: "joint_full" in config.json), but its model_type
-# "hunyuan_image_3_moe" is not in vllm's built-in MM_PREFIX_LM_MODELS list.
-# This patch extends the check to include omni-specific models.
+# WHY: HunyuanImage-3.0 requires bidirectional attention for image tokens
+# (cond_token_attn_type: "joint_full" in config.json). vLLM gates this on
+# is_mm_prefix_lm, which checks an internal MM_PREFIX_LM_MODELS list that
+# does not include "hunyuan_image_3_moe" (the upstream HF model_type).
+#
+# WHY NOT model-level: is_mm_prefix_lm is checked in vLLM core (scheduler,
+# attention backend selection) before model code runs — no model-level hook.
+#
+# SCOPE: Only affects model_type in _OMNI_MM_PREFIX_LM_MODELS (currently
+# just "hunyuan_image_3_moe"). All other models fall through to the
+# original vLLM implementation unchanged.
+#
+# FRAGILITY: Relies on is_mm_prefix_lm being a cached_property on
+# ModelConfig. The __dict__ access + __set_name__ dance works around a
+# pydantic dataclass issue in vllm 0.19.0+. If vLLM changes
+# is_mm_prefix_lm to a regular method or removes it, this will break.
+#
+# TODO: Upstream a configurable MM_PREFIX_LM_MODELS or a model_config flag
+# so this patch can be removed.
 _OMNI_MM_PREFIX_LM_MODELS = ("hunyuan_image_3_moe",)
 # Access via __dict__ to avoid triggering cached_property.__get__ which fails
 # with "Cannot use cached_property instance without calling __set_name__" in

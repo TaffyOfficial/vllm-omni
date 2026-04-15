@@ -1267,10 +1267,6 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         for s, e in self._ratio_other_slices:
             self._all_ratio_ids.update(range(s, e))
 
-        # Per-request state for stage-transition logits processor.
-        # Maps request index → (pending_tokens list, completed set).
-        self._transition_state: dict[int, tuple[list[int], set[int]]] = {}
-
         # Determine mode: comprehension (I2T/T2T) vs generation (IT2I/T2I).
         engine_output_type = getattr(vllm_config.model_config, "engine_output_type", None)
         self._is_comprehension = engine_output_type in (None, "text")
@@ -1294,6 +1290,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # Official logic: </think> → [<recaption>],
         #   </recaption> → [<answer>, <boi>, <img_size_*>]
         # After <img_size_*>, restrict vocab to ratio tokens only.
+        # Stage-transition forced sequences, keyed by trigger token.
         self._stage_transitions: dict[int, list[int]] = {}
         if not self._is_comprehension:
             self._stage_transitions[self._end_of_think_id] = [
@@ -1598,60 +1595,51 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             )
             last_token = decoded_tokens[-1] if decoded_tokens else -1
 
-            if not decoded_tokens:
-                self._clear_transition_state(req_idx)
-
             if self._is_comprehension:
-                # Comprehension: mask out generation-specific tokens.
                 for tid in self._blocked_token_ids:
                     logits[req_idx, tid] = min_score
             else:
-                # Generation: apply stage-transition logic.
-                self._apply_stage_transition(logits, req_idx, last_token, min_score)
-                # After size token → restrict to ratio tokens.
-                if last_token == self._size_token_id:
+                forced = self._get_forced_token(decoded_tokens)
+                if forced is not None:
+                    logits[req_idx].fill_(min_score)
+                    logits[req_idx, forced] = 0
+                elif last_token == self._size_token_id:
                     self._apply_ratio_restriction(logits, req_idx, min_score)
-                # After ratio token → force EOS (official uses ratio as
-                # final_stop_tokens; vLLM stop_token_ids may not include
-                # all ratio IDs, so we force EOS here).
                 elif last_token in self._all_ratio_ids:
                     logits[req_idx].fill_(min_score)
                     logits[req_idx, self._eos_token_id] = 0
 
         return self._sampler(logits=logits, sampling_metadata=sampling_metadata)
 
-    def _apply_stage_transition(
-        self,
-        logits: torch.Tensor,
-        req_idx: int,
-        last_token: int,
-        min_score: float,
-    ) -> None:
-        """Port of official _StageTransitionLogitsProcessor.__call__."""
-        state = self._transition_state.get(req_idx)
-        if state is None:
-            state = ([], set())  # (pending_tokens, completed_transitions)
-            self._transition_state[req_idx] = state
-        pending, completed = state
+    def _get_forced_token(self, decoded_tokens: list[int]) -> int | None:
+        """Derive the next forced token from output history (stateless).
 
-        # Consume pending token if last output matches head of queue.
-        if pending and last_token == pending[0]:
-            pending.pop(0)
+        Scans decoded_tokens backwards for the most recent trigger token,
+        then prefix-matches the forced sequence against what followed.
+        Returns the next token to force, or None if the sequence is complete
+        or history has diverged from the expected forced sequence.
+        """
+        for i in range(len(decoded_tokens) - 1, -1, -1):
+            trigger = decoded_tokens[i]
+            if trigger not in self._stage_transitions:
+                continue
 
-        # If pending tokens remain, force the next one.
-        if pending:
-            logits[req_idx].fill_(min_score)
-            logits[req_idx, pending[0]] = 0
-            return
+            forced_seq = self._stage_transitions[trigger]
+            emitted = decoded_tokens[i + 1 :]
 
-        # Check if last_token triggers a new transition.
-        if last_token in self._stage_transitions and last_token not in completed:
-            completed.add(last_token)
-            next_tokens = self._stage_transitions[last_token]
-            if next_tokens:
-                pending.extend(next_tokens)
-                logits[req_idx].fill_(min_score)
-                logits[req_idx, pending[0]] = 0
+            matched = 0
+            for expected, actual in zip(forced_seq, emitted):
+                if actual != expected:
+                    # History diverged from the expected forced sequence.
+                    # Stop applying transition forcing for safety.
+                    return None
+                matched += 1
+
+            if matched < len(forced_seq):
+                return forced_seq[matched]
+            return None
+
+        return None
 
     def _apply_ratio_restriction(
         self,
@@ -1676,10 +1664,6 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         max_id = logits[req_idx].argmax().item()
         logits[req_idx].fill_(min_score)
         logits[req_idx, max_id] = 0
-
-    def _clear_transition_state(self, req_idx: int) -> None:
-        """Clean up per-request transition state when request finishes."""
-        self._transition_state.pop(req_idx, None)
 
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device

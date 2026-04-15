@@ -6,7 +6,7 @@ stage_args:
     stage_type: llm
     runtime:
       process: true
-      devices: "2,3,4,5"
+      devices: "0,1,2,3"
       max_batch_size: 1
       requires_multimodal_data: true
     engine_args:
