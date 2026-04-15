@@ -1306,7 +1306,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             ]
 
         self._sampler: Sampler | None = None
-        self._eos_token_id: int = 127957  # <|endoftext|>
+        self._eos_token_id: int = tokenizer.eos_token_id
 
         self._replace_rotary_embeddings()
 
@@ -1597,6 +1597,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
             )
             last_token = decoded_tokens[-1] if decoded_tokens else -1
+
+            if not decoded_tokens:
+                self._clear_transition_state(req_idx)
 
             if self._is_comprehension:
                 # Comprehension: mask out generation-specific tokens.

@@ -45,12 +45,6 @@ _patched_cp = cached_property(_patched_is_mm_prefix_lm)
 _patched_cp.__set_name__(_OriginalModelConfig, "is_mm_prefix_lm")
 _OriginalModelConfig.is_mm_prefix_lm = _patched_cp
 
-# Also fix the original cached_property if __set_name__ was never called (vllm 0.19.0+)
-_orig_cp = _OriginalModelConfig.__dict__.get("is_mm_prefix_lm")
-if _orig_cp is not _patched_cp:
-    # Our assignment above should have replaced it, but just in case
-    pass
-
 # =============================================================================
 # Patch GlmImageTextConfig to expose mrope_section in rope_parameters
 # =============================================================================
