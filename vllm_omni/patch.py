@@ -60,6 +60,15 @@ _patched_cp = cached_property(_patched_is_mm_prefix_lm)
 _patched_cp.__set_name__(_OriginalModelConfig, "is_mm_prefix_lm")
 _OriginalModelConfig.is_mm_prefix_lm = _patched_cp
 
+# Sanity check: verify the patch is active. If vLLM changes the descriptor
+# type or __set_name__ semantics, this will fail loudly at import time
+# rather than silently falling back to unpatched behavior.
+_installed = _OriginalModelConfig.__dict__.get("is_mm_prefix_lm")
+assert _installed is _patched_cp, (
+    "is_mm_prefix_lm patch failed to install — bidirectional attention "
+    "for HunyuanImage3 will not work. Check vLLM ModelConfig changes."
+)
+
 # =============================================================================
 # Patch GlmImageTextConfig to expose mrope_section in rope_parameters
 # =============================================================================
