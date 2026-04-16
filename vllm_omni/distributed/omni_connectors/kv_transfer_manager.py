@@ -14,7 +14,7 @@ from vllm.logger import init_logger
 
 from .factory import OmniConnectorFactory
 from .utils.config import ConnectorSpec
-from .utils.initialization import KV_TRANSFER_PORT_OFFSET
+from .utils.initialization import KV_RANK_PORT_STRIDE, KV_TRANSFER_PORT_OFFSET
 from .utils.kv_utils import normalize_layer_kv
 
 logger = init_logger(__name__)
@@ -417,21 +417,37 @@ class OmniKVTransferManager:
                         )
                         c_extra["to_stage"] = str(self.config.to_stage) if self.config.to_stage is not None else "1"
 
+                        # Get TP rank for unique port assignment per worker
+                        tp_rank = 0
+                        try:
+                            from vllm.distributed import get_tensor_model_parallel_rank
+                            tp_rank = get_tensor_model_parallel_rank()
+                        except Exception:
+                            pass
+
                         if self.config.need_send_cache:
                             c_extra["role"] = "sender"
                             from_stage = self.config.from_stage
                             if from_stage is not None:
                                 try:
-                                    c_extra["zmq_port"] = base_port + KV_TRANSFER_PORT_OFFSET + int(from_stage)
+                                    c_extra["zmq_port"] = (
+                                        base_port + KV_TRANSFER_PORT_OFFSET
+                                        + int(from_stage)
+                                        + tp_rank * KV_RANK_PORT_STRIDE
+                                    )
                                 except (TypeError, ValueError):
-                                    c_extra["zmq_port"] = base_port + KV_TRANSFER_PORT_OFFSET
+                                    c_extra["zmq_port"] = base_port + KV_TRANSFER_PORT_OFFSET + tp_rank * KV_RANK_PORT_STRIDE
                         elif self.config.need_recv_cache:
                             c_extra["role"] = "receiver"
                             from_stage = self.config.from_stage
                             sender_port = base_port + KV_TRANSFER_PORT_OFFSET
                             if from_stage is not None:
                                 try:
-                                    sender_port = base_port + KV_TRANSFER_PORT_OFFSET + int(from_stage)
+                                    sender_port = (
+                                        base_port + KV_TRANSFER_PORT_OFFSET
+                                        + int(from_stage)
+                                        + tp_rank * KV_RANK_PORT_STRIDE
+                                    )
                                 except (TypeError, ValueError):
                                     pass
                             c_extra.setdefault("sender_host", c_extra.get("host", "127.0.0.1"))
