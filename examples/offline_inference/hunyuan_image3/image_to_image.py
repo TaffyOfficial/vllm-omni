@@ -3,6 +3,7 @@
 
 import argparse
 import os
+from pathlib import Path
 
 from PIL import Image
 
@@ -20,6 +21,9 @@ This uses a 2-stage pipeline:
 System prompt and <think>/<recaption> tags are auto-constructed by
 prompt_utils.build_prompt() based on --bot-task.
 """
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_STAGE_CONFIG = REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "hunyuan_image3_it2i.yaml"
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,10 +77,7 @@ def load_image(image_path: str) -> Image.Image:
 
 
 def main(args: argparse.Namespace) -> None:
-    stage_configs_path = (
-        args.stage_configs_path
-        or "vllm_omni/model_executor/stage_configs/hunyuan_image3_it2i.yaml"
-    )
+    stage_configs_path = args.stage_configs_path or str(DEFAULT_STAGE_CONFIG)
     omni = Omni(
         model=args.model,
         stage_configs_path=stage_configs_path,

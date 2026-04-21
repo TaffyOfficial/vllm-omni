@@ -3,6 +3,7 @@
 
 import argparse
 import os
+from pathlib import Path
 
 from PIL import Image
 
@@ -14,8 +15,12 @@ from prompt_utils import build_prompt
 HunyuanImage-3.0-Instruct Image-to-Text (I2T) example.
 
 System prompt is auto-selected by prompt_utils.build_prompt(task="i2t").
-Prompt format: <|startoftext|>{system_prompt}<img>{user_question}
+Prompt format (pretrain template):
+  <|startoftext|>{system_prompt}<img>{trigger_tag}{user_prompt}
 """
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_STAGE_CONFIG = REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "hunyuan_image3_i2t.yaml"
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,7 +59,7 @@ def load_image(image_path: str) -> Image.Image:
 
 
 def main(args: argparse.Namespace) -> None:
-    stage_configs_path = args.stage_configs_path or "vllm_omni/model_executor/stage_configs/hunyuan_image3_i2t.yaml"
+    stage_configs_path = args.stage_configs_path or str(DEFAULT_STAGE_CONFIG)
     omni = Omni(
         model=args.model,
         stage_configs_path=stage_configs_path,
@@ -78,8 +83,10 @@ def main(args: argparse.Namespace) -> None:
     prompts = [prompt_dict]
     omni_outputs = omni.generate(prompts=prompts)
 
-    prompt_text = omni_outputs[0].request_output.prompt
-    generated_text = omni_outputs[0].request_output.outputs[0].text
+    first_output = omni_outputs[0]
+    request_output = getattr(first_output, "request_output", first_output)
+    prompt_text = request_output.prompt
+    generated_text = request_output.outputs[0].text
     print(f"Prompt: {prompt_text}")
     print(f"Text: {generated_text}")
 

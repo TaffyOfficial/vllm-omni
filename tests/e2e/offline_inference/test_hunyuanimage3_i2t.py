@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ruff: noqa: E402
 """Smoke test for HunyuanImage-3.0 Image-to-Text (I2T) pipeline."""
 
 import sys

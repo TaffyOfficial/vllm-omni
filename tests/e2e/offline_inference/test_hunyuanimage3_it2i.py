@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ruff: noqa: E402
 """Smoke test for HunyuanImage-3.0 Image+Text-to-Image (IT2I) pipeline."""
 
 import sys
@@ -62,7 +63,7 @@ def _extract_generated_image(outputs: list[object]) -> Image.Image:
     raise AssertionError("No generated image found in Omni output")
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Need at least 4 CUDA GPUs.")
+@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="Need at least 8 CUDA GPUs.")
 def test_it2i_generates_image(omni: Omni) -> None:
     """Verify that the IT2I pipeline produces a PIL Image output."""
     # Use a simple solid-color image as input (no external file dependency)
