@@ -437,6 +437,32 @@ class LocalJudgeClient:
             f"{task_prompt}"
         )
 
+    def _build_t2i_scoring_prompt(self, task_prompt: str) -> str:
+        return (
+            "You are an expert evaluator for text-to-image generation quality.\n"
+            "Evaluate the single generated image against the given instruction.\n\n"
+            "Score these five dimensions from 0 to 5:\n"
+            "- goal: whether the image content matches the instruction accurately\n"
+            "- logic: whether objects, relationships and composition are correct\n"
+            "- cons: whether colors, style and lighting are internally consistent\n"
+            "- ui: whether the overall visual layout and structure looks realistic\n"
+            "- qual: whether the image is visually sharp and artifact-free\n\n"
+            "Be strict: only give 5 if the image is excellent in that dimension. "
+            "Give 3 for acceptable, 1-2 for poor, 0 for completely wrong.\n\n"
+            "Return JSON only. Do not add any prose outside JSON.\n"
+            "Use exactly this schema:\n"
+            "{\n"
+            '  "goal": 0,\n'
+            '  "logic": 0,\n'
+            '  "cons": 0,\n'
+            '  "ui": 0,\n'
+            '  "qual": 0,\n'
+            '  "reasoning": "short explanation"\n'
+            "}\n\n"
+            "Scoring task:\n"
+            f"{task_prompt}"
+        )
+
     def _request_text(self, prompt: str, images: list[Image.Image]) -> str:
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for image in images:
@@ -461,14 +487,15 @@ class LocalJudgeClient:
             return "\n".join(part.get("text", "") for part in message_content if part.get("type") == "text")
         return str(message_content)
 
-    def evaluate(self, *, prompt: str, images: list[Image.Image]) -> dict[str, Any]:
-        primary_prompt = self._build_scoring_prompt(prompt)
+    def evaluate(self, *, prompt: str, images: list[Image.Image], t2i_mode: bool = False) -> dict[str, Any]:
+        build = self._build_t2i_scoring_prompt if t2i_mode else self._build_scoring_prompt
+        primary_prompt = build(prompt)
         text = self._request_text(primary_prompt, images)
         try:
             return extract_json_object(text)
         except ValueError:
             retry_prompt = (
-                self._build_scoring_prompt(prompt) + "\n\nYour previous response was not valid JSON. "
+                build(prompt) + "\n\nYour previous response was not valid JSON. "
                 "Return only the JSON object with integer scores."
             )
             retry_text = self._request_text(retry_prompt, images)
@@ -500,6 +527,7 @@ class GEBenchRunner:
         output_compression: int | None = 98,
         guidance_scale: float | None = None,
         seed: int | None = 42,
+        t2i_only: bool = False,
     ):
         self.dataset_root = dataset_root
         self.output_root = output_root
@@ -510,6 +538,7 @@ class GEBenchRunner:
         self.output_compression = output_compression
         self.guidance_scale = guidance_scale
         self.seed = seed
+        self.t2i_only = t2i_only
         self.client = VllmOmniImageClient(base_url=base_url, api_key=api_key)
 
     def generate(
@@ -544,6 +573,8 @@ class GEBenchRunner:
         return results
 
     def _generate_one(self, data_type: str, sample_spec: GEBenchSampleSpec) -> dict[str, Any] | None:
+        if self.t2i_only and data_type not in {"type3", "type4"}:
+            return None
         sample_path = sample_spec.sample_path
         metadata = sample_spec.metadata
         lang_device = sample_spec.lang_device
@@ -635,6 +666,13 @@ class GEBenchRunner:
                 )
                 save_image(frame0_path, previous)
 
+            if self.t2i_only:
+                return {
+                    "data_type": data_type,
+                    "sample_name": f"{lang_device}/{sample_name}",
+                    "output_path": str(frame0_path),
+                }
+
             for step_num in range(1, 6):
                 frame_path = output_dir / f"frame{step_num}.png"
                 if frame_path.exists():
@@ -696,10 +734,11 @@ class GEBenchRunner:
 
 
 class GEBenchEvaluator:
-    def __init__(self, *, dataset_root: Path, output_root: Path, judge: LocalJudgeClient):
+    def __init__(self, *, dataset_root: Path, output_root: Path, judge: LocalJudgeClient, t2i_only: bool = False):
         self.dataset_root = dataset_root
         self.output_root = output_root
         self.judge = judge
+        self.t2i_only = t2i_only
 
     def evaluate(
         self,
@@ -783,13 +822,33 @@ class GEBenchEvaluator:
                 images=judge_images,
             )
         elif data_type in {"type3", "type4"}:
-            frames = [Image.open(sample_dir / f"frame{i}.png").convert("RGB") for i in range(6)]
-            instruction = _text_or_default(metadata.get("instruction") or metadata.get("caption"), "Complete the task.")
-            prompt_suffix, judge_images = _trajectory_judge_payload(frames)
-            raw_scores = self.judge.evaluate(
-                prompt=f"Evaluate a six-frame GUI trajectory.\nInstruction: {instruction}\n{prompt_suffix}",
-                images=judge_images,
-            )
+            if self.t2i_only:
+                frame0_path = sample_dir / "frame0.png"
+                if not frame0_path.exists():
+                    return None
+                generated = Image.open(frame0_path).convert("RGB")
+                instruction = _text_or_default(
+                    metadata.get("instruction") or metadata.get("caption"), "Generate an image."
+                )
+                raw_scores = self.judge.evaluate(
+                    prompt=(
+                        f"Evaluate the quality of this generated image.\n"
+                        f"Instruction: {instruction}\n"
+                        f"Rate how well the image matches the instruction."
+                    ),
+                    images=[generated],
+                    t2i_mode=True,
+                )
+            else:
+                frames = [Image.open(sample_dir / f"frame{i}.png").convert("RGB") for i in range(6)]
+                instruction = _text_or_default(
+                    metadata.get("instruction") or metadata.get("caption"), "Complete the task."
+                )
+                prompt_suffix, judge_images = _trajectory_judge_payload(frames)
+                raw_scores = self.judge.evaluate(
+                    prompt=f"Evaluate a six-frame GUI trajectory.\nInstruction: {instruction}\n{prompt_suffix}",
+                    images=judge_images,
+                )
         elif data_type == "type5":
             source = _resolve_referenced_image(
                 metadata=metadata, sample_path=dataset_sample, dataset_root=self.dataset_root, data_type=data_type
@@ -836,6 +895,12 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--workers", type=int, default=1)
     generate.add_argument("--max-samples", type=int, default=None)
     generate.add_argument("--samples-per-type", type=int, default=None)
+    generate.add_argument(
+        "--t2i-only",
+        action="store_true",
+        default=False,
+        help="Only generate T2I frame0 for type3/type4, skip IT2I edits and type1/2/5",
+    )
 
     evaluate = subparsers.add_parser("evaluate")
     evaluate.add_argument("--dataset-root", type=Path, required=True)
@@ -847,6 +912,12 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--workers", type=int, default=1)
     evaluate.add_argument("--max-samples", type=int, default=None)
     evaluate.add_argument("--samples-per-type", type=int, default=None)
+    evaluate.add_argument(
+        "--t2i-only",
+        action="store_true",
+        default=False,
+        help="Only evaluate frame0 for type3/type4 (matches --t2i-only in generate)",
+    )
 
     summarize = subparsers.add_parser("summarize")
     summarize.add_argument("--output-root", type=Path, required=True)
@@ -871,6 +942,7 @@ def main(argv: list[str] | None = None) -> int:
             output_compression=args.output_compression,
             guidance_scale=args.guidance_scale,
             seed=args.seed,
+            t2i_only=args.t2i_only,
         )
         records: list[dict[str, Any]] = []
         for data_type in _data_types_arg(args.data_type):
@@ -892,7 +964,9 @@ def main(argv: list[str] | None = None) -> int:
             api_key=args.judge_api_key,
             model=args.judge_model,
         )
-        evaluator = GEBenchEvaluator(dataset_root=args.dataset_root, output_root=args.output_root, judge=judge)
+        evaluator = GEBenchEvaluator(
+            dataset_root=args.dataset_root, output_root=args.output_root, judge=judge, t2i_only=args.t2i_only
+        )
         combined_results: list[dict[str, Any]] = []
         for data_type in _data_types_arg(args.data_type):
             payload = evaluator.evaluate(
