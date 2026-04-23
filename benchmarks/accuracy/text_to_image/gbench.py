@@ -116,10 +116,8 @@ def collect_gebench_generation_summary(output_root: Path) -> dict[str, Any]:
         for lang_dir in sorted(path for path in type_root.iterdir() if path.is_dir()):
             for sample_dir in sorted(path for path in lang_dir.iterdir() if path.is_dir()):
                 expected = sample_dir / "frame5.png" if data_type in {"type2", "type3", "type4"} else None
-                if expected is None:
+                if expected is None or not expected.exists():
                     expected = find_first_image(sample_dir)
-                elif not expected.exists():
-                    expected = None
                 if expected is None:
                     continue
                 records.append(
