@@ -435,7 +435,7 @@ steps:
           # Generate (4 GPUs, TP=4+EP) and judge (1 GPU) run sequentially via fixture
           # context managers — judge GPU 0 is reused after generate teardown.
           - export VLLM_TEST_CLEAN_GPU_MEMORY="1"
-          - pytest -s -v tests/e2e/accuracy/test_gebench_h100_smoke.py --run-level advanced_model --gebench-model tencent/HunyuanImage-3.0-Instruct --accuracy-judge-model QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ --gebench-devices 0,1,2,3 --gebench-port 8094 --accuracy-gpu 0 --gebench-samples-per-type 4 --gebench-num-inference-steps 28 --accuracy-workers 1 --gebench-stage-overrides '{"0":{"devices":"0,1,2,3","enable_expert_parallel":true,"max_num_seqs":1}}' --gebench-extra-server-args '["--dtype","bfloat16","--gpu-memory-utilization","0.95","--enforce-eager","--trust-remote-code","--distributed-executor-backend","mp","--no-async-chunk"]'
+          - pytest -s -v tests/e2e/accuracy/test_gebench_h100_smoke.py --run-level full_model --gebench-model tencent/HunyuanImage-3.0-Instruct --accuracy-judge-model QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ --gebench-devices 0,1,2,3 --gebench-port 8094 --accuracy-gpu 0 --gebench-samples-per-type 4 --gebench-num-inference-steps 28 --accuracy-workers 1 --gebench-stage-overrides '{"0":{"devices":"0,1,2,3","enable_expert_parallel":true,"max_num_seqs":1}}' --gebench-extra-server-args '["--dtype","bfloat16","--gpu-memory-utilization","0.95","--enforce-eager","--trust-remote-code","--distributed-executor-backend","mp","--no-async-chunk"]'
           - buildkite-agent artifact upload "tests/e2e/accuracy/artifacts/gebench_hunyuanimage-3_0-instruct/summary*.json"
         agents:
           queue: "mithril-h100-pool"
