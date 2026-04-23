@@ -21,9 +21,12 @@ def test_gebench_h100_smoke(
     gebench_samples_per_type: int,
     gebench_num_inference_steps: int,
     accuracy_workers: int,
+    gebench_t2i_only: bool,
 ) -> None:
     model_label = infer_model_label(gebench_accuracy_servers.generate_params.model).lower()
     output_root = reset_artifact_dir(accuracy_artifact_root / f"gebench_{model_label}")
+
+    t2i_flag = ["--t2i-only"] if gebench_t2i_only else []
 
     with gebench_accuracy_servers.generate_server() as generate_server:
         for data_type in ("type3", "type4"):
@@ -53,6 +56,7 @@ def test_gebench_h100_smoke(
                         str(accuracy_workers),
                         "--samples-per-type",
                         str(gebench_samples_per_type),
+                        *t2i_flag,
                     ]
                 )
                 == 0
@@ -78,6 +82,7 @@ def test_gebench_h100_smoke(
                         "EMPTY",
                         "--workers",
                         str(accuracy_workers),
+                        *t2i_flag,
                     ]
                 )
                 == 0
