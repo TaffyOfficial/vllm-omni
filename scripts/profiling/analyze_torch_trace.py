@@ -4,6 +4,7 @@
 Usage:
     python3 analyze_torch_trace.py /tmp/hunyuan_torch_traces/tp4_fp8/
 """
+
 import json
 import sys
 from pathlib import Path
@@ -21,6 +22,7 @@ def load_trace(trace_dir: str) -> dict:
 
     if str(trace_file).endswith(".gz"):
         import gzip
+
         with gzip.open(trace_file, "rt") as f:
             return json.load(f)
     else:
@@ -46,9 +48,14 @@ def extract_cuda_kernels(trace: dict, top_n: int = 30):
 def check_fp8_gemm(kernels: list[dict]) -> list[dict]:
     """Find kernels that indicate fp8 GEMM path is active."""
     fp8_indicators = [
-        "fp8", "e4m3", "e5m2", "f8",
-        "cutlass_fp8", "sm90_xmma",
-        "cublas_fp8", "cublasLt",
+        "fp8",
+        "e4m3",
+        "e5m2",
+        "f8",
+        "cutlass_fp8",
+        "sm90_xmma",
+        "cublas_fp8",
+        "cublasLt",
     ]
     fp8_kernels = []
     for k in kernels:
@@ -68,9 +75,9 @@ def main():
 
     trace = load_trace(trace_dir)
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"  Top-{top_n} CUDA Kernels by Duration")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
 
     kernels = extract_cuda_kernels(trace, top_n=top_n)
     if not kernels:
@@ -82,9 +89,9 @@ def main():
         dur_ms = k["dur_us"] / 1000
         print(f"  {i:3d}. {dur_ms:10.3f} ms  {k['name'][:100]}")
 
-    print(f"\n{'='*70}")
-    print(f"  FP8 GEMM Path Analysis")
-    print(f"{'='*70}")
+    print(f"\n{'=' * 70}")
+    print("  FP8 GEMM Path Analysis")
+    print(f"{'=' * 70}")
 
     # Check all kernels (not just top-N) for fp8
     all_kernels = extract_cuda_kernels(trace, top_n=10000)
@@ -94,28 +101,28 @@ def main():
         total_fp8_us = sum(k["dur_us"] for k in fp8_kernels)
         total_all_us = sum(k["dur_us"] for k in all_kernels) or 1
         print(f"  FP8 kernels found: {len(fp8_kernels)}")
-        print(f"  FP8 total time: {total_fp8_us/1000:.3f} ms ({100*total_fp8_us/total_all_us:.1f}% of GPU time)")
-        print(f"\n  Top FP8 kernels:")
+        print(f"  FP8 total time: {total_fp8_us / 1000:.3f} ms ({100 * total_fp8_us / total_all_us:.1f}% of GPU time)")
+        print("\n  Top FP8 kernels:")
         for i, k in enumerate(sorted(fp8_kernels, key=lambda x: -x["dur_us"])[:15], 1):
-            print(f"    {i:3d}. {k['dur_us']/1000:10.3f} ms  {k['name'][:100]}")
-        print(f"\n  Conclusion: FP8 GEMM path is ACTIVE")
+            print(f"    {i:3d}. {k['dur_us'] / 1000:10.3f} ms  {k['name'][:100]}")
+        print("\n  Conclusion: FP8 GEMM path is ACTIVE")
     else:
         # Check for regular GEMM kernels
         gemm_keywords = ["gemm", "cublas", "cutlass", "xmma", "matmul"]
         gemm_kernels = [k for k in all_kernels if any(g in k["name"].lower() for g in gemm_keywords)]
         if gemm_kernels:
             print(f"  WARNING: No FP8-specific kernels found, but {len(gemm_kernels)} GEMM kernels detected.")
-            print(f"  These may be running in FP16/BF16 instead of FP8:")
+            print("  These may be running in FP16/BF16 instead of FP8:")
             for i, k in enumerate(sorted(gemm_kernels, key=lambda x: -x["dur_us"])[:10], 1):
-                print(f"    {i:3d}. {k['dur_us']/1000:10.3f} ms  {k['name'][:100]}")
-            print(f"\n  Conclusion: FP8 GEMM path may NOT be active. Check quantization config.")
+                print(f"    {i:3d}. {k['dur_us'] / 1000:10.3f} ms  {k['name'][:100]}")
+            print("\n  Conclusion: FP8 GEMM path may NOT be active. Check quantization config.")
         else:
-            print(f"  No GEMM kernels found at all. Trace may be incomplete.")
+            print("  No GEMM kernels found at all. Trace may be incomplete.")
 
     # Summary for cross-config comparison
-    print(f"\n{'='*70}")
-    print(f"  Kernel Category Breakdown")
-    print(f"{'='*70}")
+    print(f"\n{'=' * 70}")
+    print("  Kernel Category Breakdown")
+    print(f"{'=' * 70}")
 
     categories = {
         "GEMM/MatMul": ["gemm", "cublas", "cutlass", "xmma", "matmul"],
