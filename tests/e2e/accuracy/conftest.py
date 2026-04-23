@@ -88,6 +88,12 @@ def pytest_addoption(parser):
         default=8,
         help="Number of diffusion inference steps for GEBench generate",
     )
+    group.addoption(
+        "--gebench-t2i-only",
+        action="store_true",
+        default=False,
+        help="Only generate/evaluate T2I frame0 for type3/type4, skip IT2I trajectory",
+    )
 
 
 def _hf_cache_root() -> Path:
@@ -202,6 +208,11 @@ def gebench_samples_per_type(request: pytest.FixtureRequest) -> int:
 @pytest.fixture(scope="session")
 def gebench_num_inference_steps(request: pytest.FixtureRequest) -> int:
     return int(request.config.getoption("gebench_num_inference_steps"))
+
+
+@pytest.fixture(scope="session")
+def gebench_t2i_only(request: pytest.FixtureRequest) -> bool:
+    return bool(request.config.getoption("gebench_t2i_only"))
 
 
 @pytest.fixture(scope="session")
