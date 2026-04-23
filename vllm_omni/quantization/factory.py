@@ -80,12 +80,20 @@ def _build_single(method: str, **kwargs: Any) -> QuantizationConfig:
 
     config_cls = get_quantization_config(method)
 
+    # Normalize HF checkpoint field names to vLLM conventions
+    if "bits" in kwargs and "weight_bits" not in kwargs:
+        kwargs["weight_bits"] = kwargs.pop("bits")
+
+    # Filter to only params the config class accepts
+    valid = set(inspect.signature(config_cls.__init__).parameters) - {"self"}
+    filtered = {k: v for k, v in kwargs.items() if k in valid}
+
     try:
-        return config_cls(**kwargs)
+        return config_cls(**filtered)
     except TypeError:
         sig = inspect.signature(config_cls.__init__)
         raise TypeError(
-            f"Cannot instantiate {config_cls.__name__} with kwargs {kwargs}. Expected signature: {sig}"
+            f"Cannot instantiate {config_cls.__name__} with kwargs {filtered}. Expected signature: {sig}"
         ) from None
 
 

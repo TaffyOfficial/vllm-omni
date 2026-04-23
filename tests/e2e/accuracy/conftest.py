@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from contextlib import contextmanager
@@ -61,6 +62,31 @@ def pytest_addoption(parser):
         type=int,
         default=1200,
         help="Online serving timeout in seconds for Wan2.2 I2V accuracy tests.",
+    )
+    group.addoption(
+        "--gebench-devices",
+        action="store",
+        default=None,
+        help="CUDA_VISIBLE_DEVICES for GEBench generate server (e.g. '0,1,2,3'); TP size is derived from device count",
+    )
+    group.addoption(
+        "--gebench-stage-overrides",
+        action="store",
+        default=None,
+        help="JSON string passed to --stage-overrides for GEBench generate server",
+    )
+    group.addoption(
+        "--gebench-extra-server-args",
+        action="store",
+        default=None,
+        help='JSON array of extra CLI args for GEBench generate server (e.g. \'["--dtype","bfloat16"]\')',
+    )
+    group.addoption(
+        "--gebench-num-inference-steps",
+        action="store",
+        type=int,
+        default=8,
+        help="Number of diffusion inference steps for GEBench generate",
     )
 
 
@@ -174,6 +200,11 @@ def gebench_samples_per_type(request: pytest.FixtureRequest) -> int:
 
 
 @pytest.fixture(scope="session")
+def gebench_num_inference_steps(request: pytest.FixtureRequest) -> int:
+    return int(request.config.getoption("gebench_num_inference_steps"))
+
+
+@pytest.fixture(scope="session")
 def gedit_samples_per_group(request: pytest.FixtureRequest) -> int:
     return int(request.config.getoption("gedit_samples_per_group"))
 
@@ -215,13 +246,23 @@ def _build_accuracy_server_config(
     port: int,
     run_level: str,
     model_prefix: str,
+    generate_devices: str | None = None,
+    extra_generate_args: list[str] | None = None,
+    stage_init_timeout: int = 300,
+    init_timeout: int | None = None,
 ) -> AccuracyServerConfig:
     if torch.cuda.device_count() < 1:
         pytest.skip("Need at least 1 CUDA GPU for accuracy benchmark smoke tests.")
 
     if not generate_model:
         pytest.skip("No generate model configured for accuracy benchmark test.")
-    generate_server_args = ["--num-gpus", "1"]
+
+    devices = generate_devices or shared_gpu
+    num_devices = len([d for d in devices.split(",") if d.strip()])
+    if torch.cuda.device_count() < num_devices:
+        pytest.skip(f"Need at least {num_devices} CUDA GPUs for this accuracy benchmark.")
+
+    generate_server_args = extra_generate_args if extra_generate_args is not None else ["--num-gpus", "1"]
     judge_server_args = [
         "--max-model-len",
         "32768",
@@ -229,22 +270,24 @@ def _build_accuracy_server_config(
         "0.8",
     ]
 
-    judge_env = {"CUDA_VISIBLE_DEVICES": shared_gpu}
+    generate_params_kwargs: dict = dict(
+        model=generate_model,
+        port=port,
+        server_args=generate_server_args,
+        env_dict={"CUDA_VISIBLE_DEVICES": devices},
+        use_omni=True,
+        stage_init_timeout=stage_init_timeout,
+    )
+    if init_timeout is not None:
+        generate_params_kwargs["init_timeout"] = init_timeout
 
     return AccuracyServerConfig(
-        generate_params=OmniServerParams(
-            model=generate_model,
-            port=port,
-            server_args=generate_server_args,
-            env_dict={"CUDA_VISIBLE_DEVICES": shared_gpu},
-            use_omni=True,
-            stage_init_timeout=300,
-        ),
+        generate_params=OmniServerParams(**generate_params_kwargs),
         judge_params=OmniServerParams(
             model=judge_model,
             port=port,
             server_args=judge_server_args,
-            env_dict=judge_env,
+            env_dict={"CUDA_VISIBLE_DEVICES": shared_gpu},
             use_omni=False,
         ),
         run_level=run_level,
@@ -258,6 +301,24 @@ def gebench_accuracy_servers(
     run_level: str,
     model_prefix: str,
 ) -> AccuracyServerConfig:
+    devices_opt: str | None = request.config.getoption("gebench_devices")
+    stage_overrides: str | None = request.config.getoption("gebench_stage_overrides")
+    extra_args_json: str | None = request.config.getoption("gebench_extra_server_args")
+
+    extra_args: list[str] | None = None
+    stage_init_timeout = 300
+    init_timeout: int | None = None
+
+    if devices_opt:
+        num_devices = len([d for d in devices_opt.split(",") if d.strip()])
+        extra_args = ["--tensor-parallel-size", str(num_devices)]
+        if stage_overrides:
+            extra_args += ["--stage-overrides", stage_overrides]
+        if extra_args_json:
+            extra_args += json.loads(extra_args_json)
+        stage_init_timeout = 600
+        init_timeout = 1800
+
     return _build_accuracy_server_config(
         generate_model=request.config.getoption("gebench_model"),
         judge_model=request.config.getoption("accuracy_judge_model"),
@@ -265,6 +326,10 @@ def gebench_accuracy_servers(
         port=int(request.config.getoption("gebench_port")),
         run_level=run_level,
         model_prefix=model_prefix,
+        generate_devices=devices_opt,
+        extra_generate_args=extra_args,
+        stage_init_timeout=stage_init_timeout,
+        init_timeout=init_timeout,
     )
 
 

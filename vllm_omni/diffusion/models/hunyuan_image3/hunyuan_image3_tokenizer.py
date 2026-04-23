@@ -45,7 +45,34 @@ class Conversation:
 class TokenizerWrapper:
     def __init__(self, tokenizer):
         if isinstance(tokenizer, str):
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer, trust_remote_code=True)
+            except (ValueError, KeyError, OSError):
+                import json
+                import os
+
+                from transformers import PreTrainedTokenizerFast
+
+                hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+                snapshots = os.path.join(hf_home, "hub", f"models--{tokenizer.replace('/', '--')}", "snapshots")
+                tokenizer_file = None
+                if os.path.isdir(snapshots):
+                    for snap in sorted(os.listdir(snapshots)):
+                        candidate = os.path.join(snapshots, snap, "tokenizer.json")
+                        if os.path.isfile(candidate):
+                            tokenizer_file = candidate
+                            break
+                if tokenizer_file is None:
+                    raise FileNotFoundError(f"tokenizer.json not found in HF cache for {tokenizer}")
+                kwargs = {}
+                config_candidate = os.path.join(os.path.dirname(tokenizer_file), "tokenizer_config.json")
+                if os.path.isfile(config_candidate):
+                    with open(config_candidate) as f:
+                        cfg = json.load(f)
+                    for k in ("bos_token", "eos_token", "pad_token", "unk_token"):
+                        if k in cfg:
+                            kwargs[k] = cfg[k]
+                self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file, **kwargs)
         else:
             self.tokenizer = tokenizer
 

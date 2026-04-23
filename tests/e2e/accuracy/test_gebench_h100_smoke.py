@@ -18,6 +18,8 @@ def test_gebench_h100_smoke(
     gebench_accuracy_servers,
     accuracy_artifact_root: Path,
     gebench_dataset_root: Path,
+    gebench_samples_per_type: int,
+    gebench_num_inference_steps: int,
     accuracy_workers: int,
 ) -> None:
     model_label = infer_model_label(gebench_accuracy_servers.generate_params.model).lower()
@@ -46,9 +48,11 @@ def test_gebench_h100_smoke(
                         "--output-compression",
                         "98",
                         "--num-inference-steps",
-                        "8",
+                        str(gebench_num_inference_steps),
                         "--workers",
                         str(accuracy_workers),
+                        "--samples-per-type",
+                        str(gebench_samples_per_type),
                     ]
                 )
                 == 0

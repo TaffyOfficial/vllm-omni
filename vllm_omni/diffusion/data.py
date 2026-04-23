@@ -776,6 +776,17 @@ class OmniDiffusionConfig:
         if "diffusers_call_kwargs" in kwargs and kwargs["diffusers_call_kwargs"] is None:
             kwargs["diffusers_call_kwargs"] = {}
 
+        # Build parallel_config from individual kwargs (e.g. tensor_parallel_size,
+        # enable_expert_parallel) that would otherwise be filtered out because
+        # they are fields of DiffusionParallelConfig, not OmniDiffusionConfig.
+        if "parallel_config" not in kwargs or kwargs["parallel_config"] is None:
+            pc_field_names = {f.name for f in fields(DiffusionParallelConfig)}
+            pc_kwargs = {k: kwargs.pop(k) for k in list(kwargs) if k in pc_field_names and kwargs[k] is not None}
+            if pc_kwargs:
+                kwargs["parallel_config"] = DiffusionParallelConfig(**pc_kwargs)
+        elif isinstance(kwargs["parallel_config"], dict):
+            kwargs["parallel_config"] = DiffusionParallelConfig.from_dict(kwargs["parallel_config"])
+
         # Filter kwargs to only include valid fields
         valid_fields = {f.name for f in fields(cls)}
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
