@@ -1,0 +1,50 @@
+[
+    {
+        "test_name": "test_hunyuan_image_tp4_fp8",
+        "description": "TP=4 Quantization=fp8 baseline",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "tencent/HunyuanImage-3.0-Instruct",
+            "serve_args": {
+                "stage-configs": {
+                    "stage_args": [
+                        {
+                            "stage_id": 0,
+                            "stage_type": "diffusion",
+                            "engine_args": {
+                                "enforce_eager": true,
+                                "distributed_executor_backend": "mp",
+                                "quantization": "fp8",
+                                "parallel_config": {
+                                    "tensor_parallel_size": 4
+                                }
+                            },
+                            "final_output": true,
+                            "final_output_type": "image"
+                        }
+                    ]
+                },
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "1024x1024_steps50",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 1024,
+                "height": 1024,
+                "num-inference-steps": 50,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "skip-performance-assertion": true,
+                "baseline": {
+                    "throughput_qps": 0.08,
+                    "latency_p99": 13.1227,
+                    "peak_memory_mb_max": 46838,
+                    "peak_memory_mb_mean": 46838
+                }
+            }
+        ]
+    }
+]
