@@ -1,7 +1,9 @@
 import pytest
 import torch
+from PIL import Image
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -73,3 +75,73 @@ def test_diffusion_model(omni_runner, run_level):
     assert images[0].width == width
     assert images[0].height == height
     images[0].save("image_output.png")
+
+
+@pytest.mark.advanced_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_hunyuan_image3_instruct_t2i_dummy_forward(monkeypatch):
+    from vllm_omni.diffusion.models.hunyuan_image3 import (
+        pipeline_hunyuan_image3 as hunyuan_pipe,
+    )
+
+    pipeline = object.__new__(hunyuan_pipe.HunyuanImage3Pipeline)
+    pipeline.stage_durations = {"dummy_generate": 0.0}
+
+    prompt = "a tiny brass robot watering a bonsai tree"
+    generator = torch.Generator("cpu").manual_seed(1234)
+    sampling = OmniDiffusionSamplingParams(
+        height=64,
+        width=96,
+        num_inference_steps=3,
+        guidance_scale=3.5,
+        generator=generator,
+        extra_args={"use_system_prompt": "en_vanilla"},
+    )
+    request = OmniDiffusionRequest(
+        prompts=[{"prompt": prompt}],
+        sampling_params=sampling,
+    )
+    image = Image.new("RGB", (96, 64), color=(11, 22, 33))
+    captured = {}
+
+    def fake_get_system_prompt(name, task, override=None):
+        captured["system_prompt_args"] = (name, task, override)
+        return "dummy system prompt\n"
+
+    def fake_prepare_model_inputs(self, **kwargs):
+        captured["prepare_model_inputs"] = kwargs
+        return {"dummy_inputs": True}
+
+    def fake_generate(self, **kwargs):
+        captured["generate"] = kwargs
+        return [image]
+
+    monkeypatch.setattr(hunyuan_pipe, "get_system_prompt", fake_get_system_prompt)
+    monkeypatch.setattr(
+        hunyuan_pipe.HunyuanImage3Pipeline,
+        "prepare_model_inputs",
+        fake_prepare_model_inputs,
+    )
+    monkeypatch.setattr(
+        hunyuan_pipe.HunyuanImage3Pipeline,
+        "_generate",
+        fake_generate,
+    )
+
+    output = hunyuan_pipe.HunyuanImage3Pipeline.forward(pipeline, request)
+
+    assert output.output is image
+    assert output.stage_durations == {"dummy_generate": 0.0}
+    assert captured["system_prompt_args"] == ("en_vanilla", "image", None)
+    assert captured["prepare_model_inputs"] == {
+        "prompt": [prompt],
+        "cot_text": None,
+        "system_prompt": "dummy system prompt",
+        "mode": "gen_image",
+        "generator": generator,
+        "image_size": (64, 96),
+        "num_inference_steps": 3,
+        "guidance_scale": 3.5,
+    }
+    assert captured["generate"] == {"dummy_inputs": True}
