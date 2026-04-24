@@ -1,27 +1,39 @@
 #!/usr/bin/env bash
 # =============================================================================
-# HunyuanImage 3.0 Profiling Script
-# 用途：收集三种配置的 per-layer breakdown + torch.profiler kernel trace
-# 用法：在远端 GPU 节点容器内执行
-#   bash /path/to/run_hunyuan_profiling.sh [phase]
-#   phase: all | stage_durations | torch_profile
+# Diffusion Model Profiling Script
+# Collects per-layer breakdown + torch.profiler kernel trace for any diffusion
+# model served by vllm-omni.
+#
+# Usage:
+#   bash run_diffusion_profiling.sh <model> [phase]
+#   phase: all | stage_durations | torch_profile  (default: all)
+#
+# Example:
+#   bash run_diffusion_profiling.sh tencent/HunyuanImage-3.0-Instruct all
+#   bash run_diffusion_profiling.sh Qwen/Qwen-Image-2512 stage_durations
 # =============================================================================
 set -euo pipefail
 
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <model> [all|stage_durations|torch_profile]"
+    exit 1
+fi
+
 # ---------------------------------------------------------------------------
-# 配置区 — 根据你的环境改
+# Configuration
 # ---------------------------------------------------------------------------
-MODEL="tencent/HunyuanImage-3.0"
-VLLM_OMNI_DIR="${VLLM_OMNI_DIR:-/path/to/vllm-omni}"  # 改成远端 vllm-omni 路径
-RESULT_DIR="/tmp/hunyuan_profiling_results"
-TORCH_PROFILE_DIR="/tmp/hunyuan_torch_traces"
+MODEL="$1"
+PHASE="${2:-all}"
+VLLM_OMNI_DIR="${VLLM_OMNI_DIR:-/path/to/vllm-omni}"
+MODEL_SHORT="$(echo "$MODEL" | sed 's|.*/||; s|[^a-zA-Z0-9_-]|_|g')"
+RESULT_DIR="/tmp/${MODEL_SHORT}_profiling_results"
+TORCH_PROFILE_DIR="/tmp/${MODEL_SHORT}_torch_traces"
 PORT=8100
 HOST="127.0.0.1"
-NUM_PROMPTS=3          # profiling 不需要跑太多
+NUM_PROMPTS=3
 NUM_STEPS=50
 WIDTH=1024
 HEIGHT=1024
-PHASE="${1:-all}"      # all | stage_durations | torch_profile
 
 mkdir -p "$RESULT_DIR" "$TORCH_PROFILE_DIR"
 
@@ -277,7 +289,7 @@ run_torch_profiling() {
     ls -la "$TORCH_PROFILE_DIR/$name/" 2>/dev/null || echo "(empty)"
     echo ""
     echo "To analyze top-N kernels:"
-    echo "  python3 analyze_torch_trace.py $TORCH_PROFILE_DIR/$name/"
+    echo "  python3 tools/analyze_torch_trace.py $TORCH_PROFILE_DIR/$name/"
 }
 
 # ---------------------------------------------------------------------------

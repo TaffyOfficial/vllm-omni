@@ -2,7 +2,7 @@
 """Analyze torch profiler traces to extract top-N kernels and confirm fp8 GEMM path.
 
 Usage:
-    python3 analyze_torch_trace.py /tmp/hunyuan_torch_traces/tp4_fp8/
+    python3 tools/analyze_torch_trace.py <trace_dir> [top_n]
 """
 
 import json
