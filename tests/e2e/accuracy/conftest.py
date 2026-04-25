@@ -287,6 +287,15 @@ def _build_accuracy_server_config(
     if torch.cuda.device_count() < num_devices:
         pytest.skip(f"Need at least {num_devices} CUDA GPUs for this accuracy benchmark.")
 
+    if extra_generate_args is not None:
+        has_gpu_allocation_arg = any(
+            arg in {"--tensor-parallel-size", "--num-gpus"}
+            or arg.startswith("--tensor-parallel-size=")
+            or arg.startswith("--num-gpus=")
+            for arg in extra_generate_args
+        )
+        if not has_gpu_allocation_arg:
+            raise ValueError("extra_generate_args must include --tensor-parallel-size or --num-gpus")
     generate_server_args = extra_generate_args if extra_generate_args is not None else ["--num-gpus", "1"]
     judge_server_args = [
         "--max-model-len",

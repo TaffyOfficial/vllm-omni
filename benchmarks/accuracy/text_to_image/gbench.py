@@ -117,6 +117,8 @@ def collect_gebench_generation_summary(output_root: Path) -> dict[str, Any]:
             for sample_dir in sorted(path for path in lang_dir.iterdir() if path.is_dir()):
                 expected = sample_dir / "frame5.png" if data_type in {"type2", "type3", "type4"} else None
                 if expected is None or not expected.exists():
+                    # t2i-only runs emit frame0 for type3/type4 instead of the
+                    # six-frame trajectory output, so summarize any image found.
                     expected = find_first_image(sample_dir)
                 if expected is None:
                     continue
