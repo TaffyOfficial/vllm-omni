@@ -105,8 +105,18 @@ class DiffusionPipelineProfilerMixin:
 
     @property
     def stage_durations(self) -> dict[str, float]:
+        if not hasattr(self, "_profiler_lock"):
+            return {}
         with self._profiler_lock:
             return self._stage_durations.copy()
+
+    @stage_durations.setter
+    def stage_durations(self, value: dict[str, float]) -> None:
+        if not hasattr(self, "_profiler_lock"):
+            self._profiler_lock = Lock()
+            self._stage_durations = {}
+        with self._profiler_lock:
+            self._stage_durations = dict(value)
 
     def clear_profiler_records(self) -> None:
         with self._profiler_lock:
