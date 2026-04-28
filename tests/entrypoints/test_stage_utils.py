@@ -98,6 +98,32 @@ def test_set_stage_devices_handles_not_enough_devices(mocker: MockerFixture, mon
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "6,7"
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.usefixtures("clean_gpu_memory_between_tests")
+def test_set_stage_devices_value_based_fallback(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
+    # When a process is spawned with CUDA_VISIBLE_DEVICES="2,3" (e.g. for a
+    # second stage in multi-process mode) and the YAML specifies absolute device
+    # IDs that match those values (devices="2,3"), the index-based path fails
+    # because logical IDs [2,3] exceed the visible list length (2).  The
+    # value-based fallback should recognise that "2" and "3" are present in the
+    # visible set and map them directly.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,3")
+    call_log: list[int] = []
+    dummy_torch = _make_dummy_torch(call_log)
+    monkeypatch.setitem(sys.modules, "torch", dummy_torch)
+
+    mock_platform = _make_mock_platform(mocker, device_type="cuda", env_var="CUDA_VISIBLE_DEVICES")
+    monkeypatch.setattr(
+        "vllm_omni.platforms.current_omni_platform",
+        mock_platform,
+    )
+
+    set_stage_devices(stage_id=1, devices="2,3")
+
+    mock_platform.set_device_control_env_var.assert_called_once_with("2,3")
+
+
 @pytest.mark.usefixtures("clean_gpu_memory_between_tests")
 def test_set_stage_devices_npu_platform(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     """Test that set_stage_devices works correctly for NPU platform."""

@@ -96,10 +96,30 @@ def _map_device_list(stage_id: int, device_list: list[str], visible_device_list:
         raise ValueError("Logical devices must be non-negative integers")
 
     logical_ids = [int(device) for device in device_list]
-    mapped_devices = [visible_device_list[idx] for idx in logical_ids if idx < num_visible]
-    mapping_pairs = [
-        f"{logical_id}->{visible_device_list[logical_id]}" for logical_id in logical_ids if logical_id < num_visible
-    ]
+
+    # Primary path: index-based mapping (logical ID is an index into visible_device_list).
+    index_mapped = [(lid, visible_device_list[lid]) for lid in logical_ids if lid < num_visible]
+
+    if index_mapped:
+        mapped_devices = [phys for _, phys in index_mapped]
+        mapping_pairs = [f"{lid}->{phys}" for lid, phys in index_mapped]
+    else:
+        # Fallback: value-based matching.  Handles deploy configs that use absolute
+        # physical device IDs when the process CUDA_VISIBLE_DEVICES is already
+        # restricted to the target subset (e.g. stage process spawned with
+        # CUDA_VISIBLE_DEVICES="2,3" and YAML specifies devices="2,3").
+        # Only activated when *no* ID fits as an index, avoiding mixed-mode
+        # interpretation that could silently map two IDs to the same GPU.
+        visible_set = set(visible_device_list)
+        value_mapped = [(lid, str(lid)) for lid in logical_ids if str(lid) in visible_set]
+        mapped_devices = [phys for _, phys in value_mapped]
+        mapping_pairs = [f"{lid}->{phys}(direct)" for lid, phys in value_mapped]
+        if mapped_devices:
+            logger.debug(
+                "Stage %s: logical IDs %s all exceed visible device count (%d); "
+                "falling back to direct physical-ID matching against %s",
+                stage_id, device_list, num_visible, visible_device_list,
+            )
     if not mapped_devices:
         raise ValueError(
             f"Stage {stage_id} has logical IDs {device_list}, none of which map to the visible devices "
