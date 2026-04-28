@@ -96,6 +96,14 @@ logger = init_logger(__name__)
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 
+# Process-global lock serialising the CUDA_VISIBLE_DEVICES save/set/spawn/restore
+# critical section across ALL AsyncOmniEngine instances in this process.  A per-
+# instance lock (the previous design) allowed concurrent engine inits (e.g. DP
+# replicas) to race on os.environ, causing one instance to save a value already
+# mutated by another and then restore it incorrectly, leading to the
+# "Stage N has logical IDs … none of which map to visible devices" crash.
+_STAGE_LAUNCH_LOCK = threading.Lock()
+
 
 # ============================================================================
 # Parent-EngineArgs field-routing contracts (consumed by
@@ -691,7 +699,7 @@ class AsyncOmniEngine:
         llm_stage_positions: list[int] = []
         llm_launch_futures: dict[int, concurrent.futures.Future[StartedLlmStage]] = {}
         started_llm_stages: dict[int, StartedLlmStage] = {}
-        llm_stage_launch_lock = threading.Lock()
+        llm_stage_launch_lock = _STAGE_LAUNCH_LOCK
 
         async_chunk = self.async_chunk
         prompt_expand_func = None
