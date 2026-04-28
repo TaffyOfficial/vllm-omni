@@ -118,7 +118,10 @@ def _map_device_list(stage_id: int, device_list: list[str], visible_device_list:
             logger.debug(
                 "Stage %s: logical IDs %s all exceed visible device count (%d); "
                 "falling back to direct physical-ID matching against %s",
-                stage_id, device_list, num_visible, visible_device_list,
+                stage_id,
+                device_list,
+                num_visible,
+                visible_device_list,
             )
     if not mapped_devices:
         raise ValueError(
