@@ -853,12 +853,19 @@ class HunyuanImage3Processor:
 
             # VIT processing
             vit_pixel_values = self.vision_encoder_processor(image)
-            # shape: (seq_len, num_channels * patch_size * patch_size)
-            current_info["vit_pixel_values"] = vit_pixel_values["pixel_values"].squeeze(0)
-            # shape: (seq_len, )
-            current_info["vit_pixel_attention_mask"] = vit_pixel_values["pixel_attention_mask"].squeeze(0)
-            # shape: (2, )
-            current_info["vit_spatial_shapes"] = vit_pixel_values["spatial_shapes"].squeeze(0)
+            # transformers>=5.x returns lists; stack to tensor when needed
+            _pv = vit_pixel_values["pixel_values"]
+            if isinstance(_pv, list):
+                _pv = torch.stack(_pv, dim=0)
+            current_info["vit_pixel_values"] = _pv.squeeze(0)
+            _pam = vit_pixel_values["pixel_attention_mask"]
+            if isinstance(_pam, list):
+                _pam = torch.stack(_pam, dim=0)
+            current_info["vit_pixel_attention_mask"] = _pam.squeeze(0)
+            _ss = vit_pixel_values["spatial_shapes"]
+            if isinstance(_ss, list):
+                _ss = torch.tensor(_ss, dtype=torch.long)
+            current_info["vit_spatial_shapes"] = _ss.squeeze(0)
 
             # VAE processing
             image_width, image_height = self.reso_group.get_target_size(image.width, image.height)
