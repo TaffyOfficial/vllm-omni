@@ -60,6 +60,14 @@ def build_prompt(
 
     has_image_input = task.startswith("i2t") or task.startswith("it2i")
 
+    # T2T: pure text comprehension. The pretrain-style format
+    # (system_prompt + raw user_prompt) does not signal where the answer
+    # should start, so the model falls into repetition. Use the instruct
+    # chat format (`User: ...\n\nA: `) that the model was trained with for
+    # text completion — verified to match the official HF AR baseline.
+    if task == "t2t":
+        return f"<|startoftext|>User: {user_prompt}\n\nA: "
+
     parts = ["<|startoftext|>"]
     if sys_text:
         parts.append(sys_text)
