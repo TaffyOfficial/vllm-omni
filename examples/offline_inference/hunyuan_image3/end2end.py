@@ -60,13 +60,6 @@ def build_prompt(
 
     has_image_input = task.startswith("i2t") or task.startswith("it2i")
 
-    # T2T: pure text comprehension. Skip the en_unified system prompt — it
-    # only describes image-gen modes and confuses the model into repetition.
-    # Use the bare instruct chat format that matches the official HF AR
-    # baseline (verified token-for-token).
-    if task == "t2t":
-        return f"<|startoftext|>User: {user_prompt}\n\nA: "
-
     # t2i_vanilla: pretrain mode for direct text→image generation. The
     # vanilla system prompt drives the model with no chat structure.
     if task == "t2i_vanilla":
@@ -76,13 +69,16 @@ def build_prompt(
         parts.append(user_prompt)
         return "".join(parts)
 
-    # i2t / t2i_think / t2i_recaption / it2i_think / it2i_recaption:
-    # HunyuanImage3 instruct chat template.
-    #   <|startoftext|>{system?}\n\nUser: {<img>?}{user_prompt}\n\nA: {trigger?}
-    # The trigger_tag MUST come AFTER the assistant prefix `A: `, not before
-    # user_prompt. Putting `<think>` before user_prompt (the old pretrain
-    # layout) puts the user's instructions inside the model's "thinking
-    # section", which under greedy decoding collapses into repetition garbage.
+    # All other tasks (t2t / i2t / t2i_think / t2i_recaption /
+    # it2i_think / it2i_recaption) use HunyuanImage3 Instruct chat template:
+    #   <|startoftext|>{system?}\n\nUser: {<img>?}{user_prompt}\n\nAssistant: {trigger?}
+    # generation_config.json declares sequence_template="instruct", so the
+    # AR prefill MUST use this template — verified to match HF's
+    # apply_chat_template output token-for-token (modulo BPE boundary merges).
+    # The trigger_tag (e.g. <think>) MUST come AFTER the `Assistant: ` prefix:
+    # if it goes BEFORE user_prompt (the old pretrain layout) the model puts
+    # the user's instructions inside the "thinking section" and collapses
+    # into repetition garbage under greedy decoding.
     parts = ["<|startoftext|>"]
     if sys_text:
         parts.append(f"{sys_text}\n\n")
@@ -90,7 +86,7 @@ def build_prompt(
     if has_image_input:
         parts.append("<img>")
     parts.append(user_prompt)
-    parts.append("\n\nA: ")
+    parts.append("\n\nAssistant: ")
     if trigger_tag:
         parts.append(trigger_tag)
 
