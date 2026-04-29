@@ -867,12 +867,23 @@ class HunyuanImage3Processor:
                 _ss = torch.tensor(_ss, dtype=torch.long)
             current_info["vit_spatial_shapes"] = _ss.squeeze(0)
 
-            # VAE processing
+            # VAE processing.
+            # The resize/crop math here mirrors HF's `resize_and_crop` with
+            # crop_type="center" (hunyuan3.0_ins/image_processor.py:61). VAE
+            # normalize uses the same transforms.Compose([ToTensor,
+            # Normalize([0.5], [0.5])]) as HF's `pil_image_to_tensor`. So
+            # numerical output of this branch should match HF up to floating-
+            # point reduction order.
             image_width, image_height = self.reso_group.get_target_size(image.width, image.height)
             resized_image = self._resize_and_crop(image, (image_width, image_height))
             vae_pixel_values = self.vae_processor(resized_image)
             token_height = image_height // (self.hf_config.vae_downsample_factor[0] * self.hf_config.patch_size)
             token_width = image_width // (self.hf_config.vae_downsample_factor[1] * self.hf_config.patch_size)
+            # Cast to model dtype here. Keeping fp32 raises
+            # "Input type (float) and bias type (BFloat16) should be the same"
+            # in the VAE conv3d (vllm-omni's _vae_encode does not auto-cast).
+            # HF avoids this because its build_cond_images stores fp32 and
+            # the model forward casts inputs explicitly before encoding.
             current_info["vae_pixel_values"] = vae_pixel_values.squeeze(0).to(dtype=torch_dtype)
             current_info["vae_token_grid_hw"] = torch.tensor([token_height, token_width])
 
