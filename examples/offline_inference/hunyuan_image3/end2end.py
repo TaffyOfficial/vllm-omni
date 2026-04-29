@@ -60,22 +60,39 @@ def build_prompt(
 
     has_image_input = task.startswith("i2t") or task.startswith("it2i")
 
-    # T2T: pure text comprehension. The pretrain-style format
-    # (system_prompt + raw user_prompt) does not signal where the answer
-    # should start, so the model falls into repetition. Use the instruct
-    # chat format (`User: ...\n\nA: `) that the model was trained with for
-    # text completion — verified to match the official HF AR baseline.
+    # T2T: pure text comprehension. Skip the en_unified system prompt — it
+    # only describes image-gen modes and confuses the model into repetition.
+    # Use the bare instruct chat format that matches the official HF AR
+    # baseline (verified token-for-token).
     if task == "t2t":
         return f"<|startoftext|>User: {user_prompt}\n\nA: "
 
+    # t2i_vanilla: pretrain mode for direct text→image generation. The
+    # vanilla system prompt drives the model with no chat structure.
+    if task == "t2i_vanilla":
+        parts = ["<|startoftext|>"]
+        if sys_text:
+            parts.append(sys_text)
+        parts.append(user_prompt)
+        return "".join(parts)
+
+    # i2t / t2i_think / t2i_recaption / it2i_think / it2i_recaption:
+    # HunyuanImage3 instruct chat template.
+    #   <|startoftext|>{system?}\n\nUser: {<img>?}{user_prompt}\n\nA: {trigger?}
+    # The trigger_tag MUST come AFTER the assistant prefix `A: `, not before
+    # user_prompt. Putting `<think>` before user_prompt (the old pretrain
+    # layout) puts the user's instructions inside the model's "thinking
+    # section", which under greedy decoding collapses into repetition garbage.
     parts = ["<|startoftext|>"]
     if sys_text:
-        parts.append(sys_text)
+        parts.append(f"{sys_text}\n\n")
+    parts.append("User: ")
     if has_image_input:
         parts.append("<img>")
+    parts.append(user_prompt)
+    parts.append("\n\nA: ")
     if trigger_tag:
         parts.append(trigger_tag)
-    parts.append(user_prompt)
 
     return "".join(parts)
 
