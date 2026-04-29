@@ -1059,6 +1059,25 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
             if ratio_token_id is None:
                 raise ValueError(f"Ratio token '<img_ratio_{_ratio_index}>' not found in tokenizer vocabulary")
 
+            # NOTE on the timestep slot:
+            # HF's apply_chat_template emits the literal <timestep> token id
+            # 128017 here. HF's modeling forward (`instantiate_continuous_tokens`,
+            # see hunyuan3.0_ins/modeling_hunyuan_image_3.py:1964) then *scatter-
+            # replaces* the embedding at that position with `timestep_emb(0)`
+            # for cond images. So the wte embedding of <timestep> is irrelevant
+            # at runtime — what matters is the timestep_emb injection.
+            #
+            # vllm-omni achieves the same effect via the multimodal-embedding
+            # merger: we put an <img> (128006) placeholder here and ship a
+            # `timestep_emb(0)` tensor at the head of `embed_multimodal()`'s
+            # combined_embeddings. The merger replaces this placeholder's
+            # embedding with the timestep tensor, yielding a final hidden
+            # state numerically equivalent to HF at that position.
+            #
+            # Keep this slot as <img> (NOT <timestep>): switching to <timestep>
+            # requires either (a) a second PromptReplacement targeting 128017,
+            # or (b) the merger's embed_token_id to be a list — neither is
+            # currently supported by PromptUpdateDetails.select_token_id.
             replacement = (
                 [boi_token_id]
                 + [base_size_token_id]
@@ -1501,11 +1520,14 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             "Each image should have both VAE and ViT embeddings."
         )
 
-        # Order per image: timestep -> VAE tokens -> ViT tokens
+        # Order per image: timestep -> VAE tokens -> ViT tokens.
+        # The <img> placeholder at the timestep slot (see _get_prompt_updates)
+        # gets its embedding replaced by `timestep_emb(0)` here, which is what
+        # HF achieves via instantiate_continuous_tokens at runtime.
         combined_embeddings: list[torch.Tensor] = []
         num_images = len(vae_token_embeddings)
         for img_idx in range(num_images):
-            # 1. Timestep embedding
+            # 1. Timestep embedding (cond image timestep == 0)
             timestep = torch.zeros((1,)).to(vit_embeddings.device).to(vit_embeddings.dtype)
             timestep_emb = self._timestep_encode(timestep)
 
