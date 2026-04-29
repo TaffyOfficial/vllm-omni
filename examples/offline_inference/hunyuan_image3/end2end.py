@@ -42,13 +42,75 @@ _MODALITY_TASK_MAP = {
 }
 
 
+def build_prompt_tokens(
+    user_prompt: str,
+    tokenizer,
+    task: str = "it2i_think",
+    sys_type: str | None = None,
+    custom_system_prompt: str | None = None,
+) -> list[int]:
+    """Segment-by-segment tokenization that matches HF apply_chat_template.
+
+    Calling tokenizer.encode(build_prompt(...)) on the full string lets BPE
+    merge tokens across segment boundaries (e.g. user_prompt ends with `。`
+    and the next segment is `\\n\\n` -> they merge into a single token id
+    3490 instead of HF's [1811, 271]). HF's apply_chat_template tokenizes
+    each segment independently and concatenates token_ids, so no cross-
+    boundary merge happens. We replicate that here and feed the result to
+    Omni via OmniTokensPrompt (prompt_token_ids).
+    """
+    if task not in _TASK_PRESETS:
+        raise ValueError(f"Unknown task {task!r}. Choose from: {sorted(_TASK_PRESETS)}")
+
+    preset_sys_type, preset_bot_task, trigger_tag = _TASK_PRESETS[task]
+    effective_sys_type = sys_type or preset_sys_type
+
+    bos_id = tokenizer.convert_tokens_to_ids("<|startoftext|>")
+    img_id = tokenizer.convert_tokens_to_ids("<img>")
+    trig_id = tokenizer.convert_tokens_to_ids(trigger_tag) if trigger_tag else None
+
+    has_image_input = task.startswith("i2t") or task.startswith("it2i")
+
+    # t2i_vanilla uses pretrain template with no chat structure; the vanilla
+    # system prompt drives the model directly. No segment boundaries to
+    # protect, fall back to whole-string encode.
+    if task == "t2i_vanilla":
+        s = build_prompt(user_prompt, task, sys_type, custom_system_prompt)
+        return tokenizer.encode(s, add_special_tokens=False)
+
+    system_prompt = get_system_prompt(effective_sys_type, preset_bot_task, custom_system_prompt)
+    # Do NOT strip — HF apply_chat_template keeps the system prompt's
+    # natural trailing newline; stripping it would shift one token id.
+    sys_text = system_prompt or ""
+
+    ids: list[int] = [bos_id]
+    if sys_text:
+        ids += tokenizer.encode(sys_text, add_special_tokens=False)
+        ids += tokenizer.encode("\n\n", add_special_tokens=False)
+    ids += tokenizer.encode("User: ", add_special_tokens=False)
+    if has_image_input:
+        ids += [img_id]
+    ids += tokenizer.encode(user_prompt, add_special_tokens=False)
+    ids += tokenizer.encode("\n\nAssistant: ", add_special_tokens=False)
+    if trig_id is not None:
+        ids += [trig_id]
+    return ids
+
+
 def build_prompt(
     user_prompt: str,
     task: str = "it2i_think",
     sys_type: str | None = None,
     custom_system_prompt: str | None = None,
 ) -> str:
-    """Build a HunyuanImage-3.0 prompt using pretrain template format."""
+    """Build a HunyuanImage-3.0 prompt as a string (legacy/compat path).
+
+    NOTE: when this string is passed to the engine, the engine's tokenizer
+    will run a single BPE pass over the whole string, which can merge
+    tokens across segment boundaries (e.g. `。\\n\\n` -> id 3490). For
+    inputs that need to match HF baseline byte-for-byte, use
+    `build_prompt_tokens` instead and feed the result via prompt_token_ids.
+    """
     if task not in _TASK_PRESETS:
         raise ValueError(f"Unknown task {task!r}. Choose from: {sorted(_TASK_PRESETS)}")
 
@@ -200,12 +262,18 @@ def main():
 
         input_image = Image.open(args.image_path).convert("RGB")
 
+    # Load tokenizer for segment-wise prompt tokenization (matches HF
+    # apply_chat_template byte-for-byte; see build_prompt_tokens docstring).
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+
     # Format prompts
     formatted_prompts: list[OmniPromptType] = []
     for p in prompts:
-        formatted_text = build_prompt(p, task=task, sys_type=args.sys_type)
+        token_ids = build_prompt_tokens(p, tokenizer, task=task, sys_type=args.sys_type)
 
-        prompt_dict: dict = {"prompt": formatted_text}
+        prompt_dict: dict = {"prompt_token_ids": token_ids}
 
         if args.modality == "text2img":
             prompt_dict["modalities"] = ["image"]
