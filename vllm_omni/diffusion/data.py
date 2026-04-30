@@ -779,13 +779,19 @@ class OmniDiffusionConfig:
         # Build parallel_config from individual kwargs (e.g. tensor_parallel_size,
         # enable_expert_parallel) that would otherwise be filtered out because
         # they are fields of DiffusionParallelConfig, not OmniDiffusionConfig.
-        if "parallel_config" not in kwargs or kwargs["parallel_config"] is None:
-            pc_field_names = {f.name for f in fields(DiffusionParallelConfig)}
-            pc_kwargs = {k: kwargs.pop(k) for k in list(kwargs) if k in pc_field_names and kwargs[k] is not None}
-            if pc_kwargs:
-                kwargs["parallel_config"] = DiffusionParallelConfig(**pc_kwargs)
-        elif isinstance(kwargs["parallel_config"], dict):
-            kwargs["parallel_config"] = DiffusionParallelConfig.from_dict(kwargs["parallel_config"])
+        pc_field_names = {f.name for f in fields(DiffusionParallelConfig)}
+        pc_kwargs = {k: kwargs.pop(k) for k in list(kwargs) if k in pc_field_names and kwargs[k] is not None}
+        par = kwargs.get("parallel_config", None)
+        if isinstance(par, Mapping):
+            par = dict(par)
+            if par.get("tensor_parallel_size") is None:
+                par.pop("tensor_parallel_size", None)
+            for key, value in pc_kwargs.items():
+                if key not in par or par[key] is None:
+                    par[key] = value
+            kwargs["parallel_config"] = DiffusionParallelConfig.from_dict(par)
+        elif par is None and pc_kwargs:
+            kwargs["parallel_config"] = DiffusionParallelConfig(**pc_kwargs)
 
         # Filter kwargs to only include valid fields
         valid_fields = {f.name for f in fields(cls)}
