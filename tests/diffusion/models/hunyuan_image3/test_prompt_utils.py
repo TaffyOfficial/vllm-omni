@@ -110,18 +110,14 @@ def test_build_prompt_string_structure_chat_template(task: str):
     # fix: trigger goes AFTER `Assistant: `, not before user_prompt).
     if task in ("it2i_think", "t2i_think"):
         assert s.endswith("Assistant: <think>"), (
-            "Trigger <think> must be appended right after `Assistant: ` (Part A fix). "
-            f"Got tail: ...{s[-40:]!r}"
+            f"Trigger <think> must be appended right after `Assistant: ` (Part A fix). Got tail: ...{s[-40:]!r}"
         )
     if task in ("it2i_recaption", "t2i_recaption"):
         assert s.endswith("Assistant: <recaption>"), (
-            "Trigger <recaption> must be appended right after `Assistant: ` (Part A fix). "
-            f"Got tail: ...{s[-40:]!r}"
+            f"Trigger <recaption> must be appended right after `Assistant: ` (Part A fix). Got tail: ...{s[-40:]!r}"
         )
     if task in ("t2t", "i2t"):
-        assert s.endswith("Assistant: "), (
-            "Plain (no-trigger) task must end at `Assistant: ` with no trailing tag."
-        )
+        assert s.endswith("Assistant: "), "Plain (no-trigger) task must end at `Assistant: ` with no trailing tag."
 
 
 def test_build_prompt_vanilla_uses_pretrain_template():
@@ -162,9 +158,7 @@ def test_build_prompt_tokens_segments_each_boundary():
     # No call must contain user_prompt glued to neighboring text.
     for call in tok.encode_calls:
         if call != "写诗。":
-            assert "写诗。" not in call, (
-                f"user_prompt leaked into a multi-segment encode call: {call!r}"
-            )
+            assert "写诗。" not in call, f"user_prompt leaked into a multi-segment encode call: {call!r}"
 
 
 def test_build_prompt_tokens_image_placeholder_present_for_image_tasks():
@@ -221,9 +215,7 @@ def test_end2end_routes_through_shared_prompt_utils():
     no User:/Assistant: framing, etc.) without touching prompt_utils,
     bypassing every other test in this file.
     """
-    end2end_path = (
-        _repo_root() / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
-    )
+    end2end_path = _repo_root() / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
     assert end2end_path.is_file(), f"end2end.py not found at {end2end_path}"
 
     tree = ast.parse(end2end_path.read_text(encoding="utf-8"))
@@ -240,11 +232,7 @@ def test_end2end_routes_through_shared_prompt_utils():
 
     imported_from_prompt_utils: set[str] = set()
     for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.ImportFrom)
-            and node.module
-            and node.module.endswith("hunyuan_image3.prompt_utils")
-        ):
+        if isinstance(node, ast.ImportFrom) and node.module and node.module.endswith("hunyuan_image3.prompt_utils"):
             imported_from_prompt_utils.update(alias.name for alias in node.names)
     assert "build_prompt_tokens" in imported_from_prompt_utils, (
         "end2end.py must import build_prompt_tokens from "
@@ -261,9 +249,7 @@ _HUNYUAN_MODEL_ID = "tencent/HunyuanImage-3.0-Instruct"
 
 def _hf_cached(model_id: str) -> bool:
     hf_home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
-    snap_dir = os.path.join(
-        hf_home, "hub", f"models--{model_id.replace('/', '--')}", "snapshots"
-    )
+    snap_dir = os.path.join(hf_home, "hub", f"models--{model_id.replace('/', '--')}", "snapshots")
     return os.path.isdir(snap_dir) and any(os.scandir(snap_dir))
 
 
