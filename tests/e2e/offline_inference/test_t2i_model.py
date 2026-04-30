@@ -1,3 +1,4 @@
+from threading import Lock
 from types import SimpleNamespace
 
 import pytest
@@ -144,7 +145,8 @@ def test_hunyuan_image3_instruct_t2i_dummy_forward(monkeypatch):
     )
 
     pipeline = object.__new__(hunyuan_pipe.HunyuanImage3Pipeline)
-    pipeline.stage_durations = {"dummy_generate": 0.0}
+    pipeline._profiler_lock = Lock()
+    pipeline._stage_durations = {"dummy_generate": 0.0}
     pipeline.image_processor = DummyImageProcessor()
     pipeline._tkwrapper = DummyTokenizerWrapper()
     pipeline.config = SimpleNamespace(
