@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
 import math
 import typing
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -17,14 +18,20 @@ from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.multimodal import BaseDummyOptions
-from vllm.distributed import get_pp_group
+from vllm.distributed import (
+    get_ep_group,
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -37,7 +44,9 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.hunyuan_v1 import (
+    HunYuanMLP,
     HunYuanModel,
+    HunYuanSparseMoeBlock,
     _get_cla_factor,
     _is_moe,
 )
@@ -1105,6 +1114,204 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
         ]
 
 
+def _hunyuan_image3_unpack_packed_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unpack pre-computed ``(topk_weights, topk_indices)`` packed by
+    :class:`HunyuanImage3SparseMoeBlock` into ``gating_output``.
+
+    Used as ``custom_routing_function`` for the underlying ``SharedFusedMoE``,
+    bypassing its bf16 ``topk_softmax`` CUDA op so the routing decision can
+    be made in fp32 (matching the reference implementation).
+
+    Layout of ``gating_output`` (shape ``[num_tokens, top_k * 2]``)::
+
+        [:, :top_k]  -> topk_weights (already softmax'd + renormalized in fp32,
+                                      stored as fp32 for transport)
+        [:, top_k:]  -> topk_indices (cast to fp32 for transport, restored to int32)
+    """
+    topk_weights = gating_output[:, :topk].contiguous()
+    topk_indices = gating_output[:, topk:]
+    return topk_weights.to(torch.float32), topk_indices.to(torch.int32)
+
+
+class HunyuanImage3SparseMoeBlock(HunYuanSparseMoeBlock):
+    """MoE block with FP32 routing for byte-level alignment with HF.
+
+    The reference ``modeling_hunyuan_image_3.py`` runs the router in fp32:
+
+    - ``HunyuanTopKGate.wg`` is constructed as ``nn.Linear(..., dtype=torch.float32)``
+      and ``hidden_states`` is cast to fp32 before the matmul (line 1114-1116).
+    - ``HunyuanMoE.forward`` wraps the gate call in
+      ``with torch.autocast('cuda', enabled=False):`` to defeat any AMP cast
+      (line 1204-1205), then calls ``easy_topk`` which does
+      ``F.softmax`` → ``torch.topk`` → divide by
+      ``torch.clamp(weight_sums, min=1e-8)`` → cast back to bf16, all in fp32
+      (line 1132-1139, 1206-1207).
+
+    vLLM's stock ``HunYuanSparseMoeBlock`` instead builds the gate as a
+    default-dtype ``ReplicatedLinear`` (bf16) and lets ``SharedFusedMoE``'s
+    ``topk_softmax`` CUDA op consume bf16 logits, which can flip top-k
+    boundary decisions vs HF on close routing scores. With ``num_experts=64``,
+    ``top_k=8`` per layer × 32 MoE layers, even a small per-token flip rate
+    cascades into divergent expert outputs and KV-cache state, eventually
+    flipping the top-1 decoded token.
+
+    This subclass:
+
+    1. Replaces ``self.gate`` with a fp32 ``ReplicatedLinear``.
+    2. Replaces ``self.experts`` with a ``SharedFusedMoE`` whose routing is a
+       no-op unpack of our pre-computed (topk_weights, topk_indices) — the
+       fp32 softmax/topk/renormalize is done in :meth:`forward` here, exactly
+       mirroring HF's ``easy_topk`` math (including ``clamp(min=1e-8)``).
+    """
+
+    def __init__(
+        self,
+        config,
+        quant_config=None,
+        layer_id: int = -1,
+        prefix: str = "",
+        enable_eplb: bool = False,
+    ) -> None:
+        # Bypass ``HunYuanSparseMoeBlock.__init__`` — it would build a wasteful
+        # bf16 gate + a stub ``SharedFusedMoE`` we'd then have to del+recreate
+        # (which trips ``ValueError: Duplicate layer name`` because the stub
+        # already registered itself in ``compilation_config.static_forward_context``).
+        # Instead, set up ``nn.Module`` ourselves and construct the fp32 gate
+        # + ``custom_routing_function``-driven ``SharedFusedMoE`` directly,
+        # mirroring the parent's structure 1:1 except for the routing dtype.
+        nn.Module.__init__(self)
+
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.ep_group = get_ep_group().device_group
+        self.ep_rank = get_ep_group().rank_in_group
+        self.ep_size = self.ep_group.size()
+        self.n_routed_experts = config.num_experts
+
+        if self.tp_size > config.num_experts:
+            raise ValueError(
+                f"Tensor parallel size {self.tp_size} is greater than "
+                f"the number of experts {config.num_experts}."
+            )
+
+        if isinstance(config.moe_topk, list):
+            top_k = config.moe_topk[layer_id]
+        else:
+            top_k = config.moe_topk
+        self.top_k = top_k
+
+        intermediate_size = config.intermediate_size
+        if config.moe_intermediate_size is not None:
+            intermediate_size = (
+                config.moe_intermediate_size
+                if isinstance(config.moe_intermediate_size, int)
+                else config.moe_intermediate_size[layer_id]
+            )
+
+        vllm_config = get_current_vllm_config()
+        eplb_config = vllm_config.parallel_config.eplb_config
+        self.enable_eplb = enable_eplb
+        self.n_logical_experts = self.n_routed_experts
+        self.n_redundant_experts = eplb_config.num_redundant_experts
+        self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
+        self.n_local_physical_experts = self.n_physical_experts // self.ep_size
+        self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
+        self.physical_expert_end = (
+            self.physical_expert_start + self.n_local_physical_experts
+        )
+
+        # FP32 router gate (HF: ``wg = nn.Linear(..., dtype=torch.float32)``).
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=None,
+            params_dtype=torch.float32,
+            prefix=f"{prefix}.gate",
+        )
+
+        if config.use_mixed_mlp_moe > 0:
+            num_shared_expert = (
+                config.num_shared_expert[layer_id]
+                if isinstance(config.num_shared_expert, list)
+                else config.num_shared_expert
+            )
+            self.shared_mlp = HunYuanMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size * num_shared_expert,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+                prefix=f"{prefix}.shared_mlp",
+            )
+        else:
+            self.shared_mlp = None
+
+        # Experts with our ``_hunyuan_image3_unpack_packed_topk`` custom
+        # routing — we feed it (topk_weights, topk_indices) packed into
+        # ``router_logits`` in ``forward()`` so the bf16 ``topk_softmax``
+        # CUDA op is bypassed entirely. ``renormalize=False`` because we
+        # already did clamp+divide in fp32 to match HF's
+        # ``topk_weight = topk_weight_1 / clamp(sum, min=1e-8)``.
+        self.experts = SharedFusedMoE(
+            shared_experts=self.shared_mlp,
+            num_experts=self.n_routed_experts,
+            top_k=top_k,
+            hidden_size=config.hidden_size,
+            intermediate_size=intermediate_size,
+            reduce_results=False,
+            renormalize=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.experts",
+            enable_eplb=self.enable_eplb,
+            num_redundant_experts=self.n_redundant_experts,
+            custom_routing_function=_hunyuan_image3_unpack_packed_topk,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        orig_shape = hidden_states.shape
+        hidden_dim = hidden_states.shape[-1]
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # FP32 router (HF: `with torch.autocast('cuda', enabled=False): ...`
+        # plus `if self.wg.weight.dtype == torch.float32: hidden_states.float()`).
+        # ``self.gate.weight`` is fp32 (params_dtype=torch.float32), so the
+        # ReplicatedLinear matmul runs in fp32 once we cast the input.
+        router_logits, _ = self.gate(hidden_states.float())
+
+        # softmax + topk + clamp-divide renormalization, all in fp32 — matches
+        # ``HunyuanTopKGate.easy_topk`` exactly.
+        gates = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+        topk_weights, topk_indices = torch.topk(gates, self.top_k, dim=-1)
+        weight_sums = topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights / weight_sums.clamp(min=1e-8)
+
+        # Cast topk weights to model dtype for the expert MLP combine.
+        # HF: ``topk_weights = topk_weights.to(hidden_states.dtype)`` (line 1207).
+        topk_weights = topk_weights.to(hidden_states.dtype)
+
+        # Pack (weights, indices) into the ``router_logits`` slot so
+        # ``_hunyuan_image3_unpack_packed_topk`` can pull them back out
+        # inside ``SharedFusedMoE``. Both halves are stored as fp32 for
+        # transport — the indices get cast back to int32 on unpack.
+        packed_routing = torch.cat(
+            [topk_weights.float(), topk_indices.to(torch.float32)], dim=-1
+        )
+
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states, router_logits=packed_routing
+        )
+        if self.shared_mlp is not None:
+            final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
+        if self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        return final_hidden_states.view(orig_shape)
+
+
 class HunyuanImage3RotaryEmbedding(nn.Module):
     """Custom interleaved 2D Rotary Embedding for HunyuanImage3.
 
@@ -1341,6 +1548,79 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self._eos_token_id: int = tokenizer.eos_token_id
 
         self._replace_rotary_embeddings()
+        self._patch_moe_blocks()
+
+    def _patch_moe_blocks(self):
+        """Replace stock ``HunYuanSparseMoeBlock`` instances with
+        :class:`HunyuanImage3SparseMoeBlock`, which routes in fp32 to match
+        the HF reference (``modeling_hunyuan_image_3.HunyuanMoE``).
+
+        Stock vLLM builds the router gate as a default-dtype (bf16)
+        ``ReplicatedLinear`` and lets ``SharedFusedMoE``'s ``topk_softmax``
+        kernel consume bf16 logits, which is the largest deterministic
+        precision gap remaining vs HF after the prompt/preprocessing
+        alignment fixes. See ``HunyuanImage3SparseMoeBlock`` docstring for
+        the full rationale.
+
+        Must run before weight loading (still inside ``__init__``) so the
+        replacement gate's fp32 ``params_dtype`` is honored when the
+        checkpoint is loaded.
+        """
+        if not _is_moe(self.config):
+            return
+        enable_eplb = getattr(
+            self.vllm_config.parallel_config, "enable_eplb", False
+        )
+        ccfg = self.vllm_config.compilation_config
+        replaced = 0
+        for layer_id, layer in enumerate(self.model.layers):
+            mlp = getattr(layer, "mlp", None)
+            if isinstance(mlp, HunYuanSparseMoeBlock) and not isinstance(
+                mlp, HunyuanImage3SparseMoeBlock
+            ):
+                # Pop the OLD experts' registration from
+                # ``static_forward_context`` first — otherwise the new
+                # ``SharedFusedMoE`` built inside
+                # :class:`HunyuanImage3SparseMoeBlock` will trip
+                # ``ValueError: Duplicate layer name`` (see
+                # vllm/model_executor/layers/fused_moe/layer.py:327).
+                old_prefix = f"model.layers.{layer_id}.mlp.experts"
+                ccfg.static_forward_context.pop(old_prefix, None)
+                if old_prefix in ccfg.static_all_moe_layers:
+                    ccfg.static_all_moe_layers.remove(old_prefix)
+
+                # Free the OLD MoE block's GPU buffers BEFORE allocating
+                # the replacement. The parent ``SharedFusedMoE`` pre-
+                # allocates the full ``[num_experts, ...]`` expert weight
+                # tensors at ``__init__`` (~750 MiB per layer per worker
+                # on this 80B model with TP=2), so without this drop we
+                # transiently double the MoE footprint and OOM near the
+                # gpu_memory_utilization cap.
+                layer.mlp = None
+                del mlp
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                layer.mlp = HunyuanImage3SparseMoeBlock(
+                    config=self.config,
+                    quant_config=self.quant_config,
+                    layer_id=layer_id,
+                    prefix=f"model.layers.{layer_id}.mlp",
+                    enable_eplb=enable_eplb,
+                )
+                replaced += 1
+        logger.info(
+            "Replaced %d HunYuanSparseMoeBlock layers with "
+            "HunyuanImage3SparseMoeBlock (fp32 router matching HF reference)",
+            replaced,
+        )
+        if replaced == 0:
+            logger.warning(
+                "HunyuanImage3: _patch_moe_blocks replaced 0 layers. "
+                "Routing will run in bf16 instead of fp32 — output will "
+                "diverge from the HF reference more than necessary. "
+                "Check that model.layers[*].mlp is HunYuanSparseMoeBlock."
+            )
 
     def _replace_rotary_embeddings(self):
         """Replace vLLM's standard MRotaryEmbedding with the custom
