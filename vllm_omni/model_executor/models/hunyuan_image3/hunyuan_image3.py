@@ -29,6 +29,7 @@ from vllm.distributed import (
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
+from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -1194,8 +1195,7 @@ class HunyuanImage3SparseMoeBlock(HunYuanSparseMoeBlock):
 
         if self.tp_size > config.num_experts:
             raise ValueError(
-                f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.num_experts}."
+                f"Tensor parallel size {self.tp_size} is greater than the number of experts {config.num_experts}."
             )
 
         if isinstance(config.moe_topk, list):
@@ -1220,9 +1220,7 @@ class HunyuanImage3SparseMoeBlock(HunYuanSparseMoeBlock):
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
         self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
-        self.physical_expert_end = (
-            self.physical_expert_start + self.n_local_physical_experts
-        )
+        self.physical_expert_end = self.physical_expert_start + self.n_local_physical_experts
 
         # FP32 router gate (HF: ``wg = nn.Linear(..., dtype=torch.float32)``).
         self.gate = ReplicatedLinear(
@@ -1298,13 +1296,9 @@ class HunyuanImage3SparseMoeBlock(HunYuanSparseMoeBlock):
         # ``_hunyuan_image3_unpack_packed_topk`` can pull them back out
         # inside ``SharedFusedMoE``. Both halves are stored as fp32 for
         # transport — the indices get cast back to int32 on unpack.
-        packed_routing = torch.cat(
-            [topk_weights.float(), topk_indices.to(torch.float32)], dim=-1
-        )
+        packed_routing = torch.cat([topk_weights.float(), topk_indices.to(torch.float32)], dim=-1)
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=packed_routing
-        )
+        final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=packed_routing)
         if self.shared_mlp is not None:
             final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
         if self.tp_size > 1:
@@ -1574,16 +1568,12 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         """
         if not _is_moe(self.config):
             return
-        enable_eplb = getattr(
-            self.vllm_config.parallel_config, "enable_eplb", False
-        )
+        enable_eplb = getattr(self.vllm_config.parallel_config, "enable_eplb", False)
         ccfg = self.vllm_config.compilation_config
         replaced = 0
         for layer_id, layer in enumerate(self.model.layers):
             mlp = getattr(layer, "mlp", None)
-            if isinstance(mlp, HunYuanSparseMoeBlock) and not isinstance(
-                mlp, HunyuanImage3SparseMoeBlock
-            ):
+            if isinstance(mlp, HunYuanSparseMoeBlock) and not isinstance(mlp, HunyuanImage3SparseMoeBlock):
                 # Pop the OLD experts' registration from
                 # ``static_forward_context`` first — otherwise the new
                 # ``SharedFusedMoE`` built inside
