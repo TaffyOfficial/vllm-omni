@@ -12,7 +12,6 @@ signature pattern as glm_image.ar2diffusion.
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import torch
@@ -63,18 +62,6 @@ def ar2diffusion(
         generated_token_ids = output.cumulative_token_ids
         generated_text = getattr(output, "text", "") or ""
 
-        if not generated_text and generated_token_ids:
-            tokenizer = _resolve_ar_tokenizer(stage_list[source_stage_id])
-            if tokenizer is not None:
-                try:
-                    generated_text = tokenizer.decode(list(generated_token_ids), skip_special_tokens=False)
-                except Exception as exc:
-                    logger.warning(
-                        "[ar2diffusion] Failed to decode AR tokens for request %d: %s",
-                        i,
-                        exc,
-                    )
-
         # Get original prompt info
         original_prompt = prompt[i] if i < len(prompt) else {}
         if isinstance(original_prompt, dict):
@@ -116,14 +103,15 @@ def ar2diffusion(
         if use_system_prompt is not None:
             diffusion_input["use_system_prompt"] = use_system_prompt
 
-        # Forward multimodal data (original image for IT2I conditioning)
+        # Forward multimodal data (original image for IT2I conditioning).
+        # The diffusion pre_process_func reads multi_modal_data["image"], which
+        # matches vLLM's standard prompt schema, so we only need to pass it once.
         mm_data = original_prompt.get("multi_modal_data")
         if mm_data:
             prompt_images = mm_data.get("image")
             if prompt_images is None:
                 prompt_images = mm_data.get("images")
             if prompt_images is not None:
-                diffusion_input["pil_image"] = prompt_images
                 diffusion_input["multi_modal_data"] = {"image": prompt_images}
 
         # Forward multimodal output from AR (if any)
@@ -140,40 +128,3 @@ def ar2diffusion(
         diffusion_inputs.append(diffusion_input)
 
     return diffusion_inputs
-
-
-logger = logging.getLogger(__name__)
-
-
-_AR_TOKENIZER_CACHE: dict[str, Any] = {}
-
-
-def _resolve_ar_tokenizer(stage_client: Any) -> Any:
-    """Best-effort resolution of the AR stage's tokenizer.
-
-    The stage client exposes the resolved ``vllm_config``; we use its
-    ``model_config.model`` path to load an ``AutoTokenizer`` lazily and cache
-    the result so we don't pay the init cost on every request.
-    """
-    model_path = None
-    vllm_config = getattr(stage_client, "vllm_config", None)
-    if vllm_config is not None:
-        model_cfg = getattr(vllm_config, "model_config", None)
-        if model_cfg is not None:
-            model_path = getattr(model_cfg, "tokenizer", None) or getattr(model_cfg, "model", None)
-    if model_path is None:
-        model_path = getattr(stage_client, "model", None) or getattr(stage_client, "model_name", None)
-    if not model_path:
-        return None
-    if model_path in _AR_TOKENIZER_CACHE:
-        return _AR_TOKENIZER_CACHE[model_path]
-    try:
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    except Exception as exc:
-        logger.warning("[ar2diffusion] Could not load tokenizer from %r: %s", model_path, exc)
-        _AR_TOKENIZER_CACHE[model_path] = None
-        return None
-    _AR_TOKENIZER_CACHE[model_path] = tokenizer
-    return tokenizer

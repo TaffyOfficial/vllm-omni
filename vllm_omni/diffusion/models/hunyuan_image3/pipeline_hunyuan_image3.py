@@ -109,16 +109,23 @@ def _to_pil_image(image: Any) -> PILImage.Image:
 
 
 def _resize_and_crop_center(image: PILImage.Image, target_width: int, target_height: int) -> PILImage.Image:
-    src_width, src_height = image.size
-    scale = max(target_width / src_width, target_height / src_height)
-    resized_width = max(target_width, int(round(src_width * scale)))
-    resized_height = max(target_height, int(round(src_height * scale)))
-    resized = image.resize((resized_width, resized_height), PILImage.Resampling.LANCZOS)
-    left = max((resized_width - target_width) // 2, 0)
-    top = max((resized_height - target_height) // 2, 0)
-    right = left + target_width
-    bottom = top + target_height
-    return resized.crop((left, top, right, bottom))
+    # Mirrors HunyuanImage3Processor._resize_and_crop in
+    # vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 so the AR
+    # and DiT stages preprocess condition images identically.
+    tw, th = target_width, target_height
+    w, h = image.size
+    tr = th / tw
+    r = h / w
+    if r < tr:
+        resize_height = th
+        resize_width = int(round(th / h * w))
+    else:
+        resize_width = tw
+        resize_height = int(round(tw / w * h))
+    resized = image.resize((resize_width, resize_height), PILImage.Resampling.LANCZOS)
+    crop_top = int(round((resize_height - th) / 2.0))
+    crop_left = int(round((resize_width - tw) / 2.0))
+    return resized.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
 
 
 def _to_python_scalar(value: Any) -> Any:
