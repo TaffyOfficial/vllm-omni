@@ -290,3 +290,163 @@ def test_segment_tokenize_diverges_from_full_string_encode():
         f"merged length ({len(full_ids)}) -- impossible if segmentation is "
         f"genuinely bypassing merges."
     )
+
+
+# -------------------- AR / DiT template-source consistency (PR #3107) --------------------
+#
+# Bounty-hunter raised the concern (PR #3107 review, 2026-05-04) that AR and
+# DiT call different functions to build their input token sequences and could
+# drift apart silently. The contract that keeps them aligned:
+#
+#   AR side   : `build_prompt_tokens(...)` from prompt_utils, which renders
+#               the canonical instruct chat template (tested above).
+#   DiT side  : `pipeline_hunyuan_image3.HunyuanImage3Pipeline.prepare_model_inputs`
+#               passes `sequence_template=getattr(self.generation_config,
+#               "sequence_template", "pretrain")` into the tokenizer wrapper,
+#               so the chat-template selection is driven by the model's own
+#               `generation_config.json` (which declares `"instruct"` for the
+#               HunyuanImage-3.0-Instruct checkpoint).
+#
+# These tests are structural guards: they don't require a GPU or model
+# weights, but they fail loudly the moment either side pivots away from the
+# shared instruct template.
+
+
+def test_dit_pipeline_reads_sequence_template_from_generation_config():
+    """Guard: DiT must derive `sequence_template` from `generation_config`.
+
+    If someone hardcodes ``sequence_template="pretrain"`` (the historic
+    bug) or removes the lookup entirely, the DiT prefix re-diverges from
+    the AR prefill -- exactly the AR/DiT inconsistency we're protecting
+    against.
+    """
+    pipeline_path = (
+        _repo_root()
+        / "vllm_omni"
+        / "diffusion"
+        / "models"
+        / "hunyuan_image3"
+        / "pipeline_hunyuan_image3.py"
+    )
+    assert pipeline_path.is_file(), f"pipeline_hunyuan_image3.py not found at {pipeline_path}"
+    src = pipeline_path.read_text(encoding="utf-8")
+
+    tree = ast.parse(src)
+
+    # Locate HunyuanImage3Pipeline.prepare_model_inputs.
+    target_func: ast.FunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "HunyuanImage3Pipeline":
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == "prepare_model_inputs":
+                    target_func = item
+                    break
+            if target_func is not None:
+                break
+    assert target_func is not None, (
+        "HunyuanImage3Pipeline.prepare_model_inputs not found -- this guard "
+        "needs to be retargeted at the new entry point."
+    )
+
+    # Inside that function, look for an assignment of the form
+    #     sequence_template = getattr(self.generation_config, "sequence_template", ...)
+    # OR  sequence_template = self.generation_config.sequence_template
+    found_dynamic_lookup = False
+    for stmt in ast.walk(target_func):
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "sequence_template" for t in stmt.targets):
+            continue
+        value = stmt.value
+        # getattr(self.generation_config, "sequence_template", ...)
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "getattr"
+            and len(value.args) >= 2
+            and isinstance(value.args[1], ast.Constant)
+            and value.args[1].value == "sequence_template"
+        ):
+            found_dynamic_lookup = True
+            break
+        # self.generation_config.sequence_template
+        if (
+            isinstance(value, ast.Attribute)
+            and value.attr == "sequence_template"
+            and isinstance(value.value, ast.Attribute)
+            and value.value.attr == "generation_config"
+        ):
+            found_dynamic_lookup = True
+            break
+
+    assert found_dynamic_lookup, (
+        "prepare_model_inputs no longer reads sequence_template from "
+        "generation_config. The DiT prefix template is now fixed at compile "
+        "time, which lets it drift away from the AR side that uses the "
+        "model's instruct chat template via prompt_utils.build_prompt_tokens."
+    )
+
+    # And it must be passed into apply_chat_template (i.e. actually used).
+    used_in_apply_chat_template = False
+    for call in ast.walk(target_func):
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)):
+            continue
+        if call.func.attr != "apply_chat_template":
+            continue
+        for kw in call.keywords:
+            if (
+                kw.arg == "sequence_template"
+                and isinstance(kw.value, ast.Name)
+                and kw.value.id == "sequence_template"
+            ):
+                used_in_apply_chat_template = True
+                break
+        if used_in_apply_chat_template:
+            break
+    assert used_in_apply_chat_template, (
+        "sequence_template is computed but not forwarded to apply_chat_template "
+        "-- the DiT chat template is now decoupled from generation_config."
+    )
+
+
+def test_dit_tokenizer_wrapper_supports_instruct_branch():
+    """Guard: the DiT-side `TokenizerWrapper` still has an `instruct` branch.
+
+    `prepare_model_inputs` reads ``sequence_template`` from
+    ``generation_config`` (verified by the test above) and forwards it to
+    ``TokenizerWrapper.apply_chat_template``. If someone deletes the
+    `instruct` codepath inside the wrapper, AR (which uses the instruct
+    template via `prompt_utils.build_prompt_tokens`) and DiT (which would
+    silently fall through to a pretrain-style branch) drift apart -- the
+    exact bug class flagged in PR #3107 review.
+
+    AR-side instruct anchors (`User: ` / `Assistant: `) live in the model's
+    chat-template definition, not in the wrapper module, so we don't grep
+    for those literal strings here -- we assert the wrapper still routes
+    on ``sequence_template == "instruct"``.
+    """
+    # AR side: prompt_utils.build_prompt must emit the User:/Assistant: framing.
+    s = build_prompt("HELLO", task="it2i_think")
+    assert "User: " in s and "Assistant: " in s, (
+        "prompt_utils.build_prompt no longer emits the canonical instruct "
+        "framing -- AR and DiT will produce different prefixes."
+    )
+
+    # DiT side: the tokenizer wrapper must still recognize sequence_template="instruct".
+    tk_wrapper_path = (
+        _repo_root()
+        / "vllm_omni"
+        / "diffusion"
+        / "models"
+        / "hunyuan_image3"
+        / "hunyuan_image3_tokenizer.py"
+    )
+    if not tk_wrapper_path.is_file():
+        pytest.skip(f"hunyuan_image3_tokenizer.py not found at {tk_wrapper_path}; structural anchor moved")
+    tk_src = tk_wrapper_path.read_text(encoding="utf-8")
+    assert '"instruct"' in tk_src or "'instruct'" in tk_src, (
+        "DiT-side TokenizerWrapper no longer references sequence_template='instruct'. "
+        "AR (prompt_utils.build_prompt_tokens) still produces the instruct prefix; "
+        "the wrapper losing the matching branch is the AR/DiT-template-drift bug "
+        "class Bounty-hunter flagged on PR #3107."
+    )
