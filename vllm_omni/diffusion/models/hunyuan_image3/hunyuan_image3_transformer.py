@@ -1512,12 +1512,12 @@ class HunYuanSparseMoeBlock(nn.Module):
             self.shared_mlp = None
 
         self.experts = HunyuanFusedMoE(
+            gate=self.gate,
             shared_experts=self.shared_mlp,
             num_experts=self.n_routed_experts,
             top_k=top_k,
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size,
-            reduce_results=False,
             renormalize=top_k > 1,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
@@ -1532,14 +1532,15 @@ class HunYuanSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
-        if self.shared_mlp is not None:
-            final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
-
-        if self.tp_size > 1:
-            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
+        # vllm 0.20+ FusedMoE owns the gate (passed via __init__) and the
+        # shared-experts merge + TP all-reduce internally. Pass `hidden_states`
+        # as both inputs and `router_logits` so FusedMoE's stored gate runs
+        # routing in-place; the returned tensor is the already-combined
+        # (routed + shared) output, no tuple unpacking needed.
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            router_logits=hidden_states,
+        )
 
         return final_hidden_states.view(orig_shape)
 

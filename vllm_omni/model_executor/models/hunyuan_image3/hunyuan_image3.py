@@ -29,7 +29,16 @@ from vllm.distributed import (
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
-from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
+
+try:
+    from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
+except ImportError:
+    # PyPI vllm 0.20.x neither exports `SharedFusedMoE` from the package top-level
+    # nor ships a `shared_fused_moe.py` submodule. The functionality lives on
+    # `FusedMoE` directly (which gained a `shared_experts` parameter), so alias
+    # the symbol — call sites only use the classmethod `make_expert_params_mapping`
+    # and `__init__(shared_experts=..., ...)` which are present on `FusedMoE`.
+    from vllm.model_executor.layers.fused_moe import FusedMoE as SharedFusedMoE
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -1261,7 +1270,6 @@ class HunyuanImage3SparseMoeBlock(HunYuanSparseMoeBlock):
             top_k=top_k,
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size,
-            reduce_results=False,
             renormalize=False,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
@@ -1298,11 +1306,12 @@ class HunyuanImage3SparseMoeBlock(HunYuanSparseMoeBlock):
         # transport — the indices get cast back to int32 on unpack.
         packed_routing = torch.cat([topk_weights.float(), topk_indices.to(torch.float32)], dim=-1)
 
+        # vllm 0.20+ FusedMoE merges shared-experts internally and runs the
+        # TP all-reduce inside its forward (we no longer pass
+        # `reduce_results=False`). The tuple `(routed, shared)` return shape
+        # from the legacy SharedFusedMoE is gone; the result is the
+        # already-combined, already-reduced tensor.
         final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=packed_routing)
-        if self.shared_mlp is not None:
-            final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(orig_shape)
 
 

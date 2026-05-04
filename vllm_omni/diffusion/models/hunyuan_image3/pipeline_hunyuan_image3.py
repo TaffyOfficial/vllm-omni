@@ -352,8 +352,11 @@ class HunyuanImage3Pipeline(
         self.image_processor = HunyuanImage3ImageProcessor(self.hf_config)
         self.hf_config.vit.pop("use_return_dict", None)
         vision_config = Siglip2VisionConfig(**self.hf_config.vit)
-        self.vision_model = Siglip2VisionModel(vision_config).vision_model
-        # self.vision_model = vision_model.vision_model
+        # transformers >=5.54 removed the `.vision_model` attribute from
+        # Siglip2VisionModel; the top-level module is now itself the vision
+        # tower. Older transformers expose both, so dropping `.vision_model`
+        # is forward-compatible.
+        self.vision_model = Siglip2VisionModel(vision_config)
         self.vision_aligner = LightProjector(self.hf_config.vit_aligner)
         self.timestep_emb = TimestepEmbedder(hidden_size=self.hf_config.hidden_size)
         if self.hf_config.img_proj_type != "unet":
@@ -837,18 +840,21 @@ class HunyuanImage3Pipeline(
             cond_vae_images, cond_timestep, cond_vit_images = self._encode_cond_image(
                 batch_cond_image_info, cfg_factor[mode]
             )
-            # Pack vit kwargs. Siglip2-so requires spatial_shapes and attention_mask for inference.
-            vit_kwargs = {"spatial_shapes": [], "attention_mask": []}
+            # Pack vit kwargs. Siglip2 requires spatial_shapes and pixel_attention_mask
+            # at the forward boundary. transformers >=5.54 renamed the kwarg from
+            # `attention_mask` to `pixel_attention_mask` so the dict key must match
+            # the expected forward signature.
+            vit_kwargs = {"spatial_shapes": [], "pixel_attention_mask": []}
             for cond_image_info in batch_cond_image_info:
                 vit_kwargs["spatial_shapes"].append(
                     torch.stack([item.vision_encoder_kwargs["spatial_shapes"] for item in cond_image_info])
                 )
-                vit_kwargs["attention_mask"].append(
+                vit_kwargs["pixel_attention_mask"].append(
                     torch.stack([item.vision_encoder_kwargs["pixel_attention_mask"] for item in cond_image_info])
                 )
             if cfg_factor[mode] > 1:
                 vit_kwargs["spatial_shapes"] = vit_kwargs["spatial_shapes"] * cfg_factor[mode]
-                vit_kwargs["attention_mask"] = vit_kwargs["attention_mask"] * cfg_factor[mode]
+                vit_kwargs["pixel_attention_mask"] = vit_kwargs["pixel_attention_mask"] * cfg_factor[mode]
         else:
             cond_vae_images, cond_timestep, cond_vit_images = None, None, None
             vit_kwargs = None
