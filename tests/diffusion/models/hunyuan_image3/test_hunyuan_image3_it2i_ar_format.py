@@ -51,121 +51,25 @@ def _snapshot_dir(model_id: str) -> pathlib.Path:
     return snap
 
 
-@pytest.mark.skipif(
-    not _hf_cached(_HUNYUAN_MODEL_ID),
-    reason=f"{_HUNYUAN_MODEL_ID} not in HF cache",
-)
-def test_ar_prefill_tokens_match_official_hf_apply_chat_template_for_it2i():
-    """The AR-side prefill we build must be token-id-identical to what
-    the official HunyuanImage3TokenizerFast's ``apply_chat_template`` emits
-    for the same (system, user_prompt, image) triple under
-    ``sequence_template="instruct"`` + ``bot_task="think"``.
-
-    The Instruct template canonical contract for IT2I (``it2i_think``):
-
-      [BOS] + system_prompt + "\\n\\n" + "User: " + <img> + user_prompt
-      + "\\n\\nAssistant: " + <think>
-
-    This is what the model was trained on; our segment-by-segment
-    ``build_prompt_tokens`` (PR #3243) was hand-derived to match. If
-    upstream changes the canonical template (extra space, BOS dropped,
-    trigger moved) or our segment list drifts, the AR prefill no longer
-    matches the model's training distribution and IT2I output collapses
-    into repetition garbage -- same failure mode PR #3243 fixed for T2I.
-
-    We bypass HF's generic ``apply_chat_template`` (the model's
-    tokenizer config has no ``chat_template`` field; the canonical
-    template lives on the custom ``HunyuanImage3TokenizerFast`` class loaded
-    via ``trust_remote_code``). The custom method has a non-standard
-    signature -- batch lists, ``sequence_template`` switch, ``mode``,
-    ``bot_task`` -- so we adapt the call site rather than using
-    ``apply_chat_template(messages, ...)`` directly.
-    """
-    from transformers import AutoTokenizer
-
-    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
-        _TASK_PRESETS,
-        build_prompt_tokens,
-    )
-    from vllm_omni.diffusion.models.hunyuan_image3.system_prompt import get_system_prompt
-
-    user_prompt = "Add a cute orange cat sitting in the foreground."
-    task = "it2i_think"
-
-    # The standard tokenizer (used to encode our segments) and the custom
-    # HunyuanImage3TokenizerFast (used to render the canonical Instruct
-    # template) are loaded separately. AutoTokenizer with trust_remote_code
-    # returns the standard fast tokenizer because the model's
-    # ``tokenizer_config.json`` declares ``tokenizer_class:
-    # PreTrainedTokenizerFast`` -- the custom class is shipped as a
-    # standalone module rather than via auto-mapping.
-    fast_tok = AutoTokenizer.from_pretrained(_HUNYUAN_MODEL_ID, trust_remote_code=True)
-    ours = build_prompt_tokens(user_prompt, fast_tok, task=task)
-
-    preset_sys_type, preset_bot_task, _ = _TASK_PRESETS[task]
-    sys_text = get_system_prompt(preset_sys_type, preset_bot_task, None) or ""
-
-    tok_mod, _img_mod = _import_official_snapshot_modules()
-    if tok_mod is None or not hasattr(tok_mod, "HunyuanImage3TokenizerFast"):
-        pytest.skip("Official HunyuanImage3TokenizerFast module not loadable")
-
-    snap = _snapshot_dir(_HUNYUAN_MODEL_ID)
-    try:
-        official_tok = tok_mod.HunyuanImage3TokenizerFast.from_pretrained(
-            str(snap),
-            sequence_template="instruct",
-        )
-    except Exception as exc:
-        pytest.skip(f"Official HunyuanImage3TokenizerFast.from_pretrained failed: {exc}")
-
-    try:
-        out = official_tok.apply_chat_template(
-            batch_prompt=[user_prompt],
-            batch_system_prompt=[sys_text],
-            mode="gen_text",
-            bot_task="think",
-            sequence_template="instruct",
-            cfg_factor=1,
-            add_assistant_prefix=True,
-        )
-    except Exception as exc:
-        pytest.skip(
-            f"Official apply_chat_template raised at runtime: {exc}"
-        )
-
-    # ``apply_chat_template`` returns ``{"output": <SpecialOutput>, "sections": ...}``
-    # where ``SpecialOutput.tokens`` is a tensor of shape
-    # ``(batch * cfg_factor, seq_len)``. Extract the single-batch list.
-    if isinstance(out, dict):
-        output_obj = out.get("output", out)
-    else:
-        output_obj = out
-    tokens = getattr(output_obj, "tokens", None)
-    if tokens is None and isinstance(out, dict):
-        tokens = out.get("input_ids")
-    if tokens is None:
-        pytest.skip(
-            "apply_chat_template returned an object without `tokens`/`input_ids`"
-        )
-    if hasattr(tokens, "tolist"):
-        tokens = tokens.tolist()
-    if tokens and isinstance(tokens[0], list):
-        hf_ids = list(tokens[0])
-    else:
-        hf_ids = list(tokens)
-
-    # The official template includes the `<img>` placeholder once for the
-    # condition image; our `build_prompt_tokens(task='it2i_think')` also
-    # inserts a single `<img>` slot for the IT2I case. Both lists should
-    # therefore align directly without padding.
-    assert ours == hf_ids, (
-        "AR-prefill token-id sequence drifted from official apply_chat_template:\n"
-        f"  ours length={len(ours)}, hf length={len(hf_ids)}\n"
-        f"  first divergent index="
-        f"{next((i for i, (a, b) in enumerate(zip(ours, hf_ids)) if a != b), 'tail-diff')}\n"
-        "  -> the IT2I AR prefill no longer matches the model's training "
-        "  distribution (same class of bug PR #3243 fixed for T2I)."
-    )
+# --- Real AR-output comparison lives in
+# tests/e2e/accuracy/test_hunyuan_image3_it2i_ar_output.py ---
+#
+# Earlier revisions of this file shipped a CPU-only "compare prefill
+# token sequences" check that called the official tokenizer's
+# `apply_chat_template`. That comparison was misleading: it only verified
+# the *input* prompt template, not the AR-stage *generated output*; and
+# it kept skipping because instantiating
+# `HunyuanImage3TokenizerFast.from_pretrained(snap)` returns a
+# byte-fallback (char-level) tokenizer that is not the same encoding the
+# vllm-omni production path actually uses (which goes through the
+# standard `AutoTokenizer.from_pretrained`).
+#
+# The "AR output matches official" contract is genuinely a GPU-required
+# end-to-end test: it must drive `model.prepare_model_inputs` +
+# `model.generate(do_sample=False)` on the HF side and the IT2I `i2t`
+# stage on the omni side, then compare AR-generated token sequences.
+# That is now the responsibility of the e2e test in
+# tests/e2e/accuracy/test_hunyuan_image3_it2i_ar_output.py.
 
 
 _OFFICIAL_PKG = "_hunyuan_image_3_official_snapshot"
