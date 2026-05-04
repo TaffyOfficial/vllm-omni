@@ -228,18 +228,33 @@ def _run_omni_ar_greedy(
     return list(prefill_token_ids), generated, decoded
 
 
-@pytest.mark.skipif(
-    not _hf_cached(_HUNYUAN_MODEL_ID),
-    reason=f"{_HUNYUAN_MODEL_ID} not in HF cache",
+_RECORDED_BASELINE = (
+    pathlib.Path(__file__).resolve().parents[3]
+    / "tests"
+    / "diffusion"
+    / "models"
+    / "hunyuan_image3"
+    / "_hi3_ar_hf_baseline.json"
 )
-@pytest.mark.skipif(
-    not _required_modeling_patches_present(),
-    reason=(
-        "modeling_hunyuan_image_3.py snapshot is missing the RoPE-broadcast "
-        "and 2D-attention-mask patches (see workflow-starter/memory/hf/"
-        "hf_baseline_runbook.md). HF baseline cannot run cleanly without them."
-    ),
-)
+
+
+def _load_recorded_baseline():
+    """Recorded HF AR-output baseline produced by running this test's HF
+    path inside the project's ``/root/venv_hf`` (transformers==4.57.1,
+    torch==2.8.0+cu128). The capture script lives at
+    ``scripts/bench/bench_ar_hf.py``; the JSON is checked in so the
+    omni-side regression can run without rebuilding the heavy HF
+    environment on every CI shard."""
+    import json
+
+    if not _RECORDED_BASELINE.is_file():
+        return None
+    try:
+        return json.loads(_RECORDED_BASELINE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
 def test_omni_ar_output_aligns_with_hf_reference_greedy() -> None:
     """End-to-end: vllm-omni AR-stage output must match HF reference output
     on the prefill-tokens-byte-identical front and on a small generated
@@ -248,6 +263,19 @@ def test_omni_ar_output_aligns_with_hf_reference_greedy() -> None:
     This is the strict version of "AR output matches official AR output
     format" -- both sides are *running* the model, not just rendering a
     chat template.
+
+    Two modes:
+      - ``recorded`` (preferred): a JSON baseline checked in alongside
+        this test holds the HF prefill input_ids + first-N greedy tokens
+        captured offline in the project's HF venv (transformers==4.57.1,
+        torch==2.8.0+cu128, with the two manual modeling patches from
+        workflow-starter/memory/hf/hf_baseline_runbook.md applied). The
+        recorded mode keeps CI fast and doesn't require pulling in two
+        incompatible HF stacks at the same time.
+      - ``live`` (fallback): if the JSON isn't there, the test falls back
+        to launching HF and omni in the same process. Heavy and only
+        works on a venv that can simultaneously satisfy both
+        transformers/torch pins.
     """
     import torch
 
@@ -256,10 +284,23 @@ def test_omni_ar_output_aligns_with_hf_reference_greedy() -> None:
 
     condition_image = _make_synthetic_condition_image()
 
-    # 1. HF reference -- pulls input_ids straight from prepare_model_inputs.
-    hf_prefill, hf_gen_tokens, hf_decoded = _run_hf_ar_greedy(condition_image)
+    recorded = _load_recorded_baseline()
+    if recorded is not None:
+        hf_prefill = list(recorded["prefill_input_ids"])
+        hf_gen_tokens = list(recorded["generated_token_ids"])
+        hf_decoded = recorded.get("decoded_text", "")
+    else:
+        if not _hf_cached(_HUNYUAN_MODEL_ID):
+            pytest.skip(f"{_HUNYUAN_MODEL_ID} not in HF cache and no recorded baseline")
+        if not _required_modeling_patches_present():
+            pytest.skip(
+                "modeling_hunyuan_image_3.py snapshot is missing the RoPE / 2D-mask "
+                "patches; recorded baseline JSON is also missing. See "
+                "workflow-starter/memory/hf/hf_baseline_runbook.md."
+            )
+        hf_prefill, hf_gen_tokens, hf_decoded = _run_hf_ar_greedy(condition_image)
 
-    # 2. vllm-omni AR -- consumes the same input_ids via prompt_token_ids.
+    # Run vllm-omni AR -- consumes the same input_ids via prompt_token_ids.
     om_prefill, om_gen_tokens, om_decoded = _run_omni_ar_greedy(
         condition_image, prefill_token_ids=hf_prefill
     )
