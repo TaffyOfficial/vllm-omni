@@ -233,7 +233,7 @@ def test_hunyuan_image3_instruct_t2i_dummy_forward(monkeypatch):
     ]
     assert captured["generate"]["gen_timestep_scatter_index"].tolist() == [[1], [1]]
     assert captured["generate"]["generator"] is generator
-    assert captured["generate"]["eos_token_id"] == [10]
+    assert captured["generate"]["eos_token_id"] == [11, 10]
     assert captured["generate"]["max_new_tokens"] is None
     assert captured["generate"]["batch_gen_image_info"] == captured["chat_template"]["batch_gen_image_info"]
     assert captured["generate"]["tokenizer_output"].tokens.tolist() == [[1, 2, 3, 4], [1, 2, 3, 4]]
