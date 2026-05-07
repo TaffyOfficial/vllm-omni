@@ -1,0 +1,61 @@
+{#-
+  HunyuanImage-3.0-Instruct chat template for /v1/chat/completions.
+
+  HunyuanImage3's HF tokenizer ships without a default chat_template, so
+  /v1/chat/completions requests fail with ChatTemplateResolutionError unless
+  one is supplied explicitly via --chat-template.
+
+  This template targets the **text-to-image with chain-of-thought** path
+  (the `t2i_think` task in `vllm_omni.diffusion.models.hunyuan_image3.prompt_utils`).
+  It emits the `<think>` trigger after `Assistant: `, which is the format the
+  AR/DiT pipeline expects for image generation. For pure-text comprehension
+  (i2t / t2t), prefer the offline `examples/offline_inference/hunyuan_image3/`
+  flow which builds prompts via `build_prompt_tokens()` and skips the trigger.
+
+  The official `unified_system_prompt_en` (see system_prompt.py) is *not*
+  embedded here — pass it explicitly as a `system` role message when output
+  quality matters (e.g. demos / non-benchmark runs). Without a system message
+  the AR will still produce a latent, but quality is degraded vs. the offline
+  end2end.py path.
+
+  Reference format (from prompt_utils.py):
+    <|startoftext|>{system?}\n\nUser: {<img>?}{user_prompt}\n\nAssistant: {<think>?}
+-#}
+{{- '<|startoftext|>' -}}
+{%- for message in messages -%}
+  {%- if message.role == 'system' -%}
+    {%- if message.content is string -%}
+      {{- message.content -}}
+    {%- else -%}
+      {%- for c in message.content -%}
+        {%- if c.type == 'text' -%}{{- c.text -}}{%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+    {{- '\n\n' -}}
+  {%- endif -%}
+{%- endfor -%}
+{%- for message in messages -%}
+  {%- if message.role == 'user' -%}
+    {{- 'User: ' -}}
+    {%- if message.content is string -%}
+      {{- message.content -}}
+    {%- else -%}
+      {%- for c in message.content -%}
+        {%- if c.type == 'image_url' -%}{{- '<img>' -}}{%- endif -%}
+        {%- if c.type == 'text' -%}{{- c.text -}}{%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+    {{- '\n\nAssistant: ' -}}
+  {%- elif message.role == 'assistant' -%}
+    {%- if message.content is string -%}
+      {{- message.content -}}
+    {%- else -%}
+      {%- for c in message.content -%}
+        {%- if c.type == 'text' -%}{{- c.text -}}{%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+  {{- '<think>' -}}
+{%- endif -%}

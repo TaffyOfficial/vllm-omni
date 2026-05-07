@@ -1,0 +1,90 @@
+# Stage config for running Hunyuan-Image3.0 t2i on 4 GPUs (2 AR + 2 DiT).
+# Adapted from hunyuan_image3_moe.yaml (8 GPU 4+4) by halving TP on each stage.
+#
+# Verified on 4x NVIDIA L20X 144GB. Should also fit on 4x L40S 48GB / 4x A100 80GB
+# but VAE tiling may be required on the smaller-VRAM cards (pass --vae-use-tiling).
+#
+# Devices layout: AR on GPU 0,1 (TP=2); DiT on GPU 2,3 (TP=2).
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0,1"
+    engine_args:
+      model_stage: AR
+      max_num_seqs: 1
+      model_arch: HunyuanImage3ForCausalMM
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.9
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+      tensor_parallel_size: 2
+      pipeline_parallel_size: 1
+      hf_overrides:
+        rope_parameters:
+          mrope_section: [0, 32, 32]
+          rope_type: default
+      omni_kv_config:
+        need_send_cache: true
+        kv_transfer_criteria:
+          type: prefill_finished
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.1
+  - stage_id: 1
+    stage_type: diffusion
+    runtime:
+      process: true
+      devices: "2,3"
+      max_batch_size: 1
+    engine_args:
+      model_stage: diffusion
+      enforce_eager: true
+      distributed_executor_backend: "mp"
+      vae_use_slicing: false
+      vae_use_tiling: false
+      cache_backend: null
+      cache_config: null
+      enable_cache_dit_summary: false
+      omni_kv_config:
+        need_recv_cache: true
+      parallel_config:
+        pipeline_parallel_size: 1
+        data_parallel_size: 1
+        tensor_parallel_size: 2
+        enable_expert_parallel: false
+        sequence_parallel_size: 1
+        ulysses_degree: 1
+        ring_degree: 1
+        cfg_parallel_size: 1
+        vae_patch_parallel_size: 1
+        use_hsdp: false
+        hsdp_shard_size: -1
+        hsdp_replicate_size: 1
+    engine_input_source: [0]
+    final_output: true
+    final_output_type: image
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
