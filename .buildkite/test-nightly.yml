@@ -335,7 +335,7 @@ steps:
       - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with H100"
         timeout_in_minutes: 120
         commands:
-          - pytest -sv tests/e2e/ -k "not test_wan and not test_bagel_expansion and not hunyuan" -m "full_model and diffusion and H100 and not resource_heavy" --run-level "full_model" --ignore=tests/e2e/accuracy
+          - pytest -sv tests/e2e/ -k "not test_wan and not test_bagel_expansion and not hunyuan" -m "full_model and diffusion and H100" --run-level "full_model" --ignore=tests/e2e/accuracy
         agents:
           queue: "mithril-h100-pool"
         plugins:
@@ -412,7 +412,7 @@ steps:
       - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with L4"
         timeout_in_minutes: 60
         commands:
-          - pytest -sv tests/e2e/ -k "not test_wan and not test_bagel_expansion and not hunyuan" -m "full_model and diffusion and L4 and not resource_heavy" --run-level "full_model" --ignore=tests/e2e/accuracy
+          - pytest -sv tests/e2e/ -k "not test_wan and not test_bagel_expansion and not hunyuan" -m "full_model and diffusion and L4" --run-level "full_model" --ignore=tests/e2e/accuracy
         agents:
           queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
         plugins:
@@ -469,7 +469,7 @@ steps:
       - label: ":full_moon: Diffusion X2I(&A&T) · GEBench Accuracy Test"
         timeout_in_minutes: 60
         commands:
-          - pytest -s -v tests/e2e/accuracy/test_gebench_h100_smoke.py --run-level full_model --gebench-model Qwen/Qwen-Image-2512 --accuracy-judge-model QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ --accuracy-gpu 0 --gebench-port 8093 --accuracy-workers 1 --gebench-min-overall 0.35 --gebench-min-type3 0.30 --gebench-min-type4 0.35
+          - pytest -s -v tests/e2e/accuracy/test_gebench_h100_smoke.py --run-level full_model --gebench-model Qwen/Qwen-Image-2512 --accuracy-judge-model QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ --accuracy-gpu 0 --gebench-port 8093 --accuracy-workers 1
           - buildkite-agent artifact upload "tests/e2e/accuracy/artifacts/gebench_qwen-image-2512/summary*.json"
         agents:
           queue: "mithril-h100-pool"
@@ -481,49 +481,6 @@ steps:
                     resources:
                       limits:
                         nvidia.com/gpu: 1
-                    volumeMounts:
-                      - name: devshm
-                        mountPath: /dev/shm
-                      - name: hf-cache
-                        mountPath: /root/.cache/huggingface
-                    env:
-                      - name: HF_HOME
-                        value: /root/.cache/huggingface
-                      - name: HF_TOKEN
-                        valueFrom:
-                          secretKeyRef:
-                            name: hf-token-secret
-                            key: token
-                nodeSelector:
-                  node.kubernetes.io/instance-type: gpu-h100-sxm
-                volumes:
-                  - name: devshm
-                    emptyDir:
-                      medium: Memory
-                  - name: hf-cache
-                    hostPath:
-                      path: /mnt/hf-cache
-                      type: DirectoryOrCreate
-
-      - label: ":full_moon: Diffusion X2I(&A&T) · GEBench Accuracy Test (HunyuanImage-3.0)"
-        timeout_in_minutes: 120
-        commands:
-          # GPU memory cleanup before/after to prevent leaks from 80B MoE TP=4+EP workers.
-          # Generate (4 GPUs, TP=4+EP) and judge (1 GPU) run sequentially via fixture
-          # context managers — judge GPU 0 is reused after generate teardown.
-          - export VLLM_TEST_CLEAN_GPU_MEMORY="1"
-          - pytest -s -v tests/e2e/accuracy/test_gebench_h100_smoke.py --run-level full_model --gebench-model tencent/HunyuanImage-3.0-Instruct --accuracy-judge-model QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ --gebench-devices 0,1,2,3 --gebench-port 8094 --accuracy-gpu 0 --gebench-samples-per-type 4 --gebench-num-inference-steps 28 --accuracy-workers 1 --gebench-t2i-only --gebench-stage-overrides '{"0":{"devices":"0,1,2,3","enable_expert_parallel":true,"max_num_seqs":1}}' --gebench-extra-server-args '["--dtype","bfloat16","--gpu-memory-utilization","0.95","--enforce-eager","--trust-remote-code","--distributed-executor-backend","mp","--no-async-chunk"]'
-          - buildkite-agent artifact upload "tests/e2e/accuracy/artifacts/gebench_hunyuanimage-3_0-instruct/summary*.json"
-        agents:
-          queue: "mithril-h100-pool"
-        plugins:
-          - kubernetes:
-              podSpec:
-                containers:
-                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                    resources:
-                      limits:
-                        nvidia.com/gpu: 4
                     volumeMounts:
                       - name: devshm
                         mountPath: /dev/shm

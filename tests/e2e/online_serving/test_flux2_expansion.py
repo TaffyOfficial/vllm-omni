@@ -14,7 +14,7 @@ import pytest
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model, pytest.mark.resource_heavy]
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 FOUR_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=4)
 POSITIVE_PROMPT = "A cat sitting on a windowsill"

@@ -214,7 +214,6 @@ markers = [
     # more detailed markers
     "slow: Slow tests (may skip in quick CI)",
     "benchmark: Benchmark tests",
-    "resource_heavy: Full-model tests that need dedicated CI jobs instead of broad nightly sweeps",
 ]
 filterwarnings = [
     "ignore:.*does not have '__test__' attribute.*:UserWarning",
