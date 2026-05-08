@@ -94,6 +94,27 @@ def pytest_addoption(parser):
         default=False,
         help="Only generate/evaluate T2I frame0 for type3/type4, skip IT2I trajectory",
     )
+    group.addoption(
+        "--gebench-min-overall",
+        action="store",
+        type=float,
+        default=0.45,
+        help="Minimum overall GEBench mean score for the smoke test",
+    )
+    group.addoption(
+        "--gebench-min-type3",
+        action="store",
+        type=float,
+        default=0.45,
+        help="Minimum GEBench type3 mean score for the smoke test",
+    )
+    group.addoption(
+        "--gebench-min-type4",
+        action="store",
+        type=float,
+        default=0.45,
+        help="Minimum GEBench type4 mean score for the smoke test",
+    )
 
 
 def _hf_cache_root() -> Path:
@@ -216,6 +237,15 @@ def gebench_t2i_only(request: pytest.FixtureRequest) -> bool:
 
 
 @pytest.fixture(scope="session")
+def gebench_min_scores(request: pytest.FixtureRequest) -> dict[str, float]:
+    return {
+        "overall": float(request.config.getoption("gebench_min_overall")),
+        "type3": float(request.config.getoption("gebench_min_type3")),
+        "type4": float(request.config.getoption("gebench_min_type4")),
+    }
+
+
+@pytest.fixture(scope="session")
 def gedit_samples_per_group(request: pytest.FixtureRequest) -> int:
     return int(request.config.getoption("gedit_samples_per_group"))
 
@@ -302,6 +332,7 @@ def _build_accuracy_server_config(
         "32768",
         "--gpu-memory-utilization",
         "0.8",
+        "--enforce-eager",
     ]
 
     generate_params_kwargs: dict = dict(

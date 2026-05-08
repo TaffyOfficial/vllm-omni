@@ -22,6 +22,7 @@ def test_gebench_h100_smoke(
     gebench_num_inference_steps: int,
     accuracy_workers: int,
     gebench_t2i_only: bool,
+    gebench_min_scores: dict[str, float],
 ) -> None:
     model_label = infer_model_label(gebench_accuracy_servers.generate_params.model).lower()
     output_root = reset_artifact_dir(accuracy_artifact_root / f"gebench_{model_label}")
@@ -100,6 +101,6 @@ def test_gebench_h100_smoke(
         assert data_type in summary["evaluation"]["by_type"]
         assert summary["evaluation"]["by_type"][data_type]["count"] > 0
 
-    assert summary["evaluation"]["overall_mean"] >= 0.45
-    assert summary["evaluation"]["by_type"]["type3"]["overall_mean"] >= 0.45
-    assert summary["evaluation"]["by_type"]["type4"]["overall_mean"] >= 0.45
+    assert summary["evaluation"]["overall_mean"] >= gebench_min_scores["overall"]
+    assert summary["evaluation"]["by_type"]["type3"]["overall_mean"] >= gebench_min_scores["type3"]
+    assert summary["evaluation"]["by_type"]["type4"]["overall_mean"] >= gebench_min_scores["type4"]
