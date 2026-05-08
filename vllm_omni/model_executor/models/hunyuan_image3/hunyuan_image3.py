@@ -860,6 +860,13 @@ class HunyuanImage3Processor:
         else:
             raise TypeError(f"Unsupported image type: {type(image_input)}.")
 
+        # Each cond image keeps its own VAE bucket (mirrors official HF's
+        # ragged behavior in `_encode_cond_image`). VAE pixel tensors have
+        # different (H_i, W_i) per image, so they're flattened to 1-D and
+        # concatenated; vLLM `flat_from_sizes("image", vae_pixel_size)` slices
+        # them back per-image at consumption time. VIT (Siglip2 naflex) pads
+        # to `max_num_patches` so VIT fields keep the existing `batched`
+        # stack path.
         batch_data = []
         for image in images:
             current_info = {}
@@ -883,42 +890,49 @@ class HunyuanImage3Processor:
                 _ss = torch.tensor(_ss, dtype=torch.long)
             current_info["vit_spatial_shapes"] = _ss.squeeze(0)
 
-            # VAE processing.
-            # The resize/crop math here mirrors HF's `resize_and_crop` with
-            # crop_type="center" (hunyuan3.0_ins/image_processor.py:61). VAE
-            # normalize uses the same transforms.Compose([ToTensor,
-            # Normalize([0.5], [0.5])]) as HF's `pil_image_to_tensor`. So
-            # numerical output of this branch should match HF up to floating-
-            # point reduction order.
+            # VAE: per-image bucket via `reso_group.get_target_size`; mirrors
+            # HF's `resize_and_crop` (crop_type="center"). Keep fp32 — the
+            # VAE encoder casts to model dtype at its boundary (see
+            # `_vae_encode`).
             image_width, image_height = self.reso_group.get_target_size(image.width, image.height)
             resized_image = self._resize_and_crop(image, (image_width, image_height))
-            vae_pixel_values = self.vae_processor(resized_image)
+            vae_pixel_values = self.vae_processor(resized_image).squeeze(0)
             token_height = image_height // (self.hf_config.vae_downsample_factor[0] * self.hf_config.patch_size)
             token_width = image_width // (self.hf_config.vae_downsample_factor[1] * self.hf_config.patch_size)
-            # Keep fp32 — the VAE encoder casts to model dtype at its boundary
-            # (see _vae_encode). Casting to bf16 here costs ~7e-4 mean-abs-diff
-            # bf16 quantization error on every pixel vs HF (which keeps fp32
-            # in build_cond_images), measurable as a real numerical drift in
-            # downstream image embeddings.
-            current_info["vae_pixel_values"] = vae_pixel_values.squeeze(0)
+
+            current_info["vae_pixel_values_flat"] = vae_pixel_values.reshape(-1)
+            current_info["vae_pixel_size"] = torch.tensor(vae_pixel_values.numel(), dtype=torch.long)
             current_info["vae_token_grid_hw"] = torch.tensor([token_height, token_width])
 
-            # size
             base_size, ratio_index = self.reso_group.get_base_size_and_ratio_index(image_width, image_height)
             current_info["base_size"] = torch.tensor(base_size)
             current_info["ratio_index"] = torch.tensor(ratio_index)
 
             batch_data.append(current_info)
 
-        # Stack the tensors in the list into a batch dimension (B, ...)
-        final_image_info = {}
-        if len(batch_data) > 0:
-            for key in batch_data[0].keys():
-                final_image_info[key] = torch.stack([d[key] for d in batch_data], dim=0)
+        final_image_info: dict[str, torch.Tensor] = {}
+        if not batch_data:
+            return final_image_info
 
-        if final_image_info:
-            shapes_info = {k: tuple(v.shape) for k, v in final_image_info.items()}
-            logger.info(f"Successfully processed {len(images)} image(s). Final tensor shapes: {shapes_info}")
+        # Same-shape fields: stack along a new image-batch dim as before.
+        same_shape_keys = [
+            "vit_pixel_values",
+            "vit_pixel_attention_mask",
+            "vit_spatial_shapes",
+            "vae_token_grid_hw",
+            "vae_pixel_size",
+            "base_size",
+            "ratio_index",
+        ]
+        for key in same_shape_keys:
+            final_image_info[key] = torch.stack([d[key] for d in batch_data], dim=0)
+
+        # Variable-shape VAE pixels: 1-D concat across images (paired with
+        # `vae_pixel_size` via `flat_from_sizes` in `_get_mm_fields_config`).
+        final_image_info["vae_pixel_values"] = torch.cat([d["vae_pixel_values_flat"] for d in batch_data], dim=0)
+
+        shapes_info = {k: tuple(v.shape) for k, v in final_image_info.items()}
+        logger.info(f"Successfully processed {len(images)} image(s). Final tensor shapes: {shapes_info}")
 
         return final_image_info
 
@@ -1030,8 +1044,13 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
             config["vit_pixel_attention_mask"] = MultiModalFieldConfig.batched("image")
         if "vit_spatial_shapes" in hf_inputs:
             config["vit_spatial_shapes"] = MultiModalFieldConfig.batched("image")
-        if "vae_pixel_values" in hf_inputs:
-            config["vae_pixel_values"] = MultiModalFieldConfig.batched("image")
+        # `vae_pixel_values` is a 1-D concatenation of variable-shape per-image
+        # VAE tensors (see `process_image`). `vae_pixel_size` carries the
+        # per-image flat length so vLLM can split the buffer back per image.
+        if "vae_pixel_values" in hf_inputs and "vae_pixel_size" in hf_inputs:
+            config["vae_pixel_values"] = MultiModalFieldConfig.flat_from_sizes("image", hf_inputs["vae_pixel_size"])
+        if "vae_pixel_size" in hf_inputs:
+            config["vae_pixel_size"] = MultiModalFieldConfig.batched("image")
         if "vae_token_grid_hw" in hf_inputs:
             config["vae_token_grid_hw"] = MultiModalFieldConfig.batched("image")
         if "base_size" in hf_inputs:
@@ -1668,6 +1687,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         vit_pixel_attention_mask = kwargs.pop("vit_pixel_attention_mask", None)
         vit_spatial_shapes = kwargs.pop("vit_spatial_shapes", None)
         vae_pixel_values = kwargs.pop("vae_pixel_values", None)
+        # vae_pixel_size is only metadata for vLLM's flat_from_sizes split;
+        # we reconstruct per-image shapes from vae_token_grid_hw below.
+        kwargs.pop("vae_pixel_size", None)
         vae_token_grid_hw = kwargs.pop("vae_token_grid_hw", None)
 
         if vit_pixel_values is None or vae_pixel_values is None:
@@ -1677,13 +1699,36 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         if vit_pixel_values.numel() == 0 or vae_pixel_values.numel() == 0:
             return None
 
+        # `vae_pixel_values` arrives as a 1-D concatenation of per-image flat
+        # buffers (see `process_image` + `flat_from_sizes`). Reconstruct a
+        # list of per-image (3, H_i, W_i) tensors using the per-image grid
+        # dims so the downstream VAE encoder can run image-by-image.
+        vae_factor_h = self.config.vae_downsample_factor[0] * self.config.patch_size
+        vae_factor_w = self.config.vae_downsample_factor[1] * self.config.patch_size
+        num_images = vae_token_grid_hw.shape[0]
+        vae_image_list: list[torch.Tensor] = []
+        offset = 0
+        flat = vae_pixel_values.reshape(-1)
+        for i in range(num_images):
+            token_h, token_w = vae_token_grid_hw[i].tolist()
+            h_i = int(token_h) * vae_factor_h
+            w_i = int(token_w) * vae_factor_w
+            n_i = 3 * h_i * w_i
+            vae_image_list.append(flat[offset : offset + n_i].reshape(3, h_i, w_i))
+            offset += n_i
+        if offset != flat.numel():
+            raise ValueError(
+                f"vae_pixel_values size mismatch: consumed {offset} of {flat.numel()} elements "
+                f"across {num_images} images (token_grid_hw={vae_token_grid_hw.tolist()})"
+            )
+
         return HunyuanImage3PixelInputs(
             type="pixel_values",
             pixel_values={
                 "vit_pixel_values": vit_pixel_values,
                 "vit_pixel_attention_mask": vit_pixel_attention_mask,
                 "vit_spatial_shapes": vit_spatial_shapes,
-                "vae_pixel_values": vae_pixel_values,
+                "vae_pixel_values": vae_image_list,
                 "vae_token_grid_hw": vae_token_grid_hw,
             },
         )
@@ -1795,22 +1840,12 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # Perform ViT encoding
         vit_embeddings = self._vit_encode(vit_pixel_values, vit_pixel_attention_mask, vit_spatial_shapes)
 
-        # Perform VAE encoding
-        t, latents = self._vae_encode(vae_pixel_values, vae_cfg_factor)
-
-        # Process VAE latents through patch_embed to convert to token embeddings
-        # VAE latents are in (B, C, H, W) format, need to be converted to (B, seq_len, hidden_size)
+        # VAE encode + patch_embed per image — each cond image is at its own
+        # `reso_group` bucket so shapes are ragged across the image-batch dim.
         vae_token_embeddings = []
-        batch_size = latents.shape[0]
-        for i in range(batch_size):
-            t_i = t[i]
-            latents_i = latents[i : i + 1]  # Shape: (1, C, H, W)
-
-            # Time embedding for VAE processing
-            t_emb = self.time_embed(t_i)
-
-            # Process VAE latent through patch_embed
-            # Input: (1, C, H, W) -> Output: (1, seq_len, hidden_size)
+        for vae_image_i in vae_pixel_values:
+            t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), vae_cfg_factor)
+            t_emb = self.time_embed(t_i[0])
             vae_tokens, _, _ = self.patch_embed(latents_i, t_emb)
             vae_token_embeddings.append(vae_tokens)
 

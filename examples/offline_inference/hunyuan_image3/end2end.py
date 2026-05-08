@@ -10,6 +10,7 @@ Supports all modalities through a single entry point:
 Usage:
     python end2end.py --modality text2img --prompts "A cute cat"
     python end2end.py --modality img2img --image-path input.png --prompts "Make it snowy"
+    python end2end.py --modality img2img --image-path img1.png,img2.png --prompts "Combine"
     python end2end.py --modality img2text --image-path input.png --prompts "Describe this image"
 """
 
@@ -71,7 +72,7 @@ def parse_args():
         "--image-path",
         type=str,
         default=None,
-        help="Path to input image (for img2img/img2text).",
+        help="Input image path(s) for img2img/img2text. Comma-separated for multi-image (up to 3).",
     )
     parser.add_argument(
         "--output",
@@ -207,14 +208,19 @@ def main():
         print("[Info] No prompts provided, using default.")
         prompts = ["A cute cat"]
 
-    # Load image if needed
-    input_image = None
+    input_images: list = []
     if args.modality in ("img2img", "img2text"):
-        if not args.image_path or not os.path.exists(args.image_path):
+        if not args.image_path:
             raise ValueError(f"--image-path required for {args.modality}, got: {args.image_path}")
         from PIL import Image
 
-        input_image = Image.open(args.image_path).convert("RGB")
+        image_paths = [p.strip() for p in args.image_path.split(",") if p.strip()]
+        for p in image_paths:
+            if not os.path.exists(p):
+                raise ValueError(f"Image path does not exist: {p}")
+            input_images.append(Image.open(p).convert("RGB"))
+        if not input_images:
+            raise ValueError(f"--image-path produced no usable paths: {args.image_path!r}")
 
     # Load tokenizer for segment-wise prompt tokenization (matches HF
     # apply_chat_template byte-for-byte; see build_prompt_tokens docstring).
@@ -222,10 +228,18 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
+    mm_image_payload = (input_images[0] if len(input_images) == 1 else input_images) if input_images else None
+
     # Format prompts
     formatted_prompts: list[OmniPromptType] = []
     for p in prompts:
-        result = build_prompt_tokens(p, tokenizer, task=task, sys_type=args.sys_type)
+        # Only pass `num_images` for modalities that actually consume images;
+        # text-only paths ignore the parameter, but threading it
+        # unconditionally reads as if t2i needed at least one image.
+        build_kwargs: dict = {"task": task, "sys_type": args.sys_type}
+        if input_images:
+            build_kwargs["num_images"] = len(input_images)
+        result = build_prompt_tokens(p, tokenizer, **build_kwargs)
         token_ids = result.token_ids
         effective_sys_type = result.system_prompt_type
 
@@ -243,12 +257,12 @@ def main():
             prompt_dict["modalities"] = ["image"]
         elif args.modality == "img2img":
             prompt_dict["modalities"] = ["image"]
-            prompt_dict["multi_modal_data"] = {"image": input_image}
-            prompt_dict["height"] = input_image.height
-            prompt_dict["width"] = input_image.width
+            prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
+            prompt_dict["height"] = input_images[0].height
+            prompt_dict["width"] = input_images[0].width
         elif args.modality == "img2text":
             prompt_dict["modalities"] = ["text"]
-            prompt_dict["multi_modal_data"] = {"image": input_image}
+            prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
         elif args.modality == "text2text":
             prompt_dict["modalities"] = ["text"]
 
