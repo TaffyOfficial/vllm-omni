@@ -66,21 +66,25 @@ class FakeTokenizer:
         return list(range(100, 100 + len(text)))
 
 
-_IMAGE_TASKS = ("i2t", "it2i_think", "it2i_recaption")
-_TEXT_ONLY_TASKS = ("t2t",)
+_IMAGE_TASK_COMBOS = (
+    ("i2t", None),
+    ("it2i", "think"),
+    ("it2i", "recaption"),
+)
+_TEXT_ONLY_TASK_COMBOS = (("t2t", None),)
 
 
 # -------------------- string builder --------------------
 
 
-@pytest.mark.parametrize("task", _IMAGE_TASKS)
+@pytest.mark.parametrize("task,bot_task", _IMAGE_TASK_COMBOS)
 @pytest.mark.parametrize("num_images", [1, 2, 3])
-def test_build_prompt_emits_N_consecutive_img_placeholders(task: str, num_images: int):
+def test_build_prompt_emits_N_consecutive_img_placeholders(task: str, bot_task: str | None, num_images: int):
     """N=1/2/3 -> exactly N `<img>` substrings appear consecutively
     between `User: ` and the user prompt, with no separator between them."""
-    s = build_prompt("HELLO", task=task, num_images=num_images)
+    s = build_prompt("HELLO", task=task, bot_task=bot_task, num_images=num_images)
     assert s.count("<img>") == num_images, (
-        f"task={task} num_images={num_images}: expected {num_images} <img> "
+        f"task={task} bot_task={bot_task} num_images={num_images}: expected {num_images} <img> "
         f"placeholders, found {s.count('<img>')} -- prompt was: {s!r}"
     )
 
@@ -97,24 +101,24 @@ def test_build_prompt_emits_N_consecutive_img_placeholders(task: str, num_images
 def test_build_prompt_default_num_images_matches_legacy():
     """num_images default = 1 must produce a string bit-identical to the
     pre-multi-image behavior (single `<img>` placeholder)."""
-    legacy = build_prompt("HELLO", task="it2i_think")
-    explicit = build_prompt("HELLO", task="it2i_think", num_images=1)
+    legacy = build_prompt("HELLO", task="it2i", bot_task="think")
+    explicit = build_prompt("HELLO", task="it2i", bot_task="think", num_images=1)
     assert legacy == explicit, "default num_images=1 must match legacy single-image output"
 
 
 # -------------------- token builder --------------------
 
 
-@pytest.mark.parametrize("task", _IMAGE_TASKS)
-def test_build_prompt_tokens_inserts_N_img_ids(task: str):
+@pytest.mark.parametrize("task,bot_task", _IMAGE_TASK_COMBOS)
+def test_build_prompt_tokens_inserts_N_img_ids(task: str, bot_task: str | None):
     """N=1/2/3 -> the resulting id sequence contains exactly N copies of
     img_id (=2) sitting consecutively after the `User: ` segment."""
     tok = FakeTokenizer()
-    ids_n1 = build_prompt_tokens("hi", tok, task=task, num_images=1)
+    ids_n1 = build_prompt_tokens("hi", tok, task=task, bot_task=bot_task, num_images=1)
     tok = FakeTokenizer()
-    ids_n2 = build_prompt_tokens("hi", tok, task=task, num_images=2)
+    ids_n2 = build_prompt_tokens("hi", tok, task=task, bot_task=bot_task, num_images=2)
     tok = FakeTokenizer()
-    ids_n3 = build_prompt_tokens("hi", tok, task=task, num_images=3)
+    ids_n3 = build_prompt_tokens("hi", tok, task=task, bot_task=bot_task, num_images=3)
 
     assert ids_n1.count(2) == 1
     assert ids_n2.count(2) == 2
@@ -141,9 +145,9 @@ def test_build_prompt_tokens_default_num_images_matches_legacy():
     omitting the parameter (regression guard for existing single-image
     callers)."""
     tok_a = FakeTokenizer()
-    legacy = build_prompt_tokens("hi", tok_a, task="it2i_think")
+    legacy = build_prompt_tokens("hi", tok_a, task="it2i", bot_task="think")
     tok_b = FakeTokenizer()
-    explicit = build_prompt_tokens("hi", tok_b, task="it2i_think", num_images=1)
+    explicit = build_prompt_tokens("hi", tok_b, task="it2i", bot_task="think", num_images=1)
     assert legacy == explicit
     # Also: encode() must have been called on the same set of segments,
     # so segment boundaries are preserved.
@@ -153,23 +157,23 @@ def test_build_prompt_tokens_default_num_images_matches_legacy():
 # -------------------- validation --------------------
 
 
-@pytest.mark.parametrize("task", _IMAGE_TASKS)
+@pytest.mark.parametrize("task,bot_task", _IMAGE_TASK_COMBOS)
 @pytest.mark.parametrize("bad", [0, -1, MAX_IMAGES_PER_REQUEST + 1, 99])
-def test_build_prompt_rejects_out_of_range_num_images(task: str, bad: int):
+def test_build_prompt_rejects_out_of_range_num_images(task: str, bot_task: str | None, bad: int):
     with pytest.raises(ValueError, match="num_images must be in"):
-        build_prompt("hi", task=task, num_images=bad)
+        build_prompt("hi", task=task, bot_task=bot_task, num_images=bad)
     with pytest.raises(ValueError, match="num_images must be in"):
-        build_prompt_tokens("hi", FakeTokenizer(), task=task, num_images=bad)
+        build_prompt_tokens("hi", FakeTokenizer(), task=task, bot_task=bot_task, num_images=bad)
 
 
-@pytest.mark.parametrize("task", _TEXT_ONLY_TASKS)
+@pytest.mark.parametrize("task,bot_task", _TEXT_ONLY_TASK_COMBOS)
 @pytest.mark.parametrize("num_images", [0, 1, 2, 99])
-def test_text_only_tasks_ignore_num_images(task: str, num_images: int):
+def test_text_only_tasks_ignore_num_images(task: str, bot_task: str | None, num_images: int):
     """Validation only kicks in for image-input tasks; t2t et al. accept
     any num_images and emit zero `<img>` placeholders."""
-    s = build_prompt("hi", task=task, num_images=num_images)
+    s = build_prompt("hi", task=task, bot_task=bot_task, num_images=num_images)
     assert "<img>" not in s
-    ids = build_prompt_tokens("hi", FakeTokenizer(), task=task, num_images=num_images)
+    ids = build_prompt_tokens("hi", FakeTokenizer(), task=task, bot_task=bot_task, num_images=num_images)
     assert 2 not in ids
 
 
@@ -198,7 +202,7 @@ def test_real_tokenizer_emits_n_consecutive_img_ids(num_images: int):
     img_id = tok.convert_tokens_to_ids("<img>")
     assert img_id is not None and img_id >= 0, f"<img> not in tokenizer vocab; got id={img_id}"
 
-    ids = build_prompt_tokens("hi", tok, task="it2i_think", num_images=num_images)
+    ids = build_prompt_tokens("hi", tok, task="it2i", bot_task="think", num_images=num_images)
 
     # Exactly N copies of <img> id, all consecutive.
     img_positions = [i for i, x in enumerate(ids) if x == img_id]
@@ -221,9 +225,9 @@ def test_real_tokenizer_n_plus_one_extends_by_exactly_one_img_id():
     tok = AutoTokenizer.from_pretrained(_HUNYUAN_MODEL_ID, trust_remote_code=True)
     img_id = tok.convert_tokens_to_ids("<img>")
 
-    ids_n1 = build_prompt_tokens("hi", tok, task="it2i_think", num_images=1)
-    ids_n2 = build_prompt_tokens("hi", tok, task="it2i_think", num_images=2)
-    ids_n3 = build_prompt_tokens("hi", tok, task="it2i_think", num_images=3)
+    ids_n1 = build_prompt_tokens("hi", tok, task="it2i", bot_task="think", num_images=1)
+    ids_n2 = build_prompt_tokens("hi", tok, task="it2i", bot_task="think", num_images=2)
+    ids_n3 = build_prompt_tokens("hi", tok, task="it2i", bot_task="think", num_images=3)
 
     assert len(ids_n2) == len(ids_n1) + 1, f"N=2 should be N=1 + 1 token; got {len(ids_n2)} vs {len(ids_n1)}"
     assert len(ids_n3) == len(ids_n1) + 2, f"N=3 should be N=1 + 2 tokens; got {len(ids_n3)} vs {len(ids_n1)}"
@@ -246,6 +250,6 @@ def test_real_tokenizer_default_n1_byte_identical_to_legacy():
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(_HUNYUAN_MODEL_ID, trust_remote_code=True)
-    legacy = build_prompt_tokens("hi", tok, task="it2i_think")
-    explicit = build_prompt_tokens("hi", tok, task="it2i_think", num_images=1)
+    legacy = build_prompt_tokens("hi", tok, task="it2i", bot_task="think")
+    explicit = build_prompt_tokens("hi", tok, task="it2i", bot_task="think", num_images=1)
     assert legacy == explicit, "real tokenizer: default num_images=1 must be byte-identical to legacy"
