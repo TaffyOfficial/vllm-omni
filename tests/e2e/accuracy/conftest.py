@@ -54,7 +54,7 @@ def pytest_addoption(parser):
         "--wan22-i2v-image-source",
         action="store",
         default=None,
-        help="Image source for Wan2.2 I2V accuracy tests. Can be local path or remote URL.",
+        help="Image source for Wan2.2 I2V accuracy tests. Can be local path or remote URL",
     )
     group.addoption(
         "--wan22-i2v-online-timeout-seconds",
@@ -136,7 +136,7 @@ def _ensure_dataset_snapshot(dataset_id: str) -> Path:
         return candidates[0]
 
     subprocess.run(
-        ["huggingface-cli", "download", "--repo-type", "dataset", dataset_id],
+        ["hf", "download", "--repo-type", "dataset", dataset_id],
         check=True,
     )
     candidates = _dataset_cache_dirs(dataset_id)
@@ -306,7 +306,7 @@ def _build_accuracy_server_config(
     stage_init_timeout: int = 300,
     init_timeout: int | None = None,
 ) -> AccuracyServerConfig:
-    if torch.cuda.device_count() < 1:
+    if torch.accelerator.device_count() < 1:
         pytest.skip("Need at least 1 CUDA GPU for accuracy benchmark smoke tests.")
 
     if not generate_model:
