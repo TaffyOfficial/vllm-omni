@@ -9,6 +9,7 @@ import pytest
 import torch
 from PIL import Image
 
+from tests.helpers.runtime import OmniRunner
 from vllm_omni import Omni
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt
 
@@ -49,16 +50,11 @@ pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
 @pytest.fixture(scope="module")
 def omni() -> Generator[Omni, None, None]:
-    engine = Omni(
-        model=MODEL_NAME,
+    with OmniRunner(
+        MODEL_NAME,
         stage_configs_path=str(STAGE_CONFIG_PATH),
-        stage_init_timeout=600,
-        init_timeout=900,
-    )
-    try:
-        yield engine
-    finally:
-        engine.close()
+    ) as runner:
+        yield runner.omni
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="Need at least 4 CUDA GPUs.")
