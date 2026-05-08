@@ -36,11 +36,21 @@ def available_tasks() -> list[str]:
     return sorted(_TASK_PRESETS)
 
 
+# Upstream "Multi-Image Fusion" caps reference images at 3 per request.
+MAX_IMAGES_PER_REQUEST = 3
+
+
+def _validate_num_images(num_images: int) -> None:
+    if not (1 <= num_images <= MAX_IMAGES_PER_REQUEST):
+        raise ValueError(f"num_images must be in [1, {MAX_IMAGES_PER_REQUEST}], got {num_images}")
+
+
 def build_prompt(
     user_prompt: str,
     task: str = "it2i_think",
     sys_type: str | None = None,
     custom_system_prompt: str | None = None,
+    num_images: int = 1,
 ) -> str:
     """Build a HunyuanImage-3.0 prompt as a string (legacy/compat path).
 
@@ -49,6 +59,9 @@ def build_prompt(
     tokens across segment boundaries (e.g. `。\\n\\n` -> id 3490). For
     inputs that need to match HF baseline byte-for-byte, use
     `build_prompt_tokens` instead and feed the result via prompt_token_ids.
+
+    `num_images` emits N consecutive `<img>` placeholders between
+    `User: ` and `user_prompt`. Ignored for text-only tasks.
     """
     if task not in _TASK_PRESETS:
         raise ValueError(f"Unknown task {task!r}. Choose from: {available_tasks()}")
@@ -60,6 +73,8 @@ def build_prompt(
     sys_text = system_prompt.strip() if system_prompt else ""
 
     has_image_input = task.startswith("i2t") or task.startswith("it2i")
+    if has_image_input:
+        _validate_num_images(num_images)
 
     # t2i_vanilla: pretrain mode for direct text->image generation. The
     # vanilla system prompt drives the model with no chat structure.
@@ -72,7 +87,7 @@ def build_prompt(
 
     # All other tasks (t2t / i2t / t2i_think / t2i_recaption /
     # it2i_think / it2i_recaption) use HunyuanImage3 Instruct chat template:
-    #   <|startoftext|>{system?}\n\nUser: {<img>?}{user_prompt}\n\nAssistant: {trigger?}
+    #   <|startoftext|>{system?}\n\nUser: {<img>*N?}{user_prompt}\n\nAssistant: {trigger?}
     # generation_config.json declares sequence_template="instruct", so the
     # AR prefill MUST use this template -- verified to match HF's
     # apply_chat_template output token-for-token (modulo BPE boundary merges).
@@ -85,7 +100,7 @@ def build_prompt(
         parts.append(f"{sys_text}\n\n")
     parts.append("User: ")
     if has_image_input:
-        parts.append("<img>")
+        parts.extend(["<img>"] * num_images)
     parts.append(user_prompt)
     parts.append("\n\nAssistant: ")
     if trigger_tag:
@@ -100,6 +115,7 @@ def build_prompt_tokens(
     task: str = "it2i_think",
     sys_type: str | None = None,
     custom_system_prompt: str | None = None,
+    num_images: int = 1,
 ) -> list[int]:
     """Segment-by-segment tokenization that matches HF apply_chat_template.
 
@@ -110,6 +126,8 @@ def build_prompt_tokens(
     each segment independently and concatenates token_ids, so no cross-
     boundary merge happens. We replicate that here and feed the result to
     Omni via OmniTokensPrompt (prompt_token_ids).
+
+    `num_images` inserts N `<img>` token ids; see `build_prompt`.
     """
     if task not in _TASK_PRESETS:
         raise ValueError(f"Unknown task {task!r}. Choose from: {available_tasks()}")
@@ -122,6 +140,8 @@ def build_prompt_tokens(
     trig_id = tokenizer.convert_tokens_to_ids(trigger_tag) if trigger_tag else None
 
     has_image_input = task.startswith("i2t") or task.startswith("it2i")
+    if has_image_input:
+        _validate_num_images(num_images)
 
     # t2i_vanilla uses pretrain template with no chat structure; the vanilla
     # system prompt drives the model directly. No segment boundaries to
@@ -141,7 +161,7 @@ def build_prompt_tokens(
         ids += tokenizer.encode("\n\n", add_special_tokens=False)
     ids += tokenizer.encode("User: ", add_special_tokens=False)
     if has_image_input:
-        ids += [img_id]
+        ids += [img_id] * num_images
     ids += tokenizer.encode(user_prompt, add_special_tokens=False)
     ids += tokenizer.encode("\n\nAssistant: ", add_special_tokens=False)
     if trig_id is not None:
@@ -149,4 +169,9 @@ def build_prompt_tokens(
     return ids
 
 
-__all__ = ["build_prompt", "build_prompt_tokens", "available_tasks"]
+__all__ = [
+    "MAX_IMAGES_PER_REQUEST",
+    "available_tasks",
+    "build_prompt",
+    "build_prompt_tokens",
+]

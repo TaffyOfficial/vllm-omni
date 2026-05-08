@@ -545,7 +545,12 @@ class HunyuanImage3Pipeline(
         timestep_scatter_index: BatchRaggedTensor,
     ):
         batch_size, seq_len, n_embd = x.shape
-        # batch_size x n x n_embd
+        # `_encode_cond_image` returns `t` as list[Tensor] for the
+        # multi-image branch (outer length = batch_size, currently fixed
+        # at 1 by the stage runtime `max_batch_size`); flatten to a Tensor
+        # before reshape.
+        if isinstance(t, list):
+            t = torch.cat([ti.reshape(-1) for ti in t], dim=0)
         timestep_scatter_src = self.timestep_emb(t.reshape(-1)).reshape(batch_size, -1, n_embd)
         x.scatter_(
             dim=1,
