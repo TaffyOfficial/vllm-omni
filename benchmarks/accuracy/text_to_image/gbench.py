@@ -523,7 +523,7 @@ class GEBenchRunner:
         api_key: str = "EMPTY",
         width: int = 768,
         height: int = 576,
-        num_inference_steps: int = 8,
+        num_inference_steps: int = 50,
         output_compression: int | None = 98,
         guidance_scale: float | None = None,
         seed: int | None = 42,
@@ -888,7 +888,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--api-key", type=str, default="EMPTY")
     generate.add_argument("--width", type=int, default=768)
     generate.add_argument("--height", type=int, default=576)
-    generate.add_argument("--num-inference-steps", type=int, default=8)
+    generate.add_argument("--num-inference-steps", type=int, default=50)
     generate.add_argument("--output-compression", type=int, default=98)
     generate.add_argument("--guidance-scale", type=float, default=None)
     generate.add_argument("--seed", type=int, default=42)

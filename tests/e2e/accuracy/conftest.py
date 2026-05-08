@@ -85,7 +85,7 @@ def pytest_addoption(parser):
         "--gebench-num-inference-steps",
         action="store",
         type=int,
-        default=8,
+        default=50,
         help="Number of diffusion inference steps for GEBench generate",
     )
     group.addoption(
