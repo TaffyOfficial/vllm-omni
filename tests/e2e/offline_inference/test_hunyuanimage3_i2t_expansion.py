@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from PIL import Image
 
 from vllm_omni import Omni
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt
@@ -15,11 +16,9 @@ MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 STAGE_CONFIG_PATH = REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "hunyuan_image3_i2t.yaml"
 
-# First 20 generated token IDs from the HF greedy reference on this input
-# (verified 2026-05-04 via scripts/bench/hf_i2t_pr2986_baseline.py;
-# baseline JSON: scripts/bench/baselines/hf_i2t_pr2986.json). vllm-omni AR
-# output matches this prefix bitwise; the two implementations diverge past
-# this point — see memory/hf/hf_omni_alignment_method.md.
+# First 20 generated token IDs from the HF greedy reference on this input.
+# vllm-omni AR output matches this prefix bitwise; the two implementations
+# diverge past this point.
 EXPECTED_PREFIX_TOKEN_IDS: list[int] = [
     791,
     2217,
@@ -66,8 +65,6 @@ def omni() -> Generator[Omni, None, None]:
 def test_i2t_generates_text(omni: Omni) -> None:
     """Verify I2T output's first 20 token IDs match the HF greedy baseline."""
     # Solid-color image keeps the input self-contained and reproducible.
-    from PIL import Image
-
     input_image = Image.new("RGB", (256, 256), color=(128, 200, 100))
 
     prompt = build_prompt("Describe the content of the picture.", task="i2t")
@@ -80,8 +77,7 @@ def test_i2t_generates_text(omni: Omni) -> None:
     outputs = omni.generate(prompts=[prompt_dict])
     assert outputs, "No outputs returned from Omni.generate()"
 
-    first_output = outputs[0]
-    request_output = getattr(first_output, "request_output", first_output)
+    request_output = outputs[0].request_output
     assert request_output.outputs, "No completion outputs"
 
     completion = request_output.outputs[0]
