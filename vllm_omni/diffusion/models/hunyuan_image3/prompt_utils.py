@@ -11,29 +11,65 @@ The DiT pipeline (`pipeline_hunyuan_image3.py`) builds prompts through
 `JointImageInfo` objects produced by image preprocessing. The example
 flow uses an `<img>` placeholder + `multi_modal_data` instead, so it
 needs a lighter-weight builder that only requires a HF tokenizer. This
-module provides that builder; the task -> template mapping below is the
-canonical mapping for both flows.
+module provides that builder; the (task, bot_task) -> template mapping
+below is the canonical mapping for both flows.
+
+Two orthogonal axes:
+
+  * `task` selects the I/O modality combination, which only controls
+    whether `<img>` placeholders are emitted between `User: ` and the
+    user prompt: ``i2t`` / ``it2i`` produce them, ``t2t`` / ``t2i`` do
+    not.
+
+  * `bot_task` selects the prompting mode and drives both the system
+    prompt and the trigger tag appended after ``Assistant: ``. ``None``
+    (default) gives a plain Assistant turn under the unified prompt;
+    ``think`` / ``recaption`` switch the trigger tag to ``<think>`` /
+    ``<recaption>``; ``think_recaption`` swaps the system prompt for
+    the dedicated combined-mode template; ``vanilla`` drops the chat
+    structure entirely (pretrain template, ``t2i`` only).
 """
 
 from __future__ import annotations
 
 from .system_prompt import get_system_prompt
 
-# task -> (sys_type, bot_task, trigger_tag)
-_TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
-    "t2t": ("en_unified", None, None),
-    "i2t": ("en_unified", None, None),
-    "it2i_think": ("en_unified", "think", "<think>"),
-    "it2i_recaption": ("en_unified", "recaption", "<recaption>"),
-    "t2i_think": ("en_unified", "think", "<think>"),
-    "t2i_recaption": ("en_unified", "recaption", "<recaption>"),
-    "t2i_vanilla": ("en_vanilla", "image", None),
+# bot_task -> (sys_type, trigger_tag).
+# ``vanilla`` is special-cased downstream: it bypasses the chat template
+# (no ``User:`` / ``Assistant:`` framing) and is only valid with
+# ``task='t2i'``.
+_BOT_TASK_PRESETS: dict[str | None, tuple[str, str | None]] = {
+    None: ("en_unified", None),
+    "think": ("en_unified", "<think>"),
+    "recaption": ("en_unified", "<recaption>"),
+    "think_recaption": ("en_think_recaption", "<think>"),
+    "vanilla": ("en_vanilla", None),
 }
+
+_TASKS: frozenset[str] = frozenset({"t2t", "i2t", "it2i", "t2i"})
 
 
 def available_tasks() -> list[str]:
-    """Sorted list of task keys accepted by `build_prompt` / `build_prompt_tokens`."""
-    return sorted(_TASK_PRESETS)
+    """Sorted list of `task` values accepted by the prompt builders."""
+    return sorted(_TASKS)
+
+
+def available_bot_tasks() -> list[str | None]:
+    """Sorted list of `bot_task` values (with ``None`` first)."""
+    rest = sorted(k for k in _BOT_TASK_PRESETS if k is not None)
+    return [None, *rest]
+
+
+def resolve_sys_type(bot_task: str | None) -> str:
+    """Default system-prompt type for a given ``bot_task``.
+
+    Callers that need to forward the same system prompt to the diffusion
+    stage (via ``use_system_prompt``) should use this helper rather than
+    duplicating the table.
+    """
+    if bot_task not in _BOT_TASK_PRESETS:
+        raise ValueError(f"Unknown bot_task {bot_task!r}. Choose from: {available_bot_tasks()}")
+    return _BOT_TASK_PRESETS[bot_task][0]
 
 
 # Upstream "Multi-Image Fusion" caps reference images at 3 per request.
@@ -45,9 +81,21 @@ def _validate_num_images(num_images: int) -> None:
         raise ValueError(f"num_images must be in [1, {MAX_IMAGES_PER_REQUEST}], got {num_images}")
 
 
+def _resolve_preset(task: str, bot_task: str | None) -> tuple[str, str | None]:
+    """Validate (task, bot_task) and return ``(sys_type, trigger_tag)``."""
+    if task not in _TASKS:
+        raise ValueError(f"Unknown task {task!r}. Choose from: {available_tasks()}")
+    if bot_task not in _BOT_TASK_PRESETS:
+        raise ValueError(f"Unknown bot_task {bot_task!r}. Choose from: {available_bot_tasks()}")
+    if bot_task == "vanilla" and task != "t2i":
+        raise ValueError(f"bot_task='vanilla' is only valid with task='t2i' (pretrain template); got task={task!r}")
+    return _BOT_TASK_PRESETS[bot_task]
+
+
 def build_prompt(
     user_prompt: str,
-    task: str = "it2i_think",
+    task: str = "it2i",
+    bot_task: str | None = "think",
     sys_type: str | None = None,
     custom_system_prompt: str | None = None,
     num_images: int = 1,
@@ -63,30 +111,33 @@ def build_prompt(
     `num_images` emits N consecutive `<img>` placeholders between
     `User: ` and `user_prompt`. Ignored for text-only tasks.
     """
-    if task not in _TASK_PRESETS:
-        raise ValueError(f"Unknown task {task!r}. Choose from: {available_tasks()}")
-
-    preset_sys_type, preset_bot_task, trigger_tag = _TASK_PRESETS[task]
+    preset_sys_type, trigger_tag = _resolve_preset(task, bot_task)
     effective_sys_type = sys_type or preset_sys_type
 
-    system_prompt = get_system_prompt(effective_sys_type, preset_bot_task, custom_system_prompt)
-    sys_text = system_prompt.strip() if system_prompt else ""
+    system_prompt = get_system_prompt(effective_sys_type, bot_task, custom_system_prompt)
+    # Do NOT strip -- HF apply_chat_template keeps the system prompt's natural
+    # leading/trailing newlines. Stripping here would shift the byte/token
+    # output relative to `build_prompt_tokens`, which is the segment-by-segment
+    # tokenization path that mirrors HF byte-for-byte. The two builders MUST
+    # produce equivalent prefixes for any sys_type whose template carries a
+    # leading newline (e.g. en_think_recaption, en_vanilla).
+    sys_text = system_prompt or ""
 
-    has_image_input = task.startswith("i2t") or task.startswith("it2i")
+    has_image_input = task in ("i2t", "it2i")
     if has_image_input:
         _validate_num_images(num_images)
 
-    # t2i_vanilla: pretrain mode for direct text->image generation. The
-    # vanilla system prompt drives the model with no chat structure.
-    if task == "t2i_vanilla":
+    # bot_task='vanilla' (t2i only): pretrain mode for direct text->image
+    # generation. The vanilla system prompt drives the model with no chat
+    # structure.
+    if bot_task == "vanilla":
         parts = ["<|startoftext|>"]
         if sys_text:
             parts.append(sys_text)
         parts.append(user_prompt)
         return "".join(parts)
 
-    # All other tasks (t2t / i2t / t2i_think / t2i_recaption /
-    # it2i_think / it2i_recaption) use HunyuanImage3 Instruct chat template:
+    # All other (task, bot_task) combos use the HunyuanImage3 Instruct chat template:
     #   <|startoftext|>{system?}\n\nUser: {<img>*N?}{user_prompt}\n\nAssistant: {trigger?}
     # generation_config.json declares sequence_template="instruct", so the
     # AR prefill MUST use this template -- verified to match HF's
@@ -112,7 +163,8 @@ def build_prompt(
 def build_prompt_tokens(
     user_prompt: str,
     tokenizer,
-    task: str = "it2i_think",
+    task: str = "it2i",
+    bot_task: str | None = "think",
     sys_type: str | None = None,
     custom_system_prompt: str | None = None,
     num_images: int = 1,
@@ -129,28 +181,31 @@ def build_prompt_tokens(
 
     `num_images` inserts N `<img>` token ids; see `build_prompt`.
     """
-    if task not in _TASK_PRESETS:
-        raise ValueError(f"Unknown task {task!r}. Choose from: {available_tasks()}")
-
-    preset_sys_type, preset_bot_task, trigger_tag = _TASK_PRESETS[task]
+    preset_sys_type, trigger_tag = _resolve_preset(task, bot_task)
     effective_sys_type = sys_type or preset_sys_type
 
     bos_id = tokenizer.convert_tokens_to_ids("<|startoftext|>")
     img_id = tokenizer.convert_tokens_to_ids("<img>")
     trig_id = tokenizer.convert_tokens_to_ids(trigger_tag) if trigger_tag else None
 
-    has_image_input = task.startswith("i2t") or task.startswith("it2i")
+    has_image_input = task in ("i2t", "it2i")
     if has_image_input:
         _validate_num_images(num_images)
 
-    # t2i_vanilla uses pretrain template with no chat structure; the vanilla
-    # system prompt drives the model directly. No segment boundaries to
-    # protect, fall back to whole-string encode.
-    if task == "t2i_vanilla":
-        s = build_prompt(user_prompt, task, sys_type, custom_system_prompt)
+    # bot_task='vanilla' uses pretrain template with no chat structure; the
+    # vanilla system prompt drives the model directly. No segment boundaries
+    # to protect, fall back to whole-string encode.
+    if bot_task == "vanilla":
+        s = build_prompt(
+            user_prompt,
+            task=task,
+            bot_task=bot_task,
+            sys_type=sys_type,
+            custom_system_prompt=custom_system_prompt,
+        )
         return tokenizer.encode(s, add_special_tokens=False)
 
-    system_prompt = get_system_prompt(effective_sys_type, preset_bot_task, custom_system_prompt)
+    system_prompt = get_system_prompt(effective_sys_type, bot_task, custom_system_prompt)
     # Do NOT strip -- HF apply_chat_template keeps the system prompt's
     # natural trailing newline; stripping it would shift one token id.
     sys_text = system_prompt or ""
@@ -171,7 +226,9 @@ def build_prompt_tokens(
 
 __all__ = [
     "MAX_IMAGES_PER_REQUEST",
+    "available_bot_tasks",
     "available_tasks",
     "build_prompt",
     "build_prompt_tokens",
+    "resolve_sys_type",
 ]

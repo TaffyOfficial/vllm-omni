@@ -19,27 +19,19 @@ import os
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     build_prompt_tokens,
+    resolve_sys_type,
 )
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniPromptType
 
-# task -> (sys_type, bot_task, trigger_tag)
-_TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
-    "t2t": ("en_unified", None, None),
-    "i2t": ("en_unified", None, None),
-    "it2i_think": ("en_unified", "think", "<think>"),
-    "it2i_recaption": ("en_unified", "recaption", "<recaption>"),
-    "t2i_think": ("en_unified", "think", "<think>"),
-    "t2i_recaption": ("en_unified", "recaption", "<recaption>"),
-    "t2i_vanilla": ("en_vanilla", "image", None),
-}
-
-# Modality → prompt_utils task mapping
-_MODALITY_TASK_MAP = {
-    "text2img": "t2i_think",
-    "img2img": "it2i_think",
-    "img2text": "i2t",
-    "text2text": "t2t",
+# Modality → (task, default bot_task) mapping. `task` selects only whether
+# `<img>` placeholders are emitted; `bot_task` (None | think | recaption |
+# think_recaption | vanilla) selects the system prompt + trigger tag.
+_MODALITY_TASK_MAP: dict[str, tuple[str, str | None]] = {
+    "text2img": ("t2i", "think"),
+    "img2img": ("it2i", "think"),
+    "img2text": ("i2t", None),
+    "text2text": ("t2t", None),
 }
 
 
@@ -96,7 +88,12 @@ def parse_args():
         "--bot-task",
         type=str,
         default=None,
-        help="Override prompt task (e.g. it2i_think, t2i_recaption). Default: auto from modality.",
+        choices=["none", "think", "recaption", "think_recaption", "vanilla"],
+        help=(
+            "Override prompt mode. `none` selects the unified system prompt with no "
+            "trigger tag (escape hatch for image modalities whose default is `think`). "
+            "Default: auto from --modality (think for image-output, none for text-output)."
+        ),
     )
     parser.add_argument(
         "--sys-type",
@@ -121,8 +118,17 @@ def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
 
-    # Determine task for prompt formatting
-    task = args.bot_task or _MODALITY_TASK_MAP[args.modality]
+    # Determine (task, bot_task) for prompt formatting. `--bot-task none` is
+    # the explicit way to request bot_task=None on a modality whose default is
+    # not None (e.g. text2img defaults to "think"); leaving --bot-task unset
+    # falls back to the modality default.
+    task, default_bot_task = _MODALITY_TASK_MAP[args.modality]
+    if args.bot_task is None:
+        bot_task: str | None = default_bot_task
+    elif args.bot_task == "none":
+        bot_task = None
+    else:
+        bot_task = args.bot_task
 
     # Determine stage config
     stage_configs_path = args.stage_configs_path or _MODALITY_DEFAULT_CONFIG[args.modality]
@@ -173,14 +179,13 @@ def main():
     formatted_prompts: list[OmniPromptType] = []
     for p in prompts:
         # Only pass `num_images` for modalities that actually consume images;
-        # text-only paths (`t2i_*` / `t2t`) ignore the parameter, but threading
+        # text-only paths (t2i / t2t) ignore the parameter, but threading
         # it unconditionally reads as if t2i needed at least one image.
-        build_kwargs: dict = {"task": task, "sys_type": args.sys_type}
+        build_kwargs: dict = {"task": task, "bot_task": bot_task, "sys_type": args.sys_type}
         if input_images:
             build_kwargs["num_images"] = len(input_images)
         token_ids = build_prompt_tokens(p, tokenizer, **build_kwargs)
-        preset_sys_type, _, _ = _TASK_PRESETS[task]
-        effective_sys_type = args.sys_type or preset_sys_type
+        effective_sys_type = args.sys_type or resolve_sys_type(bot_task)
 
         # `prompt_token_ids` drives the AR stage (matches HF byte-for-byte).
         # `prompt` and `use_system_prompt` are forwarded by ar2diffusion to

@@ -24,6 +24,7 @@ import pathlib
 import pytest
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+    available_bot_tasks,
     available_tasks,
     build_prompt,
     build_prompt_tokens,
@@ -64,39 +65,37 @@ class FakeTokenizer:
 
 def test_available_tasks_covers_all_modalities():
     tasks = set(available_tasks())
-    assert tasks >= {
-        "t2t",
-        "i2t",
-        "it2i_think",
-        "it2i_recaption",
-        "t2i_think",
-        "t2i_recaption",
-        "t2i_vanilla",
-    }
+    assert tasks == {"t2t", "i2t", "it2i", "t2i"}
+
+
+def test_available_bot_tasks_covers_all_modes():
+    bot_tasks = set(available_bot_tasks())
+    assert bot_tasks == {None, "think", "recaption", "think_recaption", "vanilla"}
 
 
 @pytest.mark.parametrize(
-    "task",
+    "task,bot_task",
     [
-        "t2t",
-        "i2t",
-        "it2i_think",
-        "it2i_recaption",
-        "t2i_think",
-        "t2i_recaption",
+        ("t2t", None),
+        ("i2t", None),
+        ("it2i", "think"),
+        ("it2i", "recaption"),
+        ("t2i", "think"),
+        ("t2i", "recaption"),
+        ("t2i", "think_recaption"),
     ],
 )
-def test_build_prompt_string_structure_chat_template(task: str):
-    """Chat-template tasks must produce <|startoftext|>...User: ...Assistant: ...
+def test_build_prompt_string_structure_chat_template(task: str, bot_task: str | None):
+    """Chat-template combos must produce <|startoftext|>...User: ...Assistant: ...
     with image placeholder (when applicable) and trigger tag AFTER `Assistant: `."""
-    s = build_prompt("HELLO", task=task)
+    s = build_prompt("HELLO", task=task, bot_task=bot_task)
 
     assert s.startswith("<|startoftext|>")
     assert "User: " in s
     assert "Assistant: " in s
     assert s.index("User: ") < s.index("HELLO") < s.index("Assistant: ")
 
-    if task.startswith(("i2t", "it2i")):
+    if task in ("i2t", "it2i"):
         assert s.index("User: ") < s.index("<img>") < s.index("HELLO"), (
             "<img> placeholder must sit between `User: ` and the user prompt"
         )
@@ -108,28 +107,35 @@ def test_build_prompt_string_structure_chat_template(task: str):
     # documentation, so substring index() catches the wrong occurrence -- use
     # endswith() which directly captures "trigger is at the tail" (the Part A
     # fix: trigger goes AFTER `Assistant: `, not before user_prompt).
-    if task in ("it2i_think", "t2i_think"):
+    if bot_task in ("think", "think_recaption"):
         assert s.endswith("Assistant: <think>"), (
             f"Trigger <think> must be appended right after `Assistant: ` (Part A fix). Got tail: ...{s[-40:]!r}"
         )
-    if task in ("it2i_recaption", "t2i_recaption"):
+    elif bot_task == "recaption":
         assert s.endswith("Assistant: <recaption>"), (
             f"Trigger <recaption> must be appended right after `Assistant: ` (Part A fix). Got tail: ...{s[-40:]!r}"
         )
-    if task in ("t2t", "i2t"):
-        assert s.endswith("Assistant: "), "Plain (no-trigger) task must end at `Assistant: ` with no trailing tag."
+    elif bot_task is None:
+        assert s.endswith("Assistant: "), "Plain (no-trigger) bot_task must end at `Assistant: ` with no trailing tag."
 
 
 def test_build_prompt_vanilla_uses_pretrain_template():
-    """t2i_vanilla is the only task that bypasses chat structure -- direct
+    """bot_task='vanilla' (t2i only) bypasses chat structure -- direct
     text->image generation driven by the vanilla system prompt."""
-    s = build_prompt("HELLO", task="t2i_vanilla")
+    s = build_prompt("HELLO", task="t2i", bot_task="vanilla")
     assert s.startswith("<|startoftext|>")
     assert "User: " not in s
     assert "Assistant: " not in s
     assert "<think>" not in s
     assert "<recaption>" not in s
     assert s.endswith("HELLO")
+
+
+def test_build_prompt_vanilla_rejects_non_t2i_task():
+    with pytest.raises(ValueError, match="bot_task='vanilla'"):
+        build_prompt("x", task="it2i", bot_task="vanilla")
+    with pytest.raises(ValueError, match="bot_task='vanilla'"):
+        build_prompt_tokens("x", FakeTokenizer(), task="i2t", bot_task="vanilla")
 
 
 def test_build_prompt_unknown_task_raises():
@@ -139,13 +145,20 @@ def test_build_prompt_unknown_task_raises():
         build_prompt_tokens("x", FakeTokenizer(), task="bogus")
 
 
+def test_build_prompt_unknown_bot_task_raises():
+    with pytest.raises(ValueError, match="Unknown bot_task"):
+        build_prompt("x", task="t2i", bot_task="bogus")
+    with pytest.raises(ValueError, match="Unknown bot_task"):
+        build_prompt_tokens("x", FakeTokenizer(), task="t2i", bot_task="bogus")
+
+
 def test_build_prompt_tokens_segments_each_boundary():
     """Regression for cross-segment BPE merge bug (commit 7bd429ed):
     each template segment must hit tokenizer.encode() independently;
     user_prompt MUST NOT be concatenated with the following separator
     in the same encode() call."""
     tok = FakeTokenizer()
-    build_prompt_tokens("写诗。", tok, task="i2t")
+    build_prompt_tokens("写诗。", tok, task="i2t", bot_task=None)
 
     # Each canonical segment is encoded in its own call.
     assert "User: " in tok.encode_calls
@@ -163,32 +176,38 @@ def test_build_prompt_tokens_segments_each_boundary():
 
 def test_build_prompt_tokens_image_placeholder_present_for_image_tasks():
     tok = FakeTokenizer()
-    ids = build_prompt_tokens("hi", tok, task="i2t")
+    ids = build_prompt_tokens("hi", tok, task="i2t", bot_task=None)
     assert ids[0] == 1, "BOS (<|startoftext|>) must be the first token"
     assert 2 in ids, "<img> placeholder must be present for i2t/it2i tasks"
 
 
 def test_build_prompt_tokens_no_image_for_text_only_tasks():
     tok = FakeTokenizer()
-    ids = build_prompt_tokens("hi", tok, task="t2t")
+    ids = build_prompt_tokens("hi", tok, task="t2t", bot_task=None)
     assert 2 not in ids, "<img> must NOT appear for text-only tasks"
 
 
 @pytest.mark.parametrize(
-    "task,trigger_id",
-    [("it2i_think", 3), ("t2i_think", 3), ("it2i_recaption", 4), ("t2i_recaption", 4)],
+    "task,bot_task,trigger_id",
+    [
+        ("it2i", "think", 3),
+        ("t2i", "think", 3),
+        ("t2i", "think_recaption", 3),
+        ("it2i", "recaption", 4),
+        ("t2i", "recaption", 4),
+    ],
 )
-def test_build_prompt_tokens_trigger_is_last_token(task: str, trigger_id: int):
+def test_build_prompt_tokens_trigger_is_last_token(task: str, bot_task: str, trigger_id: int):
     """Trigger tag id must be the LAST token (after `Assistant: ` segment)."""
     tok = FakeTokenizer()
-    ids = build_prompt_tokens("hi", tok, task=task)
+    ids = build_prompt_tokens("hi", tok, task=task, bot_task=bot_task)
     assert ids[-1] == trigger_id
 
 
 def test_build_prompt_tokens_no_trigger_for_plain_tasks():
-    """Tasks without trigger_tag (t2t / i2t) must NOT append a trigger id."""
+    """bot_task=None must NOT append a trigger id."""
     tok = FakeTokenizer()
-    ids = build_prompt_tokens("hi", tok, task="t2t")
+    ids = build_prompt_tokens("hi", tok, task="t2t", bot_task=None)
     assert ids[-1] not in {3, 4}  # neither <think> nor <recaption>
 
 
@@ -274,8 +293,8 @@ def test_segment_tokenize_diverges_from_full_string_encode():
     tok = AutoTokenizer.from_pretrained(_HUNYUAN_MODEL_ID, trust_remote_code=True)
 
     user_prompt = "写一首关于夜的诗。"
-    seg_ids = build_prompt_tokens(user_prompt, tok, task="i2t")
-    full_ids = tok.encode(build_prompt(user_prompt, task="i2t"), add_special_tokens=False)
+    seg_ids = build_prompt_tokens(user_prompt, tok, task="i2t", bot_task=None)
+    full_ids = tok.encode(build_prompt(user_prompt, task="i2t", bot_task=None), add_special_tokens=False)
 
     assert seg_ids != full_ids, (
         "build_prompt_tokens output equals naive full-string encode -- "

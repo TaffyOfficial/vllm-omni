@@ -106,7 +106,7 @@ python end2end.py --modality text2img \
 | `--seed`               | int    | `42`                                 | Random seed                                                  |
 | `--height`             | int    | `1024`                               | Output image height                                          |
 | `--width`              | int    | `1024`                               | Output image width                                           |
-| `--bot-task`           | string | auto                                 | Override prompt task (e.g. `it2i_think`, `t2i_recaption`)    |
+| `--bot-task`           | string | auto                                 | Override prompt mode: `none`, `think`, `recaption`, `think_recaption`, `vanilla` |
 | `--sys-type`           | string | auto                                 | Override system prompt type (e.g. `en_unified`, `en_vanilla`) |
 | `--stage-configs-path` | string | auto                                 | Custom stage config YAML path                                |
 | `--enforce-eager`      | flag   | `False`                              | Disable torch.compile                                        |
@@ -153,7 +153,7 @@ HunyuanImage-3.0-Instruct uses an instruct chat template:
 - `<img>`: Placeholder for each input image (single token; expanded by the multimodal pipeline)
 - Trigger tags: `<think>` (CoT), `<recaption>` (recaptioning) — placed AFTER `Assistant: `
 - System prompt: Auto-selected based on task
-- `t2i_vanilla` is the only task that uses the bare pretrain template (no chat structure)
+- `bot_task='vanilla'` (only valid with `task='t2i'`) uses the bare pretrain template (no chat structure)
 
 The shared `vllm_omni.diffusion.models.hunyuan_image3.prompt_utils.build_prompt_tokens()`
 helper handles segment-by-segment tokenization (matches HF `apply_chat_template` byte-for-byte).
