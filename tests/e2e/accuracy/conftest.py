@@ -314,7 +314,7 @@ def _build_accuracy_server_config(
 
     devices = generate_devices or shared_gpu
     num_devices = len([d for d in devices.split(",") if d.strip()])
-    if torch.cuda.device_count() < num_devices:
+    if torch.accelerator.device_count() < num_devices:
         pytest.skip(f"Need at least {num_devices} CUDA GPUs for this accuracy benchmark.")
 
     if extra_generate_args is not None:
