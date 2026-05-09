@@ -2188,9 +2188,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # validate multi_modal_data / multi_modal_uuids consistency.
             # Generate one uuid per image when the value is a list (multi-image inputs).
             engine_prompt["multi_modal_uuids"] = {
-                k: [f"img-{k}-{i}" for i in range(len(v))]
-                if isinstance(v, list)
-                else [f"img-{k}-0"]
+                k: [f"img-{k}-{i}" for i in range(len(v))] if isinstance(v, list) else [f"img-{k}-0"]
                 for k, v in engine_prompt_data.items()
             }
 

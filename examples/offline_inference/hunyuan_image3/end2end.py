@@ -130,6 +130,7 @@ def parse_args():
     nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
+
 def _infer_shape_reference_index(prompt: str, num_images: int) -> int:
     chinese_nums = {"一": 1, "二": 2, "三": 3}
 
@@ -159,6 +160,7 @@ def _infer_shape_reference_index(prompt: str, num_images: int) -> int:
             return idx
 
     return 0
+
 
 def main():
     args = parse_args()
@@ -263,7 +265,7 @@ def main():
             shape_idx = _infer_shape_reference_index(p, len(input_images))
             prompt_dict["height"] = input_images[shape_idx].height
             prompt_dict["width"] = input_images[shape_idx].width
-            shape_indices.append(shape_idx) 
+            shape_indices.append(shape_idx)
         elif args.modality == "img2text":
             prompt_dict["modalities"] = ["text"]
             prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
@@ -277,7 +279,8 @@ def main():
 
     # Override diffusion params if applicable
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-    diffusion_idx = 0   
+
+    diffusion_idx = 0
     for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
             sp.num_inference_steps = args.steps
@@ -292,8 +295,8 @@ def main():
                 shape_idx = shape_indices[diffusion_idx]
                 sp.height = input_images[shape_idx].height
                 sp.width = input_images[shape_idx].width
-            
-            diffusion_idx += 1   
+
+            diffusion_idx += 1
 
     # Print configuration
     print(f"\n{'=' * 60}")
