@@ -37,6 +37,7 @@ stage_args:
       max_tokens: 4096
       stop_token_ids: [127957]  # <|endoftext|>
       detokenize: true  # DiT bridge consumes ar_generated_text; let the AR engine produce it
+      skip_special_tokens: False  # ar2diffusion needs <img_size_*><img_ratio_*> in text to recover output aspect
 
   # Stage 1: Diffusion (DiT + VAE)
   # Receives latents from AR stage, performs denoising + VAE decode

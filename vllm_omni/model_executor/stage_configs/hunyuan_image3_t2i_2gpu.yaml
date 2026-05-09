@@ -35,6 +35,7 @@ stage_args:
       max_tokens: 2048
       seed: 42
       detokenize: True
+      skip_special_tokens: False  # ar2diffusion needs <img_size_*><img_ratio_*> in text to recover output aspect
       repetition_penalty: 1.1
 
 runtime:
