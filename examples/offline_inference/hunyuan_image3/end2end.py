@@ -27,20 +27,32 @@ from vllm_omni.inputs.data import OmniPromptType
 # Modality → (task, default bot_task) mapping. `task` selects only whether
 # `<img>` placeholders are emitted; `bot_task` (None | think | recaption |
 # think_recaption | vanilla) selects the system prompt + trigger tag.
+#
+# Both verbose (`text2img`) and short (`t2i`) forms are accepted; the short
+# forms match the internal task names (see prompt_utils._TASK_PRESETS) so
+# users who think in those terms don't have to translate.
 _MODALITY_TASK_MAP: dict[str, tuple[str, str | None]] = {
     "text2img": ("t2i", "think"),
+    "t2i": ("t2i", "think"),
     "img2img": ("it2i", "think"),
+    "it2i": ("it2i", "think"),
     "img2text": ("i2t", None),
+    "i2t": ("i2t", None),
     "text2text": ("t2t", None),
+    "t2t": ("t2t", None),
 }
 
 
 # Modality → default stage config
 _MODALITY_DEFAULT_CONFIG = {
     "text2img": "hunyuan_image3_t2i.yaml",
+    "t2i": "hunyuan_image3_t2i.yaml",
     "img2img": "hunyuan_image3_it2i.yaml",
+    "it2i": "hunyuan_image3_it2i.yaml",
     "img2text": "hunyuan_image3_i2t.yaml",
+    "i2t": "hunyuan_image3_i2t.yaml",
     "text2text": "hunyuan_image3_t2t.yaml",
+    "t2t": "hunyuan_image3_t2t.yaml",
 }
 
 
@@ -54,8 +66,12 @@ def parse_args():
     parser.add_argument(
         "--modality",
         default="text2img",
-        choices=["text2img", "img2img", "img2text", "text2text"],
-        help="Modality mode to control stage execution.",
+        choices=["text2img", "t2i", "img2img", "it2i", "img2text", "i2t", "text2text", "t2t"],
+        help=(
+            "Modality mode to control stage execution. Verbose names "
+            "(text2img/img2img/img2text/text2text) and the matching internal "
+            "task short names (t2i/it2i/i2t/t2t) are both accepted."
+        ),
     )
     parser.add_argument("--prompts", nargs="+", default=None, help="Input text prompts.")
     parser.add_argument(
@@ -117,6 +133,17 @@ def parse_args():
 def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
+
+    # Canonicalize short-form modality aliases to verbose names so the
+    # downstream branches (e.g. `if args.modality == "img2img"`) keep
+    # working without listing every alias variant.
+    _MODALITY_CANONICAL = {
+        "t2i": "text2img",
+        "it2i": "img2img",
+        "i2t": "img2text",
+        "t2t": "text2text",
+    }
+    args.modality = _MODALITY_CANONICAL.get(args.modality, args.modality)
 
     # Determine (task, bot_task) for prompt formatting. `--bot-task none` is
     # the explicit way to request bot_task=None on a modality whose default is
