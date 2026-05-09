@@ -5,6 +5,7 @@ HunyuanImage-3.0-Instruct unified end-to-end inference script.
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
@@ -19,7 +20,6 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3.yaml")
 _DEFAULT_AR_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3_ar.yaml")
 
-# Both verbose and short-form aliases are accepted.
 _MODALITY_TASK_MAP: dict[str, tuple[str, str | None]] = {
     "text2img": ("t2i", "think"),
     "t2i": ("t2i", "think"),
@@ -70,7 +70,6 @@ def parse_args():
         help="Input image path(s) for img2img/img2text. Comma-separated for multi-image (up to 3).",
     )
     parser.add_argument("--output", type=str, default=".", help="Output directory to save results.")
-
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
     parser.add_argument("--guidance-scale", type=float, default=5.0, help="Classifier-free guidance scale.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -125,6 +124,30 @@ def parse_additional_config(raw_value: str | None) -> dict | None:
     return additional_config
 
 
+def _infer_shape_reference_index(prompt: str, num_images: int) -> int:
+    chinese_nums = {"一": 1, "二": 2, "三": 3}
+
+    def _to_idx(match: re.Match[str]) -> int | None:
+        token = match.group(1).strip()
+        value = chinese_nums.get(token, int(token) if token.isdigit() else None)
+        return value - 1 if value and 1 <= value <= num_images else None
+
+    for pattern in (
+        r"参考图\s*([一二三123])",
+        r"参考第\s*([一二三123])\s*张",
+        r"参考\s*image\s*([123])",
+        r"ref(?:erence)?\s*image\s*([123])",
+        r"基于图\s*([一二三123])",
+        r"基于第\s*([一二三123])\s*张",
+        r"基于\s*image\s*([123])",
+        r"based\s*on\s*image\s*([123])",
+    ):
+        match = re.search(pattern, prompt, re.IGNORECASE)
+        if match and (idx := _to_idx(match)) is not None:
+            return idx
+    return 0
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
@@ -173,10 +196,10 @@ def main():
         from PIL import Image
 
         image_paths = [p.strip() for p in args.image_path.split(",") if p.strip()]
-        for p in image_paths:
-            if not os.path.exists(p):
-                raise ValueError(f"Image path does not exist: {p}")
-            input_images.append(Image.open(p).convert("RGB"))
+        for image_path in image_paths:
+            if not os.path.exists(image_path):
+                raise ValueError(f"Image path does not exist: {image_path}")
+            input_images.append(Image.open(image_path).convert("RGB"))
         if not input_images:
             raise ValueError(f"--image-path produced no usable paths: {args.image_path!r}")
 
@@ -186,6 +209,7 @@ def main():
     mm_image_payload = (input_images[0] if len(input_images) == 1 else input_images) if input_images else None
 
     formatted_prompts: list[OmniPromptType] = []
+    shape_indices: list[int] = []
     for prompt in prompts:
         build_kwargs: dict = {"task": task, "bot_task": bot_task, "sys_type": args.sys_type}
         if input_images:
@@ -204,8 +228,10 @@ def main():
         elif args.modality == "img2img":
             prompt_dict["modalities"] = ["image"]
             prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
-            prompt_dict["height"] = input_images[0].height
-            prompt_dict["width"] = input_images[0].width
+            shape_idx = _infer_shape_reference_index(prompt, len(input_images))
+            prompt_dict["height"] = input_images[shape_idx].height
+            prompt_dict["width"] = input_images[shape_idx].width
+            shape_indices.append(shape_idx)
         elif args.modality == "img2text":
             prompt_dict["modalities"] = ["text"]
             prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
@@ -218,6 +244,7 @@ def main():
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     ar_stop_token_ids = resolve_stop_token_ids(task=task, bot_task=bot_task, tokenizer=tokenizer)
+    diffusion_idx = 0
     for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
             sp.num_inference_steps = args.steps
@@ -228,6 +255,11 @@ def main():
             if args.modality == "text2img":
                 sp.height = args.height
                 sp.width = args.width
+            elif args.modality == "img2img":
+                shape_idx = shape_indices[diffusion_idx]
+                sp.height = input_images[shape_idx].height
+                sp.width = input_images[shape_idx].width
+            diffusion_idx += 1
         elif hasattr(sp, "stop_token_ids"):
             sp.stop_token_ids = ar_stop_token_ids
 
