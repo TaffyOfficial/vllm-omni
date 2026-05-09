@@ -1,11 +1,5 @@
 """
 HunyuanImage-3.0-Instruct unified end-to-end inference script.
-
-Supports all modalities through a single entry point:
-  - text2img:  Text -> AR -> DiT -> Image
-  - img2img:   Text+Image -> AR -> DiT -> Edited Image (IT2I)
-  - img2text:  Image+Text -> AR -> Text description (I2T)
-  - text2text: Text -> AR -> Text (comprehension, no image)
 """
 
 import argparse
@@ -21,10 +15,28 @@ from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniPromptType
 
-# Default deploy configs are absolute so this example works from any cwd.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3.yaml")
 _DEFAULT_AR_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3_ar.yaml")
+
+# Both verbose and short-form aliases are accepted.
+_MODALITY_TASK_MAP: dict[str, tuple[str, str | None]] = {
+    "text2img": ("t2i", "think"),
+    "t2i": ("t2i", "think"),
+    "img2img": ("it2i", "think"),
+    "it2i": ("it2i", "think"),
+    "img2text": ("i2t", None),
+    "i2t": ("i2t", None),
+    "text2text": ("t2t", None),
+    "t2t": ("t2t", None),
+}
+
+_MODALITY_CANONICAL = {
+    "t2i": "text2img",
+    "it2i": "img2img",
+    "i2t": "img2text",
+    "t2t": "text2text",
+}
 
 _MODALITY_DEFAULT_DEPLOY_CONFIG = {
     "text2img": _DEFAULT_DEPLOY_CONFIG,
@@ -40,27 +52,15 @@ _MODALITY_MODE = {
     "text2text": "text-to-text",
 }
 
-# Modality -> (task, default bot_task) mapping.
-_MODALITY_TASK_MAP: dict[str, tuple[str, str | None]] = {
-    "text2img": ("t2i", "think"),
-    "img2img": ("it2i", "think"),
-    "img2text": ("i2t", None),
-    "text2text": ("t2t", None),
-}
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="HunyuanImage-3.0-Instruct end-to-end inference.")
-    parser.add_argument(
-        "--model",
-        default="tencent/HunyuanImage-3.0-Instruct",
-        help="Model name or local path.",
-    )
+    parser.add_argument("--model", default="tencent/HunyuanImage-3.0-Instruct", help="Model name or local path.")
     parser.add_argument(
         "--modality",
         default="text2img",
-        choices=["text2img", "img2img", "img2text", "text2text"],
-        help="Modality mode to control stage execution.",
+        choices=["text2img", "t2i", "img2img", "it2i", "img2text", "i2t", "text2text", "t2t"],
+        help="Verbose and internal short task names are both accepted.",
     )
     parser.add_argument("--prompts", nargs="+", default=None, help="Input text prompts.")
     parser.add_argument(
@@ -69,24 +69,14 @@ def parse_args():
         default=None,
         help="Input image path(s) for img2img/img2text. Comma-separated for multi-image (up to 3).",
     )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default=".",
-        help="Output directory to save results.",
-    )
+    parser.add_argument("--output", type=str, default=".", help="Output directory to save results.")
 
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
     parser.add_argument("--guidance-scale", type=float, default=5.0, help="Classifier-free guidance scale.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--height", type=int, default=1024, help="Output image height.")
     parser.add_argument("--width", type=int, default=1024, help="Output image width.")
-    parser.add_argument(
-        "--vae-use-tiling",
-        action="store_true",
-        help="Enable VAE tiling for memory optimization.",
-    )
-
+    parser.add_argument("--vae-use-tiling", action="store_true", help="Enable VAE tiling.")
     parser.add_argument(
         "--bot-task",
         type=str,
@@ -94,13 +84,7 @@ def parse_args():
         choices=["none", "think", "recaption", "think_recaption", "vanilla"],
         help="Override prompt mode. Default: auto from --modality.",
     )
-    parser.add_argument(
-        "--sys-type",
-        type=str,
-        default=None,
-        help="Override system prompt type (e.g. en_unified, en_vanilla).",
-    )
-
+    parser.add_argument("--sys-type", type=str, default=None, help="Override system prompt type.")
     parser.add_argument("--deploy-config", type=str, default=None, help="Custom deploy YAML path.")
     parser.add_argument("--stage-configs-path", type=str, default=None, help="Custom legacy stage config YAML path.")
     parser.add_argument("--log-stats", action="store_true", default=False)
@@ -146,6 +130,7 @@ def main():
     os.makedirs(args.output, exist_ok=True)
     additional_config = parse_additional_config(args.additional_config)
 
+    args.modality = _MODALITY_CANONICAL.get(args.modality, args.modality)
     task, default_bot_task = _MODALITY_TASK_MAP[args.modality]
     if args.bot_task is None:
         bot_task: str | None = default_bot_task
@@ -168,6 +153,7 @@ def main():
         "log_stats": args.log_stats,
         "init_timeout": args.init_timeout,
         "enforce_eager": args.enforce_eager,
+        "mode": _MODALITY_MODE[args.modality],
     }
 
     if additional_config is not None:
@@ -176,14 +162,10 @@ def main():
         omni_kwargs["deploy_config"] = deploy_config
     else:
         omni_kwargs["stage_configs_path"] = stage_configs_path
-    omni_kwargs["mode"] = _MODALITY_MODE[args.modality]
 
     omni = Omni(**omni_kwargs)
 
     prompts = args.prompts or ["A cute cat"]
-    if not prompts:
-        prompts = ["A cute cat"]
-
     input_images: list = []
     if args.modality in ("img2img", "img2text"):
         if not args.image_path:
@@ -217,7 +199,6 @@ def main():
             "prompt": prompt,
             "use_system_prompt": effective_sys_type,
         }
-
         if args.modality == "text2img":
             prompt_dict["modalities"] = ["image"]
         elif args.modality == "img2img":
@@ -228,9 +209,8 @@ def main():
         elif args.modality == "img2text":
             prompt_dict["modalities"] = ["text"]
             prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
-        elif args.modality == "text2text":
+        else:
             prompt_dict["modalities"] = ["text"]
-
         formatted_prompts.append(prompt_dict)
 
     params_list = list(omni.default_sampling_params_list)
@@ -276,7 +256,6 @@ def main():
     print(f"{'=' * 60}\n")
 
     omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
-
     img_idx = 0
     for req_output in omni_outputs:
         ro = getattr(req_output, "request_output", None)
@@ -295,7 +274,6 @@ def main():
         images = getattr(req_output, "images", None)
         if not images and ro and hasattr(ro, "images"):
             images = ro.images
-
         if images:
             for j, img in enumerate(images):
                 save_path = os.path.join(args.output, f"output_{img_idx}_{j}.png")
