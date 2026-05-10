@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -29,7 +28,7 @@ class InternLM2BlockSpec:
     intermediate_size: int
     num_attention_heads: int
     num_key_value_heads: int
-    head_dim: Optional[int] = None
+    head_dim: int | None = None
     rms_norm_eps: float = 1e-5
     rope_theta: float = 1_000_000.0
     rope_scaling_factor: float = 2.0
@@ -175,7 +174,7 @@ class InternLM2Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         rotary_emb: InternLM2RotaryEmbedding,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         q, k, v = self.split_qkv(hidden_states)
         cos, sin = rotary_emb(position_ids)
@@ -199,7 +198,7 @@ def scaled_dot_product(
     v: torch.Tensor,
     *,
     num_kv_groups: int,
-    mask: Optional[torch.Tensor],
+    mask: torch.Tensor | None,
     implementation: str,
 ) -> torch.Tensor:
     k_full = repeat_kv(k, num_kv_groups)
@@ -242,7 +241,7 @@ class InternLM2Block(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         rotary_emb: InternLM2RotaryEmbedding,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_input = self.attention_norm(hidden_states)
         attn_out, k, v = self.attention(attn_input, position_ids, rotary_emb, attention_mask)
