@@ -954,29 +954,33 @@ class HunyuanImage3Processor:
 
         return final_image_info
 
-    def _resize_and_crop(self, image: Image.Image, target_size: tuple[int, int]) -> Image.Image:
+    def _resize_and_crop(
+        self,
+        image: Image.Image,
+        target_size: tuple[int, int],
+        crop_type: str = "resize",
+    ) -> Image.Image:
+        # Default mode mirrors the official `infer_align_image_size=True`
+        # path (image_processor.py:355 → crop_type="resize") used by the
+        # IT2I demo: stretch the cond image to the bucket dims so its
+        # `<img_ratio_*>` tag and ViT/VAE features stay aligned with the
+        # bucket, instead of dropping content via center crop.
         tw, th = target_size
+        if crop_type == "resize":
+            return image.resize((tw, th), resample=Image.Resampling.LANCZOS)
         w, h = image.size
-
         tr = th / tw
         r = h / w
-
-        # resize
         if r < tr:
             resize_height = th
             resize_width = int(round(th / h * w))
         else:
             resize_width = tw
             resize_height = int(round(tw / w * h))
-
         image = image.resize((resize_width, resize_height), resample=Image.Resampling.LANCZOS)
-
-        # center crop
         crop_top = int(round((resize_height - th) / 2.0))
         crop_left = int(round((resize_width - tw) / 2.0))
-
-        image = image.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
-        return image
+        return image.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
 
 
 class HunyuanImage3ProcessingInfo(BaseProcessingInfo):
