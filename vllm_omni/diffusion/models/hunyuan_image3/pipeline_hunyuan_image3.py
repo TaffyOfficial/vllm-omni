@@ -283,11 +283,13 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
                 cond_image_infos = [_build_cond_joint_image(image) for image in image_list]
                 prompt["additional_information"]["batch_cond_image_info"] = cond_image_infos
 
+                bridge_h = prompt.get("height") if isinstance(prompt, dict) else None
+                bridge_w = prompt.get("width") if isinstance(prompt, dict) else None
                 first_image_w, first_image_h = _to_pil_image(image_list[0]).size
                 if request.sampling_params.width is None:
-                    request.sampling_params.width = int(first_image_w)
+                    request.sampling_params.width = int(bridge_w or first_image_w)
                 if request.sampling_params.height is None:
-                    request.sampling_params.height = int(first_image_h)
+                    request.sampling_params.height = int(bridge_h or first_image_h)
 
             request.prompts[i] = prompt
 
