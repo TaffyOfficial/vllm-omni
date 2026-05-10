@@ -737,7 +737,7 @@ class HunyuanImage3Processor:
     class ResolutionGroup:
         """Group of resolutions for image processing."""
 
-        def __init__(self, base_size=None, step=None, align=1):
+        def __init__(self, base_size=None, step=None, align=1, extra_resolutions=None):
             self.align = align
             self.base_size = base_size
             assert base_size % align == 0, f"base_size {base_size} is not divisible by align {align}"
@@ -750,6 +750,11 @@ class HunyuanImage3Processor:
 
             self.step = step
             self.data = self._calc_by_step()
+
+            if extra_resolutions is not None:
+                for er in extra_resolutions:
+                    if not any(r.ratio == er.ratio for r in self.data):
+                        self.data.append(er)
 
             self.ratio = np.array([x.ratio for x in self.data])
             self.attr = ["" for _ in range(len(self.data))]
@@ -815,7 +820,20 @@ class HunyuanImage3Processor:
     def __init__(self, tokenizer, hf_config, **kwargs: object):
         self.tokenizer = tokenizer
         self.hf_config = hf_config
-        self.reso_group = self.ResolutionGroup(base_size=hf_config.image_base_size)
+        # `HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS` mirrors the official
+        # `vae_reso_group` extras (image_processor.py:147-152). Build with
+        # this processor's inner Resolution class so `data` stays
+        # type-homogeneous.
+        from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+            HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS,
+        )
+
+        self.reso_group = self.ResolutionGroup(
+            base_size=hf_config.image_base_size,
+            extra_resolutions=[
+                HunyuanImage3Processor.Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS
+            ],
+        )
         self.vision_encoder_processor = Siglip2ImageProcessorFast.from_dict(hf_config.vit_processor)
         self.vae_processor = transforms.Compose(
             [

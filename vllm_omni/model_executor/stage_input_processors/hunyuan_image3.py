@@ -45,9 +45,16 @@ def _build_ratio_size_table(base_size: int) -> list[tuple[int, int]]:
     `reso_group[ratio_index]` reverse lookup. Cached because the table
     is constant per `base_size`.
     """
-    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ResolutionGroup
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+        HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS,
+        Resolution,
+        ResolutionGroup,
+    )
 
-    reso_group = ResolutionGroup(base_size=base_size)
+    reso_group = ResolutionGroup(
+        base_size=base_size,
+        extra_resolutions=[Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
+    )
     return [(int(r.height), int(r.width)) for r in reso_group.data]
 
 
