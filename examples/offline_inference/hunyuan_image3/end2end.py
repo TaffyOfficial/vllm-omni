@@ -16,7 +16,6 @@ Usage:
 
 import argparse
 import os
-import re
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     build_prompt_tokens,
@@ -131,37 +130,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def _infer_shape_reference_index(prompt: str, num_images: int) -> int:
-    chinese_nums = {"一": 1, "二": 2, "三": 3}
-
-    def _to_idx(m: re.Match) -> int | None:
-        g = m.group(1).strip()
-        val = chinese_nums.get(g, int(g) if g.isdigit() else None)
-        return val - 1 if val and 1 <= val <= num_images else None
-
-    for pat in (
-        r"参考图\s*([一二三123])",
-        r"参考第\s*([一二三123])\s*张",
-        r"参考\s*image\s*([123])",
-        r"ref(?:erence)?\s*image\s*([123])",
-    ):
-        m = re.search(pat, prompt, re.IGNORECASE)
-        if m and (idx := _to_idx(m)) is not None:
-            return idx
-
-    for pat in (
-        r"基于图\s*([一二三123])",
-        r"基于第\s*([一二三123])\s*张",
-        r"基于\s*image\s*([123])",
-        r"based\s*on\s*image\s*([123])",
-    ):
-        m = re.search(pat, prompt, re.IGNORECASE)
-        if m and (idx := _to_idx(m)) is not None:
-            return idx
-
-    return 0
-
-
 def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
@@ -236,7 +204,6 @@ def main():
 
     # Format prompts
     formatted_prompts: list[OmniPromptType] = []
-    shape_indices: list[int] = []
     for p in prompts:
         # Only pass `num_images` for modalities that actually consume images;
         # text-only paths (t2i / t2t) ignore the parameter, but threading
@@ -262,10 +229,8 @@ def main():
         elif args.modality == "img2img":
             prompt_dict["modalities"] = ["image"]
             prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
-            shape_idx = _infer_shape_reference_index(p, len(input_images))
-            prompt_dict["height"] = input_images[shape_idx].height
-            prompt_dict["width"] = input_images[shape_idx].width
-            shape_indices.append(shape_idx)
+            prompt_dict["height"] = input_images[0].height
+            prompt_dict["width"] = input_images[0].width
         elif args.modality == "img2text":
             prompt_dict["modalities"] = ["text"]
             prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
@@ -280,7 +245,6 @@ def main():
     # Override diffusion params if applicable
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    diffusion_idx = 0
     for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
             sp.num_inference_steps = args.steps
@@ -291,12 +255,6 @@ def main():
             if args.modality in ("text2img",):
                 sp.height = args.height
                 sp.width = args.width
-            elif args.modality == "img2img":
-                shape_idx = shape_indices[diffusion_idx]
-                sp.height = input_images[shape_idx].height
-                sp.width = input_images[shape_idx].width
-
-            diffusion_idx += 1
 
     # Print configuration
     print(f"\n{'=' * 60}")
