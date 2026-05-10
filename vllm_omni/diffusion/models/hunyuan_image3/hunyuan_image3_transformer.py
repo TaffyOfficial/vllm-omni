@@ -1364,7 +1364,10 @@ class HunyuanImage3ImageProcessor:
     def __init__(self, config):
         self.config = config
 
-        self.reso_group = ResolutionGroup(base_size=config.image_base_size)
+        self.reso_group = ResolutionGroup(
+            base_size=config.image_base_size,
+            extra_resolutions=[Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
+        )
         self.vae_processor = transforms.Compose(
             [
                 transforms.ToTensor(),
