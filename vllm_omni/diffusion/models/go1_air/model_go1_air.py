@@ -149,9 +149,15 @@ class Go1Air(nn.Module):
         """Replace embeddings at ``img_context_token_id`` positions with vision features."""
         out = input_embeds.clone()
         flat_mask = (input_ids == self.config.img_context_token_id)
-        # vision_features: (B, V, D); ``flat_mask`` selects exactly V positions per batch row.
         flat_features = vision_features.reshape(-1, vision_features.shape[-1]).to(out.dtype)
-        out[flat_mask] = flat_features[: flat_mask.sum().item()]
+        expected_slots = int(flat_mask.sum().item())
+        if expected_slots != flat_features.shape[0]:
+            raise ValueError(
+                f"Go1Air vision injection mismatch: prompt has {expected_slots} "
+                f"img_context_token positions but vision tower produced "
+                f"{flat_features.shape[0]} tokens."
+            )
+        out[flat_mask] = flat_features
         return out
 
     def encode_prefix(
@@ -194,7 +200,12 @@ class Go1Air(nn.Module):
         control_freq: torch.Tensor,
     ) -> torch.Tensor:
         bsz = actions.shape[0]
-        state_token = self.state_adaptor(state).unsqueeze(1).expand(bsz, self.config.state_token_num, -1)
+        state_token = (
+            self.state_adaptor(state)
+            .unsqueeze(1)
+            .expand(bsz, self.config.state_token_num, -1)
+            .contiguous()
+        )
         action_tokens = self.action_adaptor(actions)
         time_tok = self.time_embedder(timesteps).unsqueeze(1)
         freq_tok = self.freq_embedder(control_freq).unsqueeze(1)
@@ -335,6 +346,15 @@ class Go1AirPolicy(nn.Module):
         policy = cls(config, processor_model_name=processor_model_name)
         policy._load_weights(Path(model_dir), strict=strict)
         policy._maybe_load_tokenizer(Path(model_dir))
+        # Real-mode forward needs both weights and a tokenizer; if either is
+        # missing, drop back to stub so the pipeline still produces a valid
+        # output shape instead of raising on first call.
+        if policy._has_weights and policy._tokenizer is None:
+            logger.warning(
+                "Go1AirPolicy: checkpoint weights loaded but tokenizer is missing; "
+                "falling back to stub mode for forward()."
+            )
+            policy._has_weights = False
         return policy
 
     def _load_weights(self, model_dir: Path, *, strict: bool) -> None:
