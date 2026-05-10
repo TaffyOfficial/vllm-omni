@@ -94,19 +94,20 @@ class Go1Air(nn.Module):
             }
         )
 
-        # Per-layer projections from LLM KV space → action expert KV space.
-        llm_kv_dim = (config.llm_hidden_size // config.llm_num_attention_heads) * config.llm_num_key_value_heads
-        action_kv_dim = spec.resolved_head_dim() * config.act_num_key_value_heads
+        # Per-layer per-head projections from LLM head_dim → action expert head_dim.
+        # The Linear is applied along the last (head_dim) axis of vlm_k/vlm_v;
+        # the kv-head count is preserved (must be equal between the two stacks).
+        head_dim_llm = config.llm_hidden_size // config.llm_num_attention_heads
+        head_dim_act = spec.resolved_head_dim()
         self.k_proj_layers = nn.ModuleList(
-            [nn.Linear(llm_kv_dim, action_kv_dim, bias=True) for _ in range(config.act_num_hidden_layers)]
+            [nn.Linear(head_dim_llm, head_dim_act, bias=True) for _ in range(config.act_num_hidden_layers)]
         )
         self.v_proj_layers = nn.ModuleList(
-            [nn.Linear(llm_kv_dim, action_kv_dim, bias=True) for _ in range(config.act_num_hidden_layers)]
+            [nn.Linear(head_dim_llm, head_dim_act, bias=True) for _ in range(config.act_num_hidden_layers)]
         )
 
         self.final_layer = FinalLayer(
             hidden_size=config.act_hidden_size,
-            intermediate_size=config.act_intermediate_size,
             action_dim=config.max_action_dim,
             eps=config.act_rms_norm_eps,
         )
@@ -182,14 +183,11 @@ class Go1Air(nn.Module):
         vlm_k: torch.Tensor,
         vlm_v: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        bsz, _, vlm_len, _ = vlm_k.shape
-        flat_k = vlm_k.transpose(1, 2).reshape(bsz, vlm_len, -1)
-        flat_v = vlm_v.transpose(1, 2).reshape(bsz, vlm_len, -1)
-        proj_k = self.k_proj_layers[layer_idx](flat_k)
-        proj_v = self.v_proj_layers[layer_idx](flat_v)
-        head_dim = self._action_spec.resolved_head_dim()
-        proj_k = proj_k.view(bsz, vlm_len, self.config.act_num_key_value_heads, head_dim).transpose(1, 2)
-        proj_v = proj_v.view(bsz, vlm_len, self.config.act_num_key_value_heads, head_dim).transpose(1, 2)
+        # vlm_k/vlm_v shape: (B, num_kv_heads, T, head_dim_llm).
+        # The per-layer Linear acts along the last axis, mapping head_dim_llm
+        # to head_dim_act while preserving the kv_heads / batch / time axes.
+        proj_k = self.k_proj_layers[layer_idx](vlm_k)
+        proj_v = self.v_proj_layers[layer_idx](vlm_v)
         return proj_k, proj_v
 
     def _build_joint_tokens(
@@ -469,38 +467,67 @@ class Go1AirPolicy(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
-        """Collect pixel_values + tokenize task into input_ids with image-context placeholders."""
+        """Collect pixel_values + tokenize task with ``<IMG_CONTEXT>`` placeholders.
+
+        Each batch row gets ``images_per_row × vision_tokens_per_image`` copies
+        of ``img_context_token_id`` prepended to the tokenised task string.
+        ``Go1Air._inject_vision`` then replaces those positions with the
+        ``mlp1``-projected vision features at forward time.
+        """
         if self._tokenizer is None:
             raise RuntimeError(
                 "Go1AirPolicy.forward requires a tokenizer for the language prefix; "
                 "load via from_pretrained(model_dir) or run the pipeline in stub mode."
             )
 
-        # Stack all observation.images.* image tensors into a single (B*N, 3, H, W) batch.
+        # Stack observation.images.* tensors into a single (B*N, 3, H, W) batch.
         image_tensors: list[torch.Tensor] = []
+        bsz_from_images = 0
         for key, value in batch_inputs.items():
             if key.startswith(f"{OBS_IMAGES}.") and not key.endswith("_mask") and isinstance(value, torch.Tensor):
-                # Expected shape (B, history, 3, H, W) — flatten history into batch.
-                bsz, history = value.shape[:2]
-                image_tensors.append(value.reshape(bsz * history, *value.shape[2:]).to(dtype))
+                bsz_row, history = value.shape[:2]
+                bsz_from_images = bsz_row
+                image_tensors.append(value.reshape(bsz_row * history, *value.shape[2:]).to(dtype))
         pixel_values = torch.cat(image_tensors, dim=0).to(device=device) if image_tensors else None
 
-        # Tokenize the task strings with one image-context placeholder per image
-        # in the batch row. The tokenizer's vocabulary is expected to contain
-        # the special id ``img_context_token_id`` (true for InternLM2 tokenizers
-        # configured for the InternVL family).
+        # Vision tokens per image after pixel_shuffle:
+        #   patches_per_side = image_size / patch_size
+        #   block = round(1 / downsample_ratio)
+        #   tokens = (patches_per_side / block) ** 2
+        side_in_patches = self.config.image_resolution[0] // self.config.vision_patch_size
+        block = max(1, int(round(1.0 / self.config.downsample_ratio)))
+        vision_tokens_per_image = (side_in_patches // block) ** 2
+
         task_strings = batch_inputs.get(OBS_TASK) or [""]
         if isinstance(task_strings, str):
             task_strings = [task_strings]
+        bsz = max(len(task_strings), bsz_from_images)
+        if bsz == 0:
+            bsz = 1
+            task_strings = [""]
+        if len(task_strings) < bsz:
+            task_strings = list(task_strings) + [""] * (bsz - len(task_strings))
 
-        encoded = self._tokenizer(
-            list(task_strings),
-            padding=True,
-            return_tensors="pt",
-        )
-        input_ids = encoded["input_ids"].to(device)
-        attention_mask = encoded.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
+        n_images_total = pixel_values.shape[0] if pixel_values is not None else 0
+        images_per_row = n_images_total // bsz if bsz > 0 else 0
+        prefix_len = images_per_row * vision_tokens_per_image
+
+        img_context_id = int(self.config.img_context_token_id)
+        pad_id = int(self.config.llm_pad_token_id)
+
+        input_ids_rows: list[list[int]] = []
+        for task in task_strings:
+            prefix = [img_context_id] * prefix_len
+            task_ids = self._tokenizer(
+                task,
+                add_special_tokens=True,
+                return_tensors="pt",
+            )["input_ids"][0].tolist()
+            input_ids_rows.append(prefix + task_ids)
+
+        max_len = max(len(row) for row in input_ids_rows)
+        padded = [row + [pad_id] * (max_len - len(row)) for row in input_ids_rows]
+        input_ids = torch.tensor(padded, device=device, dtype=torch.long)
+        attention_mask = (input_ids != pad_id).to(device=device)
 
         return pixel_values, attention_mask, input_ids

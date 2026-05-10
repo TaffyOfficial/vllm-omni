@@ -76,19 +76,29 @@ class SinusoidalScalarEmbedding(nn.Module):
 
 
 class TimestepEmbedder(nn.Module):
-    """Sinusoidal -> 2-layer MLP with parameter names ``mlp.0`` and ``mlp.2``."""
+    """Sinusoidal -> 2-layer MLP with parameter names ``mlp.0`` and ``mlp.2``.
+
+    The sinusoidal embedding has a fixed 256-dim output; the MLP then lifts
+    it to ``hidden_size``. This matches the upstream checkpoint shape
+    ``mlp.0.weight = [hidden_size, 256]``.
+    """
+
+    SINUSOIDAL_DIM = 256
 
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
-        self.sinusoidal = SinusoidalScalarEmbedding(hidden_size)
+        self.sinusoidal = SinusoidalScalarEmbedding(self.SINUSOIDAL_DIM)
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size, bias=True),
+            nn.Linear(self.SINUSOIDAL_DIM, hidden_size, bias=True),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size, bias=True),
         )
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        return self.mlp(self.sinusoidal(t))
+        # Sinusoidal output is fp32 when ``t`` is integer; cast to match the
+        # MLP's parameter dtype so the Linear matmul doesn't reject the input.
+        out = self.sinusoidal(t)
+        return self.mlp(out.to(self.mlp[0].weight.dtype))
 
 
 def make_state_action_adaptor(in_dim: int, hidden_dim: int, out_dim: int) -> nn.Sequential:
@@ -103,15 +113,20 @@ def make_state_action_adaptor(in_dim: int, hidden_dim: int, out_dim: int) -> nn.
 
 
 class FinalLayer(nn.Module):
-    """Output head: RMSNorm -> 2-layer MLP that maps to ``action_dim``."""
+    """Output head: RMSNorm -> 2-layer MLP that maps to ``action_dim``.
 
-    def __init__(self, hidden_size: int, intermediate_size: int, action_dim: int, eps: float = 1e-5) -> None:
+    The intermediate width equals ``hidden_size`` (not the action expert's
+    ``intermediate_size``), matching the upstream checkpoint shape
+    ``fc1.weight = [hidden_size, hidden_size]`` / ``fc2.weight = [action_dim, hidden_size]``.
+    """
+
+    def __init__(self, hidden_size: int, action_dim: int, eps: float = 1e-5) -> None:
         super().__init__()
         self.norm_final = InternLM2RMSNorm(hidden_size, eps=eps)
         self.ffn_final = nn.Sequential()
-        self.ffn_final.add_module("fc1", nn.Linear(hidden_size, intermediate_size, bias=True))
+        self.ffn_final.add_module("fc1", nn.Linear(hidden_size, hidden_size, bias=True))
         self.ffn_final.add_module("act", nn.SiLU())
-        self.ffn_final.add_module("fc2", nn.Linear(intermediate_size, action_dim, bias=True))
+        self.ffn_final.add_module("fc2", nn.Linear(hidden_size, action_dim, bias=True))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.ffn_final(self.norm_final(x))
@@ -167,13 +182,16 @@ class ActionExpertAttention(nn.Module):
         q, k_act = apply_rope(q, k_act, cos_act, sin_act)
 
         # Re-stamp absolute VLM positions onto the projected VLM keys so action
-        # queries can use cross-modal positional information.
+        # queries can use cross-modal positional information. Cos/sin from the
+        # rotary embedding are fp32; cast the result back to vlm_k's dtype so
+        # the joint K stays in the same precision as the action-side K.
+        orig_dtype = vlm_k.dtype
         cos_vlm, sin_vlm = rotary_emb(vlm_position_ids)
         cos_vlm = cos_vlm.unsqueeze(1)
         sin_vlm = sin_vlm.unsqueeze(1)
         half = vlm_k.shape[-1] // 2
         rotated = torch.cat((-vlm_k[..., half:], vlm_k[..., :half]), dim=-1)
-        vlm_k = (vlm_k * cos_vlm) + (rotated * sin_vlm)
+        vlm_k = ((vlm_k * cos_vlm) + (rotated * sin_vlm)).to(orig_dtype)
 
         joint_k = torch.cat([vlm_k, k_act], dim=2)
         joint_v = torch.cat([vlm_v, v_act], dim=2)
