@@ -69,9 +69,21 @@ class InternLM2Trunk(nn.Module):
         bsz, seqlen, _ = hidden.shape
         position_ids = torch.arange(seqlen, device=hidden.device).expand(bsz, seqlen)
 
+        # Decoder-only InternLM2 needs causal masking; combine with padding
+        # mask (if provided) into a (B, 1, T, T) additive attention mask.
+        neg = torch.finfo(hidden.dtype).min
+        causal = torch.triu(
+            torch.full((seqlen, seqlen), neg, device=hidden.device, dtype=hidden.dtype),
+            diagonal=1,
+        )
+        attn_bias = causal.unsqueeze(0).unsqueeze(0).expand(bsz, 1, seqlen, seqlen).contiguous()
+        if attention_mask is not None and attention_mask.dim() == 2:
+            invalid = (attention_mask == 0).view(bsz, 1, 1, seqlen)
+            attn_bias = attn_bias.masked_fill(invalid, neg)
+
         layer_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
         for block in self.layers:
-            hidden, k, v = block(hidden, position_ids, self.rotary_emb, attention_mask)
+            hidden, k, v = block(hidden, position_ids, self.rotary_emb, attn_bias)
             layer_kv.append((k, v))
         hidden = self.norm(hidden)
         return LanguageStackOutput(last_hidden_state=hidden, layer_kv=layer_kv)

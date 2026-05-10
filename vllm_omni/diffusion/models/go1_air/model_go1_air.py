@@ -393,14 +393,33 @@ class Go1AirPolicy(nn.Module):
         except ImportError:
             logger.warning("transformers not available; GO-1-Air policy will run without a tokenizer.")
             return
-        try:
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                str(model_dir),
-                trust_remote_code=True,
-            )
-        except Exception as exc:
-            logger.warning("Go1AirPolicy: tokenizer load failed (%s); falling back to stub mode.", exc)
-            self._tokenizer = None
+
+        # ``model_dir`` ships GO-1-Air's own InternLM2 tokenizer (added_tokens
+        # contain ``<IMG_CONTEXT>``); always prefer it. ``processor_model_name``
+        # is only used as a fallback for users whose checkpoint directory lacks
+        # tokenizer files.
+        sources: list[str] = [str(model_dir)]
+        if self.processor_model_name and str(self.processor_model_name) != str(model_dir):
+            sources.append(str(self.processor_model_name))
+
+        last_err: Exception | None = None
+        for source in sources:
+            try:
+                self._tokenizer = AutoTokenizer.from_pretrained(
+                    source,
+                    trust_remote_code=True,
+                )
+                logger.info("Go1AirPolicy: tokenizer loaded from %s.", source)
+                return
+            except Exception as exc:
+                last_err = exc
+        logger.warning(
+            "Go1AirPolicy: tokenizer load failed from all sources %s (last err: %s); "
+            "falling back to stub mode.",
+            sources,
+            last_err,
+        )
+        self._tokenizer = None
 
     # ----- forward --------------------------------------------------------
 
@@ -480,17 +499,40 @@ class Go1AirPolicy(nn.Module):
                 "load via from_pretrained(model_dir) or run the pipeline in stub mode."
             )
 
-        # Stack observation.images.* tensors into a single (B*N, 3, H, W) batch.
-        image_tensors: list[torch.Tensor] = []
-        bsz_from_images = 0
-        for key, value in batch_inputs.items():
-            if key.startswith(f"{OBS_IMAGES}.") and not key.endswith("_mask") and isinstance(value, torch.Tensor):
-                bsz_row, history = value.shape[:2]
-                bsz_from_images = bsz_row
-                image_tensors.append(value.reshape(bsz_row * history, *value.shape[2:]).to(dtype))
-        pixel_values = torch.cat(image_tensors, dim=0).to(device=device) if image_tensors else None
+        # Group cameras (deterministic order) and pair each with its mask.
+        # ``observation.images.*_mask`` is a (B,) bool tensor signalling whether
+        # that camera is valid on each batch row; padded / unavailable cameras
+        # must be dropped so they don't get encoded as a real visual prefix.
+        camera_keys = sorted(
+            k for k, v in batch_inputs.items()
+            if k.startswith(f"{OBS_IMAGES}.")
+            and not k.endswith("_mask")
+            and isinstance(v, torch.Tensor)
+        )
+        bsz_from_images = batch_inputs[camera_keys[0]].shape[0] if camera_keys else 0
 
-        # Vision tokens per image after pixel_shuffle:
+        per_row_frames: list[list[torch.Tensor]] = [[] for _ in range(bsz_from_images)]
+        for cam_key in camera_keys:
+            cam_tensor = batch_inputs[cam_key].to(dtype)
+            bsz_cam, history = cam_tensor.shape[:2]
+            mask = batch_inputs.get(f"{cam_key}_mask")
+            for row in range(bsz_cam):
+                if isinstance(mask, torch.Tensor):
+                    row_valid = bool(mask[row].item()) if mask.ndim >= 1 else bool(mask.item())
+                else:
+                    row_valid = True
+                if row_valid:
+                    for h in range(history):
+                        per_row_frames[row].append(cam_tensor[row, h])
+
+        flat_frames: list[torch.Tensor] = []
+        images_per_row: list[int] = []
+        for row_imgs in per_row_frames:
+            images_per_row.append(len(row_imgs))
+            flat_frames.extend(row_imgs)
+        pixel_values = torch.stack(flat_frames, dim=0).to(device=device) if flat_frames else None
+
+        # Vision tokens per kept image after pixel_shuffle:
         #   patches_per_side = image_size / patch_size
         #   block = round(1 / downsample_ratio)
         #   tokens = (patches_per_side / block) ** 2
@@ -501,23 +543,18 @@ class Go1AirPolicy(nn.Module):
         task_strings = batch_inputs.get(OBS_TASK) or [""]
         if isinstance(task_strings, str):
             task_strings = [task_strings]
-        bsz = max(len(task_strings), bsz_from_images)
-        if bsz == 0:
-            bsz = 1
-            task_strings = [""]
+        bsz = max(len(task_strings), bsz_from_images, 1)
         if len(task_strings) < bsz:
             task_strings = list(task_strings) + [""] * (bsz - len(task_strings))
-
-        n_images_total = pixel_values.shape[0] if pixel_values is not None else 0
-        images_per_row = n_images_total // bsz if bsz > 0 else 0
-        prefix_len = images_per_row * vision_tokens_per_image
+        while len(images_per_row) < bsz:
+            images_per_row.append(0)
 
         img_context_id = int(self.config.img_context_token_id)
         pad_id = int(self.config.llm_pad_token_id)
 
         input_ids_rows: list[list[int]] = []
-        for task in task_strings:
-            prefix = [img_context_id] * prefix_len
+        for row_idx, task in enumerate(task_strings):
+            prefix = [img_context_id] * (images_per_row[row_idx] * vision_tokens_per_image)
             task_ids = self._tokenizer(
                 task,
                 add_special_tokens=True,
