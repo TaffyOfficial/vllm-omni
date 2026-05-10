@@ -9,6 +9,7 @@ The submodule layout mirrors the upstream safetensors index so a
 ``state_adaptor.*``, ``action_adaptor.*``, ``final_layer.*`` are all direct
 children of :class:`Go1Air`.
 """
+
 from __future__ import annotations
 
 import json
@@ -87,9 +88,7 @@ class Go1Air(nn.Module):
 
         self.action_model = nn.ModuleDict(
             {
-                "layers": nn.ModuleList(
-                    [ActionExpertBlock(spec) for _ in range(config.act_num_hidden_layers)]
-                ),
+                "layers": nn.ModuleList([ActionExpertBlock(spec) for _ in range(config.act_num_hidden_layers)]),
                 "norm": InternLM2RMSNorm(config.act_hidden_size, eps=config.act_rms_norm_eps),
             }
         )
@@ -149,7 +148,7 @@ class Go1Air(nn.Module):
     ) -> torch.Tensor:
         """Replace embeddings at ``img_context_token_id`` positions with vision features."""
         out = input_embeds.clone()
-        flat_mask = (input_ids == self.config.img_context_token_id)
+        flat_mask = input_ids == self.config.img_context_token_id
         flat_features = vision_features.reshape(-1, vision_features.shape[-1]).to(out.dtype)
         expected_slots = int(flat_mask.sum().item())
         if expected_slots != flat_features.shape[0]:
@@ -198,12 +197,7 @@ class Go1Air(nn.Module):
         control_freq: torch.Tensor,
     ) -> torch.Tensor:
         bsz = actions.shape[0]
-        state_token = (
-            self.state_adaptor(state)
-            .unsqueeze(1)
-            .expand(bsz, self.config.state_token_num, -1)
-            .contiguous()
-        )
+        state_token = self.state_adaptor(state).unsqueeze(1).expand(bsz, self.config.state_token_num, -1).contiguous()
         action_tokens = self.action_adaptor(actions)
         time_tok = self.time_embedder(timesteps).unsqueeze(1)
         freq_tok = self.freq_embedder(control_freq).unsqueeze(1)
@@ -414,8 +408,7 @@ class Go1AirPolicy(nn.Module):
             except Exception as exc:
                 last_err = exc
         logger.warning(
-            "Go1AirPolicy: tokenizer load failed from all sources %s (last err: %s); "
-            "falling back to stub mode.",
+            "Go1AirPolicy: tokenizer load failed from all sources %s (last err: %s); falling back to stub mode.",
             sources,
             last_err,
         )
@@ -504,10 +497,9 @@ class Go1AirPolicy(nn.Module):
         # that camera is valid on each batch row; padded / unavailable cameras
         # must be dropped so they don't get encoded as a real visual prefix.
         camera_keys = sorted(
-            k for k, v in batch_inputs.items()
-            if k.startswith(f"{OBS_IMAGES}.")
-            and not k.endswith("_mask")
-            and isinstance(v, torch.Tensor)
+            k
+            for k, v in batch_inputs.items()
+            if k.startswith(f"{OBS_IMAGES}.") and not k.endswith("_mask") and isinstance(v, torch.Tensor)
         )
         bsz_from_images = batch_inputs[camera_keys[0]].shape[0] if camera_keys else 0
 

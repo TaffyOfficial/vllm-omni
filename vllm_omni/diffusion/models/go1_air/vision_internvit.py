@@ -13,6 +13,7 @@ HuggingFace base class because the checkpoint's parameter naming differs
 from ``transformers.models.internvl`` — direct subclassing would force a
 runtime key-rewrite layer and obscure the implementation.
 """
+
 from __future__ import annotations
 
 import math

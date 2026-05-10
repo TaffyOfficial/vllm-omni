@@ -9,6 +9,7 @@ projection, ``feed_forward.w1/w2/w3`` SwiGLU MLP, ``attention_norm`` /
 are factored here so the LM and the action expert decoder share the same
 building blocks while remaining independent ``nn.Module`` trees.
 """
+
 from __future__ import annotations
 
 import math
@@ -86,10 +87,7 @@ class InternLM2RotaryEmbedding(nn.Module):
         device = position_ids.device
         seq_max = int(position_ids.max().item()) + 1 if position_ids.numel() > 0 else 1
         if self.scaling_type == "dynamic" and seq_max > self.max_position_embeddings:
-            scale = (
-                self.scaling_factor * seq_max / self.max_position_embeddings
-                - (self.scaling_factor - 1.0)
-            )
+            scale = self.scaling_factor * seq_max / self.max_position_embeddings - (self.scaling_factor - 1.0)
             new_base = self.base * (scale ** (self.head_dim / (self.head_dim - 2)))
             inv_freq = _build_inv_freq(self.head_dim, new_base, device)
         else:

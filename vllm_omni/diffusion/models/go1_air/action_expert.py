@@ -9,6 +9,7 @@ lives on :class:`Go1Air` so all submodules sit at the checkpoint root, e.g.
 ``action_model.*``, ``time_embedder.*``, ``state_adaptor.*`` — matching the
 safetensors index layout published by the upstream checkpoint.
 """
+
 from __future__ import annotations
 
 import math
@@ -67,9 +68,7 @@ class SinusoidalScalarEmbedding(nn.Module):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         half = self.dim // 2
-        freqs = torch.exp(
-            -math.log(10_000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / half
-        )
+        freqs = torch.exp(-math.log(10_000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / half)
         args = t.float().unsqueeze(-1) * freqs.unsqueeze(0)
         result = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         return result.to(t.dtype if t.dtype.is_floating_point else torch.float32)

@@ -17,6 +17,7 @@ Two modes:
 This script is intentionally tiny; the full open-loop evaluation harness
 lives in a follow-up PR (mirroring ``examples/offline_inference/internvla_a1``).
 """
+
 from __future__ import annotations
 
 import argparse

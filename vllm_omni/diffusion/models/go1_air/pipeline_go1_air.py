@@ -50,9 +50,7 @@ class Go1AirPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self.config = self._build_config(od_config)
         custom_args = od_config.custom_pipeline_args or {}
         self.strict_load = bool(custom_args.get("strict_load", False))
-        self.processor_model_name = str(
-            custom_args.get("processor_model_name", DEFAULT_INTERNVL_PROCESSOR)
-        )
+        self.processor_model_name = str(custom_args.get("processor_model_name", DEFAULT_INTERNVL_PROCESSOR))
         enable_warmup = custom_args.get("enable_warmup")
         self.enable_warmup = bool(enable_warmup) if isinstance(enable_warmup, bool) else False
 
@@ -233,9 +231,7 @@ class Go1AirPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         if len(req.prompts) > 1:
-            logger.warning(
-                "Go1AirPipeline only supports a single prompt/request; taking the first sample."
-            )
+            logger.warning("Go1AirPipeline only supports a single prompt/request; taking the first sample.")
         extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
         batch_inputs = extra_args.get("batch_inputs")
         if batch_inputs is None:

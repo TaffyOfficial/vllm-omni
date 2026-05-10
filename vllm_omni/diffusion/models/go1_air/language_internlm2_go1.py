@@ -7,6 +7,7 @@ thin token-embedding + final-norm wrapper on top, and during forward we
 collect the per-layer K/V tensors so the action expert can cross-attend
 to them through its ``k_proj_layers`` / ``v_proj_layers`` projections.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
