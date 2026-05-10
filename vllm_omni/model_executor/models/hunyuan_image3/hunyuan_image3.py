@@ -1132,11 +1132,16 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
 
             # Use the real <timestep> token id (HF parity). The trained wte
             # at this slot is overwritten with timestep_emb(0) at runtime by
-            # `embed_input_ids` — same effect as HF's
-            # `instantiate_continuous_tokens` scatter-replace. Keeping the
-            # slot as <img> would have folded the timestep position into the
-            # multimodal bidirectional region, which empirically biased
-            # multi-image AR ratio prediction to the first image's bucket.
+            # `embed_input_ids`.
+            #
+            # Mark <img>*VAE + <joint_img_sep> + <img>*ViT as one contiguous
+            # embed run so vLLM's prefix-LM mask treats it as a single
+            # bidirectional region, mirroring official `joint_image_slices`
+            # full-attention range (image_processor.py:388, with
+            # cond_token_attn_type effectively spanning VAE+sep+ViT). With the
+            # default `select_token_id(<img>)` mask, sep splits the run into
+            # two regions; that asymmetry is what biased multi-image AR
+            # ratio prediction to the first image's bucket.
             replacement = (
                 [boi_token_id]
                 + [base_size_token_id]
@@ -1148,7 +1153,10 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
                 + [eoi_token_id]
             )
             logger.debug(f"actual replacement token count: {timestep_token_num + vae_token_num + vit_token_num}")
-            return PromptUpdateDetails.select_token_id(replacement, embed_token_id=img_token_id)
+            return PromptUpdateDetails.select_token_ids(
+                replacement,
+                embed_token_ids=[img_token_id, joint_img_sep_token_id],
+            )
 
         return [
             PromptReplacement(modality="image", target=[img_token_id], replacement=get_replacement_image),
@@ -1869,10 +1877,25 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             "Each image should have both VAE and ViT embeddings."
         )
 
-        # Order per image: VAE tokens -> ViT tokens. The <timestep> slot at
-        # the head of each per-image scaffold is NOT included here — its
-        # embedding is patched in by `embed_input_ids` via a token-id mask,
-        # mirroring HF's `instantiate_continuous_tokens` scatter-replace.
+        # Order per image: VAE tokens -> <joint_img_sep> wte -> ViT tokens.
+        # The <joint_img_sep> wte is included so it joins the bidirectional
+        # MM region (matching the official `joint_image_slices` full-attn
+        # range that spans VAE+sep+ViT). The merger replaces the sep slot
+        # with this wte tensor, which is numerically identical to what
+        # `model.embed_input_ids` would produce — no semantic change for
+        # single-image, but with multi-image the sep position now sits
+        # inside the bidirectional region (matching how the model was
+        # trained).
+        sep_token_id = self._mrope_joint_img_sep_token_id
+        sep_input_ids = torch.tensor(
+            [sep_token_id], device=vit_embeddings.device, dtype=torch.long
+        )
+        sep_embed = self.model.embed_input_ids(sep_input_ids).to(vit_embeddings.dtype)
+
+        # The <timestep> slot at the head of each per-image scaffold is NOT
+        # included here — its embedding is patched in by `embed_input_ids`
+        # via a token-id mask, mirroring HF's `instantiate_continuous_tokens`
+        # scatter-replace.
         combined_embeddings: list[torch.Tensor] = []
         num_images = len(vae_token_embeddings)
         for img_idx in range(num_images):
@@ -1880,7 +1903,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             if vae_token_embed.ndim == 3:
                 vae_token_embed = vae_token_embed.squeeze(0)
             vit_embed = vit_embeddings[img_idx]
-            stacked_embed = torch.cat([vae_token_embed, vit_embed], dim=0)
+            stacked_embed = torch.cat([vae_token_embed, sep_embed, vit_embed], dim=0)
             combined_embeddings.append(stacked_embed)
 
         return combined_embeddings
