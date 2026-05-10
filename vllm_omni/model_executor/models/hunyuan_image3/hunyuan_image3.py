@@ -1126,31 +1126,22 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
             ratio_token_id = tokenizer.convert_tokens_to_ids(f"<img_ratio_{_ratio_index}>")
             if ratio_token_id is None:
                 raise ValueError(f"Ratio token '<img_ratio_{_ratio_index}>' not found in tokenizer vocabulary")
+            timestep_token_id = tokenizer.convert_tokens_to_ids("<timestep>")
+            if timestep_token_id is None:
+                raise ValueError("Timestep token '<timestep>' not found in tokenizer vocabulary")
 
-            # NOTE on the timestep slot:
-            # HF's apply_chat_template emits the literal <timestep> token id
-            # 128017 here. HF's modeling forward (`instantiate_continuous_tokens`,
-            # see hunyuan3.0_ins/modeling_hunyuan_image_3.py:1964) then *scatter-
-            # replaces* the embedding at that position with `timestep_emb(0)`
-            # for cond images. So the wte embedding of <timestep> is irrelevant
-            # at runtime — what matters is the timestep_emb injection.
-            #
-            # vllm-omni achieves the same effect via the multimodal-embedding
-            # merger: we put an <img> (128006) placeholder here and ship a
-            # `timestep_emb(0)` tensor at the head of `embed_multimodal()`'s
-            # combined_embeddings. The merger replaces this placeholder's
-            # embedding with the timestep tensor, yielding a final hidden
-            # state numerically equivalent to HF at that position.
-            #
-            # Keep this slot as <img> (NOT <timestep>): switching to <timestep>
-            # requires either (a) a second PromptReplacement targeting 128017,
-            # or (b) the merger's embed_token_id to be a list — neither is
-            # currently supported by PromptUpdateDetails.select_token_id.
+            # Use the real <timestep> token id (HF parity). The trained wte
+            # at this slot is overwritten with timestep_emb(0) at runtime by
+            # `embed_input_ids` — same effect as HF's
+            # `instantiate_continuous_tokens` scatter-replace. Keeping the
+            # slot as <img> would have folded the timestep position into the
+            # multimodal bidirectional region, which empirically biased
+            # multi-image AR ratio prediction to the first image's bucket.
             replacement = (
                 [boi_token_id]
                 + [base_size_token_id]
                 + [ratio_token_id]
-                + [img_token_id] * timestep_token_num
+                + [timestep_token_id] * timestep_token_num
                 + [img_token_id] * vae_token_num
                 + [joint_img_sep_token_id]
                 + [img_token_id] * vit_token_num
@@ -1542,6 +1533,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self._end_of_answer_id = tokenizer.convert_tokens_to_ids("</answer>")
         image_base_size = getattr(config, "image_base_size", 1024)
         self._size_token_id = tokenizer.convert_tokens_to_ids(f"<img_size_{image_base_size}>")
+        self._timestep_token_id = tokenizer.convert_tokens_to_ids("<timestep>")
         self._start_ratio_id = tokenizer.convert_tokens_to_ids("<img_ratio_0>")
         self._end_ratio_id = tokenizer.convert_tokens_to_ids("<img_ratio_32>")
         ratio_33 = tokenizer.convert_tokens_to_ids("<img_ratio_33>")
@@ -1882,27 +1874,18 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             "Each image should have both VAE and ViT embeddings."
         )
 
-        # Order per image: timestep -> VAE tokens -> ViT tokens.
-        # The <img> placeholder at the timestep slot (see _get_prompt_updates)
-        # gets its embedding replaced by `timestep_emb(0)` here, which is what
-        # HF achieves via instantiate_continuous_tokens at runtime.
+        # Order per image: VAE tokens -> ViT tokens. The <timestep> slot at
+        # the head of each per-image scaffold is NOT included here — its
+        # embedding is patched in by `embed_input_ids` via a token-id mask,
+        # mirroring HF's `instantiate_continuous_tokens` scatter-replace.
         combined_embeddings: list[torch.Tensor] = []
         num_images = len(vae_token_embeddings)
         for img_idx in range(num_images):
-            # 1. Timestep embedding (cond image timestep == 0)
-            timestep = torch.zeros((1,)).to(vit_embeddings.device).to(vit_embeddings.dtype)
-            timestep_emb = self._timestep_encode(timestep)
-
-            # 2. VAE image token embeddings
             vae_token_embed = vae_token_embeddings[img_idx]
-            # Remove batch dimension if present: (B, seq_len, hidden_size) -> (seq_len, hidden_size)
             if vae_token_embed.ndim == 3:
                 vae_token_embed = vae_token_embed.squeeze(0)
-
-            # 3. ViT image embeddings
             vit_embed = vit_embeddings[img_idx]
-
-            stacked_embed = torch.cat([timestep_emb, vae_token_embed, vit_embed], dim=0)
+            stacked_embed = torch.cat([vae_token_embed, vit_embed], dim=0)
             combined_embeddings.append(stacked_embed)
 
         return combined_embeddings
@@ -1915,14 +1898,25 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         is_multimodal: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Embed input IDs with optional multimodal embeddings."""
-        # Get text embeddings
         inputs_embeds = self.model.embed_input_ids(input_ids)
 
-        # If no multimodal embeddings, return text embeddings
+        # Patch <timestep> slots with timestep_emb(0). HF parity: the trained
+        # wte at this slot is irrelevant; runtime uses
+        # `instantiate_continuous_tokens(timestep_emb(0))`. With multi-image,
+        # keeping these slots as <img> ids merged the timestep position into
+        # the bidirectional MM region and biased AR ratio prediction toward
+        # the first image's bucket.
+        timestep_mask = input_ids == self._timestep_token_id
+        n_timestep = int(timestep_mask.sum().item())
+        if n_timestep > 0:
+            timestep_input = torch.zeros(
+                (n_timestep,), device=inputs_embeds.device, dtype=inputs_embeds.dtype
+            )
+            inputs_embeds[timestep_mask] = self._timestep_encode(timestep_input)
+
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return inputs_embeds
 
-        # Merge multimodal embeddings with text embeddings
         merged_embeds = _merge_multimodal_embeddings(
             inputs_embeds=inputs_embeds,
             multimodal_embeddings=multimodal_embeddings,
@@ -2138,6 +2132,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         boi_token_id = self._mrope_boi_token_id
         eoi_token_id = self._mrope_eoi_token_id
         joint_img_sep_token_id = self._mrope_joint_img_sep_token_id
+        timestep_token_id = self._timestep_token_id
 
         # Build position arrays
         t_pos: list[int] = []  # temporal (same as 1D for this model)
@@ -2154,7 +2149,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
             if tok == boi_token_id:
                 # Found start of image block.
-                # Structure: <boi> <size> <ratio> <img>*timestep <img>*vae
+                # Structure: <boi> <size> <ratio> <timestep> <img>*vae
                 #            <joint_img_sep> <img>*vit <eoi>
                 # <boi> token
                 t_pos.append(pos)
@@ -2179,8 +2174,8 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                     pos += 1
                     i += 1
 
-                # Timestep token (1 <img> token)
-                if i < n and input_tokens[i] == img_token_id:
+                # <timestep> token (1 token)
+                if i < n and input_tokens[i] == timestep_token_id:
                     t_pos.append(pos)
                     h_pos.append(pos)
                     w_pos.append(pos)
