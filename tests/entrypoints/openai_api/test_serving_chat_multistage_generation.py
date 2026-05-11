@@ -216,3 +216,198 @@ def test_build_multistage_generation_inputs_tokenizer_path_emits_prompt_token_id
         # (4) N <img> token ids (id=2 in FakeTokenizer)
         img_count = token_ids.count(2)
         assert img_count == n, f"N={n}: expected {n} <img> token ids in prompt_token_ids, got {img_count}"
+
+
+def test_build_multistage_generation_inputs_legacy_bot_task_form_unchanged(serving_chat):
+    """Legacy callers passed a task-enum value (i2t/it2i/t2i/t2t) under
+    `bot_task` in extra_body. After the P1 task/bot_task split, the helper
+    must still treat that legacy form as `task=<value>, bot_task=None`
+    (i.e. defaults bot_task semantic to "think"), so the resulting prompt
+    is identical to the pre-P1 output.
+
+    Pins the back-compat contract.
+    """
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.0),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+    images = [Image.new("RGB", (32, 32), color="red"), Image.new("RGB", (32, 32), color="blue")]
+
+    # Legacy form: only bot_task=<task-enum>.
+    legacy_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="edit me",
+        extra_body={"bot_task": "it2i"},
+        reference_images=images,
+        gen_params=OmniDiffusionSamplingParams(),
+    )
+    # New form: explicit task=<task-enum>, no bot_task.
+    new_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="edit me",
+        extra_body={"task": "it2i"},
+        reference_images=images,
+        gen_params=OmniDiffusionSamplingParams(),
+    )
+    assert legacy_prompt["prompt"] == new_prompt["prompt"], (
+        f"legacy bot_task=<task> form must produce the same prompt as task=<task>; "
+        f"legacy={legacy_prompt['prompt']!r} new={new_prompt['prompt']!r}"
+    )
+
+
+def test_build_multistage_generation_inputs_bot_task_semantic_changes_trigger_and_sys(serving_chat):
+    """Passing bot_task=think_recaption (vs default "think") must flip the
+    resolved sys_type to en_think_recaption (and trigger tag is still
+    <think>). Pins that the API actually plumbs the bot_task semantic
+    through to build_prompt rather than ignoring it.
+    """
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.0),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+    images = [Image.new("RGB", (32, 32), color="red")]
+
+    # Default bot_task (think) -> en_unified system prompt baked into the
+    # legacy string path. Use legacy build_prompt (tokenizer=None) so the
+    # rendered prompt is a string we can grep.
+    think_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="edit me",
+        extra_body={"task": "it2i", "bot_task": "think"},
+        reference_images=images,
+        gen_params=OmniDiffusionSamplingParams(),
+    )
+    # think_recaption -> en_think_recaption system prompt (different content).
+    recap_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="edit me",
+        extra_body={"task": "it2i", "bot_task": "think_recaption"},
+        reference_images=images,
+        gen_params=OmniDiffusionSamplingParams(),
+    )
+    assert think_prompt["prompt"] != recap_prompt["prompt"], (
+        "bot_task semantic must change the rendered system prompt: "
+        f"think/think_recaption produced identical strings (len={len(think_prompt['prompt'])})"
+    )
+
+
+def test_build_multistage_generation_inputs_sys_type_override(serving_chat):
+    """Caller-supplied sys_type must override the bot_task-derived default.
+    Mirrors offline `--bot-task think_recaption --sys-type en_unified`
+    where the user wants think_recaptions trigger but the unified system
+    prompt body.
+    """
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.0),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+    images = [Image.new("RGB", (32, 32), color="red")]
+
+    # think_recaption defaults sys_type -> en_think_recaption.
+    default_sys, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="edit me",
+        extra_body={"task": "it2i", "bot_task": "think_recaption"},
+        reference_images=images,
+        gen_params=OmniDiffusionSamplingParams(),
+    )
+    # sys_type=en_unified overrides -> same system body as bot_task=think.
+    overridden, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="edit me",
+        extra_body={"task": "it2i", "bot_task": "think_recaption", "sys_type": "en_unified"},
+        reference_images=images,
+        gen_params=OmniDiffusionSamplingParams(),
+    )
+    plain_think, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="edit me",
+        extra_body={"task": "it2i", "bot_task": "think"},
+        reference_images=images,
+        gen_params=OmniDiffusionSamplingParams(),
+    )
+
+    # Override must (a) differ from the no-override default, and (b) equal
+    # the prompt that bot_task=think produces (both end up with
+    # en_unified system body + <think> trigger).
+    assert overridden["prompt"] != default_sys["prompt"], (
+        "sys_type override must change the rendered prompt body vs the bot_task default"
+    )
+    assert overridden["prompt"] == plain_think["prompt"], (
+        "sys_type=en_unified + bot_task=think_recaption must produce the same prompt as "
+        "bot_task=think (both = en_unified system body + <think> trigger)"
+    )
+
+
+def test_build_multistage_generation_inputs_custom_system_prompt(serving_chat):
+    """`extra_body["system_prompt"]` must reach build_prompt as
+    `custom_system_prompt`, enabling sys_type="custom" callers to inject
+    a verbatim system body. Without this plumbing the sys_type="custom"
+    branch in get_system_prompt() returns None and silently drops the
+    user-supplied content.
+    """
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.0),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+    images = [Image.new("RGB", (32, 32), color="red")]
+
+    QKEY = "prompt"
+    marker = "ZZZ_CUSTOM_SYSTEM_PROMPT_MARKER_ZZZ"
+
+    out, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="edit me",
+        extra_body={
+            "task": "it2i",
+            "bot_task": "think",
+            "sys_type": "custom",
+            "system_prompt": marker,
+        },
+        reference_images=images,
+        gen_params=OmniDiffusionSamplingParams(),
+    )
+    assert marker in out["prompt"], (
+        f"custom system_prompt content must reach the rendered prompt; "
+        f"marker {marker!r} not found in prompt of length {len(out['prompt'])}"
+    )
