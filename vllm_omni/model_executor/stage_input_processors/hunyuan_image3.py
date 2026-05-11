@@ -59,6 +59,67 @@ def _build_ratio_size_table(base_size: int) -> list[tuple[int, int]]:
 
 
 @lru_cache(maxsize=4)
+def _build_cot_end_token_ids(model_name_or_path: str) -> dict[str, int]:
+    """Return `{'</recaption>': id, '</think>': id}` for cot-boundary
+    truncation. Empty dict on lookup failure so callers degrade to a
+    pure text-based search.
+    """
+    try:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+    except Exception as e:  # pragma: no cover - environment-dependent
+        logger.warning("[ar2diffusion] failed to load tokenizer for cot-end lookup: %s", e)
+        return {}
+
+    result: dict[str, int] = {}
+    for marker in ("</recaption>", "</think>"):
+        tid = tokenizer.convert_tokens_to_ids(marker)
+        if tid is not None and tid != tokenizer.unk_token_id:
+            result[marker] = int(tid)
+    return result
+
+
+def _truncate_at_cot_end(
+    generated_text: str,
+    generated_token_ids,
+    model_name_or_path: str,
+) -> tuple[str, list[int]]:
+    """Truncate AR output at first `</recaption>` (or `</think>` fallback).
+
+    Mirrors `HunyuanImage3ForCausalMM.generate_image` in the official
+    upstream, which decodes only `generated_tokens[0, :end_pos + 1]` as
+    `cot_text` for DiT. The trailing `<answer><boi><img_size_*><img_ratio_*>`
+    sequence is a stage-transition trigger consumed via `image_size` /
+    height/width — it must NOT be forwarded to DiT's prompt builder, or
+    the extra `<boi>` and ratio tokens drift the DiT's own prompt
+    structure.
+    """
+    token_list = list(generated_token_ids) if generated_token_ids is not None else []
+
+    end_ids = _build_cot_end_token_ids(model_name_or_path)
+
+    for marker in ("</recaption>", "</think>"):
+        idx = generated_text.find(marker)
+        if idx == -1:
+            continue
+        text_end = idx + len(marker)
+        truncated_text = generated_text[:text_end]
+
+        truncated_tokens = token_list
+        end_id = end_ids.get(marker)
+        if end_id is not None and token_list:
+            try:
+                token_end = token_list.index(end_id)
+                truncated_tokens = token_list[: token_end + 1]
+            except ValueError:
+                pass
+        return truncated_text, truncated_tokens
+
+    return generated_text, token_list
+
+
+@lru_cache(maxsize=4)
 def _build_ratio_id_lookup(model_name_or_path: str) -> dict[int, int]:
     """Return `{token_id: ratio_index}` for `<img_ratio_*>` in the tokenizer.
 
@@ -206,17 +267,30 @@ def ar2diffusion(
                     width,
                 )
 
+        # Truncate the AR output at `</recaption>` (or `</think>`) before
+        # passing to DiT. Mirrors official `generate_image` which keeps
+        # `cot_text` clean and routes size/ratio via `image_size` only —
+        # we already extracted `ratio_idx` above and translated it into
+        # `height` / `width`, so the `<answer><boi><img_size_*><img_ratio_*>`
+        # tail has no remaining job and would only contaminate DiT's
+        # prompt builder if forwarded.
+        cot_text_for_dit, cot_token_ids_for_dit = _truncate_at_cot_end(
+            generated_text, generated_token_ids, model_name_or_path
+        )
+
         logger.info(
-            "[ar2diffusion] Request %d: AR generated %d tokens, text length=%d, target size=%dx%d (%s)",
+            "[ar2diffusion] Request %d: AR generated %d tokens, text length=%d, "
+            "cot_text length=%d, target size=%dx%d (%s)",
             i,
             len(generated_token_ids),
             len(generated_text),
+            len(cot_text_for_dit),
             height,
             width,
             f"AR ratio_idx={ratio_idx}" if ar_predicted else "from prompt (no AR ratio token)",
         )
 
-        token_tensor = torch.tensor(generated_token_ids, dtype=torch.long)
+        token_tensor = torch.tensor(cot_token_ids_for_dit, dtype=torch.long)
 
         diffusion_input: dict[str, Any] = {
             "prompt": text_prompt,
@@ -224,7 +298,7 @@ def ar2diffusion(
             "width": width,
             "extra": {
                 "ar_token_ids": token_tensor,
-                "ar_generated_text": generated_text,
+                "ar_generated_text": cot_text_for_dit,
             },
         }
 
