@@ -2165,7 +2165,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if bot_task:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt
 
-            prompt = build_prompt(prompt, task=bot_task)
+            num_images = len(reference_images) if reference_images else 1
+            prompt = build_prompt(prompt, task=bot_task, num_images=num_images)
             if reference_images and len(reference_images) == 1:
                 engine_prompt_data = {"image": reference_images[0]}
                 modalities = ["image"]

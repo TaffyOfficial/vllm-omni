@@ -1811,7 +1811,8 @@ async def edit_images(
 
         # 3.3 Parse and add size if provided
         width, height = None, None
-        if size.lower() == "auto":
+        size_was_auto = size.lower() == "auto"
+        if size_was_auto:
             if resolution is None:
                 # No resolution specified, use input image size
                 width, height = pil_images[0].size
@@ -1882,10 +1883,17 @@ async def edit_images(
                 "seed": effective_seed,
                 "num_outputs_per_prompt": n,
             }
-            if width is not None:
-                extra_body["width"] = width
-            if height is not None:
-                extra_body["height"] = height
+            # When size="auto", width/height were resolved from the first
+            # input images size (e.g. 512x512 logo), NOT a client-requested
+            # output dimension. Forwarding them to extra_body would override
+            # AR-driven pipelines (e.g. HunyuanImage-3.0) AR `<img_ratio_*>`
+            # token decision via gen_params -> sampling_params. Skip the
+            # forward when auto, matching offline end2end.py img2img.
+            if not size_was_auto:
+                if width is not None:
+                    extra_body["width"] = width
+                if height is not None:
+                    extra_body["height"] = height
             if negative_prompt is not None:
                 extra_body["negative_prompt"] = negative_prompt
             if num_inference_steps is not None:

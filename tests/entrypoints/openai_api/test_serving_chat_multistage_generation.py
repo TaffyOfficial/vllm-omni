@@ -91,3 +91,47 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine.default_sampling_params_list[1].lora_request is None
     assert engine.default_sampling_params_list[2].resolution == 640
     assert engine.default_sampling_params_list[2].lora_request is None
+
+
+def test_build_multistage_generation_inputs_multi_image_emits_n_img_placeholders(serving_chat):
+    """N reference images with bot_task set must emit N <img> placeholders.
+
+    Regression: prior to the multi-image online fix, build_prompt was
+    called without num_images, defaulting to 1. A 2-image edit request
+    would only get a single <img> placeholder in the AR prompt; vLLMs
+    _process_multimodal then raised
+    AssertionError(Failed to apply prompt replacement for mm_items[image][1])
+    when trying to replace the second image (no placeholder left for it).
+
+    Pins the contract that build_prompt() is invoked with the actual image
+    count so multi-image IT2I is wired correctly through the online
+    /v1/images/edits path.
+    """
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.0),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+    IMG = "<img>"
+    images = [Image.new("RGB", (32, 32), color="red") for _ in range(3)]
+
+    for n in (1, 2, 3):
+        engine_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
+            serving_chat,
+            engine=engine,
+            prompt="edit me",
+            extra_body={"bot_task": "it2i"},
+            reference_images=images[:n],
+            gen_params=OmniDiffusionSamplingParams(),
+        )
+        prompt_str = engine_prompt["prompt"]
+        assert prompt_str.count("<img>") == n, (
+            f"N={n}: expected {n} <img> placeholders, got {prompt_str.count(IMG)} -- prompt: {prompt_str!r}"
+        )
