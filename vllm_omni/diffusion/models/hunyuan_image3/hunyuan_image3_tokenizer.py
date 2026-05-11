@@ -903,6 +903,75 @@ class TokenizerWrapper:
             dict(type="text", text=cot_text, **uncond_kwargs),
         ]
 
+    def get_cot_sections_from_token_ids(
+        self,
+        token_ids,
+        uncond_kwargs,
+        cot_max_length=None,
+        drop_think=False,
+    ):
+        """Split AR-sampled token IDs at think/recaption markers without re-encoding.
+
+        Functional mirror of `get_cot_sections` but operates on AR sampled IDs.
+        Used by KV-reuse-aware callers: tokenize-detokenize-tokenize over the AR
+        cot text is not lossless (BPE re-merges across multi-byte UTF-8 and
+        punctuation boundaries). The resulting length drift breaks AR KV
+        position alignment (`positive_reuse_len` computed in DiT-tok space vs
+        the actual cached AR KV in AR-tok space, off by N tokens for prompts
+        containing Chinese + escaped quotes etc.).
+        """
+        if not token_ids:
+            return []
+        ids = list(token_ids)
+
+        think_id = self.tokenizer.convert_tokens_to_ids("<think>")
+        end_think_id = self.end_think_token_id
+        recaption_id = self.tokenizer.convert_tokens_to_ids("<recaption>")
+        end_recaption_id = self.end_recaption_token_id
+
+        def _split_at_pair(seq, start_id, end_id):
+            if start_id is None or end_id is None:
+                return None
+            try:
+                s = seq.index(start_id)
+                e = seq.index(end_id, s + 1)
+            except ValueError:
+                return None
+            return seq[:s], seq[s + 1 : e], seq[e + 1 :]
+
+        # Try <think>...</think> first to mirror text-side split order.
+        split = _split_at_pair(ids, think_id, end_think_id)
+        if split is not None:
+            before, inside, after = split
+            return (
+                self.get_cot_sections_from_token_ids(before, uncond_kwargs, drop_think=drop_think)
+                + (
+                    [
+                        dict(type="text", tokens=[think_id]),
+                        dict(type="text", tokens=inside, max_length=cot_max_length, **uncond_kwargs),
+                        dict(type="text", tokens=[end_think_id]),
+                    ]
+                    if not drop_think
+                    else []
+                )
+                + self.get_cot_sections_from_token_ids(after, uncond_kwargs, drop_think=drop_think)
+            )
+
+        split = _split_at_pair(ids, recaption_id, end_recaption_id)
+        if split is not None:
+            before, inside, after = split
+            return (
+                self.get_cot_sections_from_token_ids(before, uncond_kwargs, drop_think=drop_think)
+                + [
+                    dict(type="text", tokens=[recaption_id]),
+                    dict(type="text", tokens=inside, max_length=cot_max_length, **uncond_kwargs),
+                    dict(type="text", tokens=[end_recaption_id]),
+                ]
+                + self.get_cot_sections_from_token_ids(after, uncond_kwargs, drop_think=drop_think)
+            )
+
+        return [dict(type="text", tokens=ids, **uncond_kwargs)]
+
     def apply_general_template(
         self,
         message_list,
@@ -953,17 +1022,36 @@ class TokenizerWrapper:
             while _cur_message_idx < len(message_list) and _message_list[_cur_message_idx]["role"] == role:
                 message = _message_list[_cur_message_idx]
                 if message["type"] == "text":
-                    text = message["content"]
+                    content = message["content"]
+                    ctx_type = message.get("context_type", "str")
                     if role == "system":
-                        _sub_sections.append(dict(type="text", text=text))
+                        _sub_sections.append(dict(type="text", text=content))
                     elif role == "assistant":
-                        if ("<recaption>" in text and "</recaption>" in text) or (
-                            "<think>" in text and "</think>" in text
-                        ):
-                            _sub_sections.extend(self.get_cot_sections(text, uncond_kwargs, drop_think=drop_think))
+                        if ctx_type == "token_ids":
+                            # Pre-tokenized AR cot tokens; split on marker ids, no re-encode.
+                            if hasattr(content, "tolist"):
+                                content = content.tolist()
+                            think_id = self.tokenizer.convert_tokens_to_ids("<think>")
+                            recaption_id = self.tokenizer.convert_tokens_to_ids("<recaption>")
+                            has_cot = (think_id in content and self.end_think_token_id in content) or (
+                                recaption_id in content and self.end_recaption_token_id in content
+                            )
+                            if has_cot:
+                                _sub_sections.extend(
+                                    self.get_cot_sections_from_token_ids(content, uncond_kwargs, drop_think=drop_think)
+                                )
+                            else:
+                                _sub_sections.append(dict(type="text", tokens=content, **uncond_kwargs))
                         else:
-                            _sub_sections.append(dict(type="text", text=text, **uncond_kwargs))
+                            text = content
+                            if ("<recaption>" in text and "</recaption>" in text) or (
+                                "<think>" in text and "</think>" in text
+                            ):
+                                _sub_sections.extend(self.get_cot_sections(text, uncond_kwargs, drop_think=drop_think))
+                            else:
+                                _sub_sections.append(dict(type="text", text=text, **uncond_kwargs))
                     else:
+                        text = content
                         _sub_sections.append(
                             dict(type="text", text=f"{answer_prefix}{text}{answer_suffix}", **uncond_kwargs)
                         )
@@ -1088,6 +1176,7 @@ class TokenizerWrapper:
         batch_cond_image_info: list[JointImageInfo] | list[list[JointImageInfo]] | None = None,
         batch_system_prompt: list[str] | None = None,
         batch_cot_text: list[str] | None = None,
+        batch_cot_token_ids: list | None = None,
         max_length: int | None = None,
         bot_task: str = "auto",  # auto/image/think/recaption/img_ratio
         image_base_size: int = 1024,
@@ -1116,6 +1205,14 @@ class TokenizerWrapper:
                 )
             else:
                 batch_cot_text = [None] * batch_size
+            # Optional per-item pre-tokenized AR cot ids (used by KV-reuse).
+            if batch_cot_token_ids is not None:
+                assert len(batch_cot_token_ids) == batch_size, (
+                    f"batch_cot_token_ids should have the same length as batch_size ({batch_size}), "
+                    f"but got {len(batch_cot_token_ids)}."
+                )
+            else:
+                batch_cot_token_ids = [None] * batch_size
             if batch_cond_image_info is not None:
                 assert len(batch_cond_image_info) == batch_size, (
                     f"batch_cond_image_info should have the same length as batch_size ({batch_size}), "
@@ -1130,10 +1227,18 @@ class TokenizerWrapper:
 
             # Convert single round materials into standard message list
             batch_message_list = []
-            for prompt, system_prompt, cot_text, gen_image_info, cond_image_info_list in zip(
+            for (
+                prompt,
+                system_prompt,
+                cot_text,
+                cot_token_ids,
+                gen_image_info,
+                cond_image_info_list,
+            ) in zip(
                 batch_prompt,
                 batch_system_prompt,
                 batch_cot_text,
+                batch_cot_token_ids,
                 batch_gen_image_info,
                 batch_cond_image_info,
             ):
@@ -1153,7 +1258,15 @@ class TokenizerWrapper:
                 #   2.2 text inputs
                 message_list.append(dict(role="user", type="text", content=prompt, context_type="str"))
                 # 3. assistant answer sections
-                if cot_text is not None:
+                if cot_token_ids is not None:
+                    # Use AR-sampled token IDs verbatim. Avoids the
+                    # tokenize-detokenize-tokenize length drift that breaks KV reuse
+                    # (see process_successive_message context_type="token_ids" branch
+                    # and get_cot_sections_from_token_ids docstring).
+                    message_list.append(
+                        dict(role="assistant", type="text", content=cot_token_ids, context_type="token_ids")
+                    )
+                elif cot_text is not None:
                     message_list.append(dict(role="assistant", type="text", content=cot_text, context_type="str"))
                 if mode == "gen_image":
                     message_list.append(
