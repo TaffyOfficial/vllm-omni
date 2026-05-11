@@ -1701,6 +1701,14 @@ async def edit_images(
     layers: int | None = Form(None),
     resolution: int | None = Form(None),  # See SUPPORTED_LAYERED_RESOLUTIONS
     bot_task: str | None = Form(None),
+    # P1: task / sys_type / system_prompt split out from the legacy bot_task
+    # field so callers can express the full HunyuanImage-3.0 prompt template
+    # surface (task enum + bot_task semantic + sys_type override + custom
+    # system prompt body). Legacy callers that pass a task-enum value via
+    # bot_task still work (see normalization below).
+    task: str | None = Form(None),
+    sys_type: str | None = Form(None),
+    system_prompt: str | None = Form(None),
 ) -> ImageGenerationResponse:
     """
     OpenAI-compatible image edit endpoint.
@@ -1913,8 +1921,25 @@ async def edit_images(
                 lora_dict = _get_lora_from_json_str(lora)
                 _parse_lora_request(lora_dict)
                 extra_body["lora"] = lora_dict
-            if bot_task is not None:
-                extra_body["bot_task"] = bot_task
+            # P1: normalize legacy `bot_task=<task-enum>` form. Callers historically
+            # passed the task enum (i2t / it2i / t2i / t2t) via the `bot_task`
+            # Form field; promote it to `task` here so the chat_handler can
+            # split task vs bot_task semantics cleanly. New callers pass both
+            # `task` and `bot_task` explicitly; we keep them separate.
+            _task = task
+            _bot_task = bot_task
+            _legacy_task_enum = {"t2t", "i2t", "it2i", "t2i"}
+            if _task is None and _bot_task in _legacy_task_enum:
+                _task = _bot_task
+                _bot_task = None
+            if _task is not None:
+                extra_body["task"] = _task
+            if _bot_task is not None:
+                extra_body["bot_task"] = _bot_task
+            if sys_type is not None:
+                extra_body["sys_type"] = sys_type
+            if system_prompt is not None:
+                extra_body["system_prompt"] = system_prompt
 
             prompt_text = prompt.get("prompt", "")
             generation_result = await chat_handler.generate_diffusion_images(
