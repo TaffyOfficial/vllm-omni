@@ -830,9 +830,7 @@ class HunyuanImage3Processor:
 
         self.reso_group = self.ResolutionGroup(
             base_size=hf_config.image_base_size,
-            extra_resolutions=[
-                HunyuanImage3Processor.Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS
-            ],
+            extra_resolutions=[HunyuanImage3Processor.Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
         )
         self.vision_encoder_processor = Siglip2ImageProcessorFast.from_dict(hf_config.vit_processor)
         self.vae_processor = transforms.Compose(
@@ -1892,9 +1890,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # inside the bidirectional region (matching how the model was
         # trained).
         sep_token_id = self._mrope_joint_img_sep_token_id
-        sep_input_ids = torch.tensor(
-            [sep_token_id], device=vit_embeddings.device, dtype=torch.long
-        )
+        sep_input_ids = torch.tensor([sep_token_id], device=vit_embeddings.device, dtype=torch.long)
         sep_embed = self.model.embed_input_ids(sep_input_ids).to(vit_embeddings.dtype)
 
         # The <timestep> slot at the head of each per-image scaffold is NOT
@@ -1932,9 +1928,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         timestep_mask = input_ids == self._timestep_token_id
         n_timestep = int(timestep_mask.sum().item())
         if n_timestep > 0:
-            timestep_input = torch.zeros(
-                (n_timestep,), device=inputs_embeds.device, dtype=inputs_embeds.dtype
-            )
+            timestep_input = torch.zeros((n_timestep,), device=inputs_embeds.device, dtype=inputs_embeds.dtype)
             inputs_embeds[timestep_mask] = self._timestep_encode(timestep_input)
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
