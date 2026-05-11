@@ -2265,16 +2265,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 build_prompt_tokens,
             )
 
+            num_images = len(reference_images) if reference_images else 1
             prompt_token_ids: list[int] | None = None
             system_prompt_type: str | None = None
             if tokenizer is not None:
-                result = build_prompt_tokens(prompt, tokenizer, task=bot_task)
+                result = build_prompt_tokens(prompt, tokenizer, task=bot_task, num_images=num_images)
                 prompt_token_ids = result.token_ids
                 system_prompt_type = result.system_prompt_type
             else:
-                prompt = build_prompt(prompt, task=bot_task)
+                prompt = build_prompt(prompt, task=bot_task, num_images=num_images)
                 engine_prompt["prompt"] = prompt
-
             if reference_images and len(reference_images) == 1:
                 engine_prompt_data = {"image": reference_images[0]}
                 modalities = ["image"]
