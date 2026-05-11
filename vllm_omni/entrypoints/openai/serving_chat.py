@@ -2258,7 +2258,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 engine_prompt_data = {"image": reference_images}
 
-        engine_prompt: OmniTextPrompt = {"prompt": prompt}
+        prompt_token_ids: list[int] | None = None
+        system_prompt_type: str | None = None
         if bot_task:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
                 build_prompt,
@@ -2266,23 +2267,35 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             )
 
             num_images = len(reference_images) if reference_images else 1
-            prompt_token_ids: list[int] | None = None
-            system_prompt_type: str | None = None
             if tokenizer is not None:
-                result = build_prompt_tokens(prompt, tokenizer, task=bot_task, num_images=num_images)
+                # HF byte-for-byte path: feed segment-tokenized prompt_token_ids
+                # so AR sees the same template-tokenization HF apply_chat_template
+                # produces. Without this, the engine BPE-merges across template
+                # segment boundaries (e.g. "。\n\n" -> single id) and AR
+                # diverges from training distribution -- different cot_text,
+                # different DiT input, different final image. Mirrors offline
+                # examples/.../end2end.py img2img which always feeds
+                # prompt_token_ids. See prompt_utils.build_prompt NOTE.
+                result = build_prompt_tokens(
+                    prompt,
+                    tokenizer,
+                    task=bot_task,
+                    num_images=num_images,
+                )
                 prompt_token_ids = result.token_ids
                 system_prompt_type = result.system_prompt_type
             else:
+                # Legacy string path (e.g. unit tests with no tokenizer plumbed).
                 prompt = build_prompt(prompt, task=bot_task, num_images=num_images)
-                engine_prompt["prompt"] = prompt
             if reference_images and len(reference_images) == 1:
                 engine_prompt_data = {"image": reference_images[0]}
                 modalities = ["image"]
-            if prompt_token_ids is not None:
-                engine_prompt["prompt_token_ids"] = prompt_token_ids
-            if system_prompt_type is not None:
-                engine_prompt["use_system_prompt"] = system_prompt_type
 
+        engine_prompt: OmniTextPrompt = {"prompt": prompt}
+        if prompt_token_ids is not None:
+            engine_prompt["prompt_token_ids"] = prompt_token_ids
+        if system_prompt_type is not None:
+            engine_prompt["use_system_prompt"] = system_prompt_type
         engine_prompt["modalities"] = modalities
         if negative_prompt is not None:
             engine_prompt["negative_prompt"] = negative_prompt
@@ -2456,13 +2469,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             diffusion_engine = cast(AsyncOmni, engine)
             stage_configs = getattr(diffusion_engine, "stage_configs", None) or []
             if len(stage_configs) > 1:
+                # Pull tokenizer from the comprehension (AR) stage so we can
+                # build HF byte-for-byte prompt_token_ids in the helper. If
+                # the engine doesn"t expose one, fall back to the legacy
+                # string-prompt path (engine re-tokenizes).
                 tokenizer = None
                 get_tok = getattr(diffusion_engine, "get_tokenizer", None)
                 if get_tok is not None:
                     try:
                         tokenizer = await get_tok()
                     except Exception as exc:
-                        logger.warning("get_tokenizer failed: %s", exc)
+                        logger.warning("get_tokenizer failed; falling back to string prompt path: %s", exc)
                 engine_prompt, sampling_params_list = self._build_multistage_generation_inputs(
                     engine=diffusion_engine,
                     prompt=prompt,
