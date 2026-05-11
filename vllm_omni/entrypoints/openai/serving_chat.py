@@ -2132,6 +2132,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         extra_body: dict[str, Any],
         reference_images: list[Image.Image],
         gen_params: OmniDiffusionSamplingParams,
+        tokenizer: Any = None,
     ) -> tuple[OmniTextPrompt, list[Any]]:
         """Build the shared multistage generation prompt and stage params."""
         stage_configs = getattr(engine, "stage_configs", None) or []
@@ -2162,16 +2163,42 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 engine_prompt_data = {"image": reference_images}
 
+        prompt_token_ids: list[int] | None = None
+        use_system_prompt: str | None = None
         if bot_task:
-            from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt
+            from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+                build_prompt,
+                build_prompt_tokens,
+                resolve_sys_type,
+            )
 
             num_images = len(reference_images) if reference_images else 1
-            prompt = build_prompt(prompt, task=bot_task, num_images=num_images)
+            if tokenizer is not None:
+                # HF byte-for-byte path: feed segment-tokenized prompt_token_ids
+                # so AR sees the same template-tokenization HF apply_chat_template
+                # produces. Without this, the engine BPE-merges across template
+                # segment boundaries (e.g. "。\n\n" -> single id) and AR
+                # diverges from training distribution -- different cot_text,
+                # different DiT input, different final image. Mirrors offline
+                # examples/.../end2end.py img2img which always feeds
+                # prompt_token_ids. See prompt_utils.build_prompt NOTE.
+                prompt_token_ids = build_prompt_tokens(prompt, tokenizer, task=bot_task, num_images=num_images)
+                # Forward use_system_prompt so ar2diffusion bridge can rebuild
+                # the same system prefix on the DiT side. build_prompt_tokens
+                # defaults bot_task="think" -> sys_type="en_unified".
+                use_system_prompt = resolve_sys_type("think")
+            else:
+                # Legacy string path (e.g. unit tests with no tokenizer plumbed).
+                prompt = build_prompt(prompt, task=bot_task, num_images=num_images)
             if reference_images and len(reference_images) == 1:
                 engine_prompt_data = {"image": reference_images[0]}
                 modalities = ["image"]
 
         engine_prompt: OmniTextPrompt = {"prompt": prompt}
+        if prompt_token_ids is not None:
+            engine_prompt["prompt_token_ids"] = prompt_token_ids
+        if use_system_prompt is not None:
+            engine_prompt["use_system_prompt"] = use_system_prompt
         engine_prompt["modalities"] = modalities
         if negative_prompt is not None:
             engine_prompt["negative_prompt"] = negative_prompt
@@ -2345,12 +2372,24 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             diffusion_engine = cast(AsyncOmni, engine)
             stage_configs = getattr(diffusion_engine, "stage_configs", None) or []
             if len(stage_configs) > 1:
+                # Pull tokenizer from the comprehension (AR) stage so we can
+                # build HF byte-for-byte prompt_token_ids in the helper. If
+                # the engine doesn"t expose one, fall back to the legacy
+                # string-prompt path (engine re-tokenizes).
+                tokenizer = None
+                get_tok = getattr(diffusion_engine, "get_tokenizer", None)
+                if get_tok is not None:
+                    try:
+                        tokenizer = await get_tok()
+                    except Exception as exc:
+                        logger.warning("get_tokenizer failed; falling back to string prompt path: %s", exc)
                 engine_prompt, sampling_params_list = self._build_multistage_generation_inputs(
                     engine=diffusion_engine,
                     prompt=prompt,
                     extra_body=extra_body,
                     reference_images=pil_images,
                     gen_params=gen_params,
+                    tokenizer=tokenizer,
                 )
             else:
                 engine_prompt = gen_prompt
