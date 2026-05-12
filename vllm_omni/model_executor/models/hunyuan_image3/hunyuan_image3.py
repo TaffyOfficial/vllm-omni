@@ -907,8 +907,8 @@ class HunyuanImage3Processor:
             current_info["vit_spatial_shapes"] = _ss.squeeze(0)
 
             # VAE: per-image bucket via `reso_group.get_target_size`; mirrors
-            # HF's `resize_and_crop` (crop_type="center", the official
-            # generate_image default with infer_align_image_size=False).
+            # HF's `resize_and_crop` default (crop_type="center", the official
+            # generate_image default when infer_align_image_size=False).
             # Keep fp32 — the VAE encoder casts to model dtype at its
             # boundary (see `_vae_encode`).
             image_width, image_height = self.reso_group.get_target_size(image.width, image.height)
@@ -957,13 +957,13 @@ class HunyuanImage3Processor:
         self,
         image: Image.Image,
         target_size: tuple[int, int],
-        crop_type: str = "resize",
+        crop_type: str = "center",
     ) -> Image.Image:
-        # Default mode mirrors the official `infer_align_image_size=True`
-        # path (image_processor.py:355 → crop_type="resize") used by the
-        # IT2I demo: stretch the cond image to the bucket dims so its
-        # `<img_ratio_*>` tag and ViT/VAE features stay aligned with the
-        # bucket, instead of dropping content via center crop.
+        # Default mode mirrors official `generate_image` with
+        # infer_align_image_size=False: preserve aspect ratio and center-crop
+        # to the nearest VAE bucket. Keeping this default aligned with the
+        # DiT-side condition-image helper avoids AR and DiT seeing different
+        # conditioning pixels for the same IT2I request.
         tw, th = target_size
         if crop_type == "resize":
             return image.resize((tw, th), resample=Image.Resampling.LANCZOS)
