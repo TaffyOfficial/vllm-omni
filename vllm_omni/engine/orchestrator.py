@@ -695,6 +695,21 @@ class Orchestrator:
         if self.async_chunk:
             return
 
+        # When kv_ready fires mid-decode (e.g. HunyuanImage3 with
+        # kv_transfer_criteria=special_token + stop_after_transfer=false,
+        # snapshot triggers at </recaption> but AR keeps generating tail
+        # tokens for ratio extraction), the kv_ready EngineCoreOutput is
+        # NOT a finished RequestOutput, so bridges that read
+        # ``ar_output.outputs[0]`` (HunyuanImage3 ar2diffusion) crash. Only
+        # forward kv_ready when the same raw_outputs batch also contains a
+        # finished output for that req_id; otherwise wait for AR's natural
+        # completion to trigger the forward through ``_route_output``.
+        finished_in_batch = {
+            o.request_id
+            for o in raw_outputs.outputs
+            if getattr(o, "finish_reason", None) is not None
+        }
+
         for raw_output in raw_outputs.outputs:
             kv_params = getattr(raw_output, "kv_transfer_params", None)
             if not (isinstance(kv_params, dict) and kv_params.get("kv_ready")):
@@ -710,6 +725,9 @@ class Orchestrator:
             if stage_id >= req_state.final_stage_id:
                 continue
             if (stage_id + 1) in req_state.stage_submit_ts:
+                continue
+
+            if req_id not in finished_in_batch:
                 continue
 
             if self._cfg_tracker.has_companions(req_id) and not self._cfg_tracker.all_companions_done(req_id):
