@@ -640,7 +640,11 @@ class HunyuanImage3Pipeline(
             if isinstance(vae_encode_result, torch.Tensor):
                 latents = vae_encode_result
             else:
-                latents = vae_encode_result.latent_dist.sample()
+                # Fixed-seed Generator so cond latents are deterministic
+                # across calls; see AR-side comment in
+                # model_executor/.../hunyuan_image3.py:_vae_encode.
+                _cond_vae_gen = torch.Generator(device=image.device).manual_seed(0)
+                latents = vae_encode_result.latent_dist.sample(_cond_vae_gen)
             if hasattr(config, "shift_factor") and config.shift_factor:
                 latents.sub_(config.shift_factor)
             if hasattr(config, "scaling_factor") and config.scaling_factor:

@@ -1759,16 +1759,23 @@ async def edit_images(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=detail,
             )
-        pil_images = await _load_input_images(input_images_list)
+        # Only convert uploads to RGB when the caller opts into the
+        # Hunyuan-aware API surface (task / bot_task / sys_type). Legacy
+        # callers that send only the older bot_task=<task-enum> shape keep
+        # whatever PIL mode the upload arrived as, to preserve pre-existing
+        # behavior for non-Hunyuan flows.
+        normalize_edit_images_rgb = task is not None or bot_task is not None or sys_type is not None
+        pil_images = await _load_input_images(input_images_list, normalize_rgb=normalize_edit_images_rgb)
         prompt["multi_modal_data"] = {}
         prompt["multi_modal_data"]["image"] = pil_images
 
         if mask_image is not None:
-            loaded = await _load_input_images([mask_image])
+            # Mask role is different (alpha channel matters); never normalize.
+            loaded = await _load_input_images([mask_image], normalize_rgb=False)
             prompt["multi_modal_data"]["mask_image"] = loaded[0]
 
         if reference_image is not None:
-            loaded = await _load_input_images([reference_image])
+            loaded = await _load_input_images([reference_image], normalize_rgb=normalize_edit_images_rgb)
             prompt["multi_modal_data"]["reference_image"] = loaded[0]
 
         # 3 Build sample params
@@ -2220,6 +2227,8 @@ def _extract_images_from_result(result: Any) -> list[Any]:
 
 async def _load_input_images(
     inputs: list[str],
+    *,
+    normalize_rgb: bool = True,
 ) -> list[Image.Image]:
     """
     convert to PIL.Image.Image list
@@ -2266,7 +2275,18 @@ async def _load_input_images(
     if not images:
         raise ValueError("No valid input images found")
 
-    return images
+    if not normalize_rgb:
+        return images
+
+    # Match the offline HunyuanImage3 image-edit example path, which eagerly
+    # normalizes input files with ``Image.open(...).convert("RGB")`` before
+    # they reach the AR stage. Keeping uploads as RGBA/P PIL objects makes
+    # online IT2I observe a different visual input than offline (for example
+    # transparent-logo PNGs alpha-composited over white instead of black),
+    # which is enough for HunyuanImage3 AR recaption to diverge before DiT
+    # sees the request -- root cause of the "online 3 magnets vs offline 1
+    # magnet" systematic semantic mismatch.
+    return [img.convert("RGB") for img in images]
 
 
 def _choose_output_format(output_format: str | None, background: str | None) -> str:
