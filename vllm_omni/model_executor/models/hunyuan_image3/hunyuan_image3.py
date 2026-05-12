@@ -1776,7 +1776,17 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             images = images.to(dtype=self.vae.dtype)
 
         vae_encode_result = self.vae.encode(images)
-        latents = vae_encode_result.latent_dist.sample()
+        # Cond image encoding is supposed to be deterministic clean
+        # conditioning (the comment below declares `t=0`). `.sample()`
+        # without a generator consumes torch's global RNG, which made
+        # cond latents drift between requests on a long-running server
+        # (online) while looking deterministic for fresh-process callers
+        # (offline) -- silent path-level non-determinism. Feed a fixed
+        # generator so all callers see identical cond latents.
+        import torch as _torch  # local alias to keep blast radius minimal
+
+        _cond_vae_gen = _torch.Generator(device=images.device).manual_seed(0)
+        latents = vae_encode_result.latent_dist.sample(_cond_vae_gen)
 
         # Apply shift and scaling factors if present
         if hasattr(config, "shift_factor") and config.shift_factor:
