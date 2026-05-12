@@ -18,7 +18,13 @@ from vllm_omni.inputs.data import OmniPromptType
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3.yaml")
 _DEFAULT_AR_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3_ar.yaml")
-
+# Modality → (task, default bot_task) mapping. `task` selects only whether
+# `<img>` placeholders are emitted; `bot_task` (None | think | recaption |
+# think_recaption | vanilla) selects the system prompt + trigger tag.
+#
+# Both verbose (`text2img`) and short (`t2i`) forms are accepted; the short
+# forms match the internal task names (see prompt_utils.available_tasks)
+# so users who think in those terms don't have to translate.
 _MODALITY_TASK_MAP: dict[str, tuple[str, str | None]] = {
     "text2img": ("t2i", "think"),
     "t2i": ("t2i", "think"),

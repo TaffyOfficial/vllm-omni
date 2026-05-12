@@ -46,6 +46,9 @@ class DiagonalGaussianDistribution:
         x = self.mean + self.std * sample
         return x
 
+    def mode(self) -> torch.FloatTensor:
+        return self.mean
+
 
 @dataclass
 class DecoderOutput(BaseOutput):

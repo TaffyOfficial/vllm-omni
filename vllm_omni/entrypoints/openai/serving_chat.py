@@ -2328,6 +2328,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             engine_prompt["prompt_token_ids"] = prompt_token_ids
         if system_prompt_type is not None:
             engine_prompt["use_system_prompt"] = system_prompt_type
+        # Forward the custom system prompt body too. DiT's
+        # `get_system_prompt(use_system_prompt, "image", system_prompt)` reads
+        # the third positional arg, so leaving it None turns a `sys_type=custom`
+        # request into an empty DiT system prefix (AR/DiT divergence).
+        if custom_system_prompt is not None:
+            engine_prompt["system_prompt"] = custom_system_prompt
         engine_prompt["modalities"] = modalities
         if negative_prompt is not None:
             engine_prompt["negative_prompt"] = negative_prompt

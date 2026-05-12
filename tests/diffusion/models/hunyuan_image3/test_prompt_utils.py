@@ -69,8 +69,8 @@ def test_legacy_task_presets_still_available():
 def test_resolve_stop_token_ids_uses_answer_for_generation_tasks():
     tok = FakeTokenizer()
     answer_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]
-    assert resolve_stop_token_ids(task="t2i_think", tokenizer=tok) == [answer_id]
-    assert resolve_stop_token_ids(task="t2i_recaption", tokenizer=tok) == [answer_id]
+    assert resolve_stop_token_ids(task="t2i", bot_task="think", tokenizer=tok) == [answer_id]
+    assert resolve_stop_token_ids(task="t2i", bot_task="recaption", tokenizer=tok) == [answer_id]
     assert resolve_stop_token_ids(task="it2i", bot_task="think", tokenizer=tok) == [answer_id]
 
 
