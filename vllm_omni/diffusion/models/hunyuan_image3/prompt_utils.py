@@ -32,7 +32,33 @@ Two orthogonal axes:
 
 from __future__ import annotations
 
+from typing import Any
+
 from .system_prompt import get_system_prompt
+
+# HunyuanImage-3.0-Instruct special token ids from tokenizer.json.
+# Keep offline AR prompt/stop-token behavior independent of runtime
+# tokenizer lookup for these fixed control tokens. Added by main's
+# PR #3172; kept here for resolve_stop_token_ids consumers.
+HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS: dict[str, int] = {
+    "<|endoftext|>": 127957,
+    "<|startoftext|>": 127958,
+    "<boi>": 128000,
+    "<eoi>": 128001,
+    "<img>": 128006,
+    "<cfg>": 128010,
+    "<recaption>": 128018,
+    "</recaption>": 128019,
+    "<think>": 128023,
+    "</think>": 128024,
+    "<answer>": 128025,
+    "</answer>": 128026,
+    "<img_size_1024>": 128037,
+    "<img_ratio_0>": 128044,
+    "<img_ratio_32>": 128076,
+    "<img_ratio_33>": 130103,
+    "<img_ratio_36>": 130106,
+}
 
 # bot_task -> (sys_type, trigger_tag).
 # ``vanilla`` is special-cased downstream: it bypasses the chat template
@@ -70,6 +96,22 @@ def resolve_sys_type(bot_task: str | None) -> str:
     if bot_task not in _BOT_TASK_PRESETS:
         raise ValueError(f"Unknown bot_task {bot_task!r}. Choose from: {available_bot_tasks()}")
     return _BOT_TASK_PRESETS[bot_task][0]
+
+
+def resolve_stop_token_ids(
+    task: str = "it2i",
+    bot_task: str | None = "think",
+    tokenizer: Any | None = None,
+) -> list[int]:
+    """AR stop-token ids for a given (task, bot_task) generation request.
+
+    For HunyuanImage-3.0 generation tasks the AR engine stops on ``<answer>``
+    (the trigger that closes the cot / recaption section). Mirrors the
+    upstream PR #3172 helper, but takes the two-axis ``(task, bot_task)``
+    signature this module exports rather than the legacy single-axis
+    compound ``"it2i_think"`` style.
+    """
+    return [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]]
 
 
 # Upstream "Multi-Image Fusion" caps reference images at 3 per request.
@@ -225,10 +267,12 @@ def build_prompt_tokens(
 
 
 __all__ = [
+    "HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS",
     "MAX_IMAGES_PER_REQUEST",
     "available_bot_tasks",
     "available_tasks",
     "build_prompt",
     "build_prompt_tokens",
+    "resolve_stop_token_ids",
     "resolve_sys_type",
 ]

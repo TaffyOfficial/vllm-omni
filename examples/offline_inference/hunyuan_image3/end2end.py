@@ -19,6 +19,7 @@ import os
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     build_prompt_tokens,
+    resolve_stop_token_ids,
     resolve_sys_type,
 )
 from vllm_omni.entrypoints.omni import Omni
@@ -242,6 +243,12 @@ def main():
     # Build sampling params from defaults
     params_list = list(omni.default_sampling_params_list)
 
+    # Resolve AR stop token ids programmatically from prompt_utils' central
+    # token-id table (single source of truth, mirrors PR #3172 / main).
+    # The deploy yaml may also set stop_token_ids; this override keeps the
+    # example self-contained and survives yaml drift.
+    ar_stop_token_ids = resolve_stop_token_ids(task=task, bot_task=bot_task, tokenizer=tokenizer)
+
     # Override diffusion params if applicable
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -255,6 +262,9 @@ def main():
             if args.modality in ("text2img",):
                 sp.height = args.height
                 sp.width = args.width
+        elif hasattr(sp, "stop_token_ids") and ar_stop_token_ids is not None:
+            # AR (comprehension) stage. Force stop on <answer> regardless of yaml.
+            sp.stop_token_ids = ar_stop_token_ids
 
     # Print configuration
     print(f"\n{'=' * 60}")

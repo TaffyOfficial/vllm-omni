@@ -24,10 +24,12 @@ import pathlib
 import pytest
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+    HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
     available_bot_tasks,
     available_tasks,
     build_prompt,
     build_prompt_tokens,
+    resolve_stop_token_ids,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -39,7 +41,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 class FakeTokenizer:
     """Minimal tokenizer stub that records every encode() call.
 
-    Returns deterministic ids: special tokens map to small ints (1-4),
+    Returns deterministic ids from convert_tokens_to_ids while
     encode() returns one id per character starting at 100. This lets
     tests both verify segmentation (by inspecting `encode_calls`) and
     locate substrings inside the returned id list.
@@ -50,10 +52,17 @@ class FakeTokenizer:
         "<img>": 2,
         "<think>": 3,
         "<recaption>": 4,
+        "<|endoftext|>": 5,
+        "</recaption>": 6,
+        "</answer>": 7,
+        "<boi>": 8,
+        "</think>": 9,
+        **{f"<img_ratio_{i}>": 1000 + i for i in range(33)},
     }
 
     def __init__(self) -> None:
         self.encode_calls: list[str] = []
+        self.eos_token_id = self.SPECIAL["<|endoftext|>"]
 
     def convert_tokens_to_ids(self, tok: str) -> int:
         return self.SPECIAL.get(tok, 0)
@@ -71,6 +80,14 @@ def test_available_tasks_covers_all_modalities():
 def test_available_bot_tasks_covers_all_modes():
     bot_tasks = set(available_bot_tasks())
     assert bot_tasks == {None, "think", "recaption", "think_recaption", "vanilla"}
+
+
+def test_resolve_stop_token_ids_uses_answer_for_generation_tasks():
+    tok = FakeTokenizer()
+
+    answer_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]
+    assert resolve_stop_token_ids(task="t2i_think", tokenizer=tok) == [answer_id]
+    assert resolve_stop_token_ids(task="t2i_recaption", tokenizer=tok) == [answer_id]
 
 
 @pytest.mark.parametrize(
@@ -177,24 +194,24 @@ def test_build_prompt_tokens_segments_each_boundary():
 def test_build_prompt_tokens_image_placeholder_present_for_image_tasks():
     tok = FakeTokenizer()
     ids = build_prompt_tokens("hi", tok, task="i2t", bot_task=None)
-    assert ids[0] == 1, "BOS (<|startoftext|>) must be the first token"
-    assert 2 in ids, "<img> placeholder must be present for i2t/it2i tasks"
+    assert ids[0] == FakeTokenizer.SPECIAL["<|startoftext|>"], "BOS (<|startoftext|>) must be the first token"
+    assert FakeTokenizer.SPECIAL["<img>"] in ids, "<img> placeholder must be present for i2t/it2i tasks"
 
 
 def test_build_prompt_tokens_no_image_for_text_only_tasks():
     tok = FakeTokenizer()
     ids = build_prompt_tokens("hi", tok, task="t2t", bot_task=None)
-    assert 2 not in ids, "<img> must NOT appear for text-only tasks"
+    assert FakeTokenizer.SPECIAL["<img>"] not in ids, "<img> must NOT appear for text-only tasks"
 
 
 @pytest.mark.parametrize(
     "task,bot_task,trigger_id",
     [
-        ("it2i", "think", 3),
-        ("t2i", "think", 3),
-        ("t2i", "think_recaption", 3),
-        ("it2i", "recaption", 4),
-        ("t2i", "recaption", 4),
+        ("it2i", "think", FakeTokenizer.SPECIAL["<think>"]),
+        ("t2i", "think", FakeTokenizer.SPECIAL["<think>"]),
+        ("t2i", "think_recaption", FakeTokenizer.SPECIAL["<think>"]),
+        ("it2i", "recaption", FakeTokenizer.SPECIAL["<recaption>"]),
+        ("t2i", "recaption", FakeTokenizer.SPECIAL["<recaption>"]),
     ],
 )
 def test_build_prompt_tokens_trigger_is_last_token(task: str, bot_task: str, trigger_id: int):
@@ -208,7 +225,10 @@ def test_build_prompt_tokens_no_trigger_for_plain_tasks():
     """bot_task=None must NOT append a trigger id."""
     tok = FakeTokenizer()
     ids = build_prompt_tokens("hi", tok, task="t2t", bot_task=None)
-    assert ids[-1] not in {3, 4}  # neither <think> nor <recaption>
+    assert ids[-1] not in {
+        FakeTokenizer.SPECIAL["<think>"],
+        FakeTokenizer.SPECIAL["<recaption>"],
+    }
 
 
 # -------------------- end2end.py wiring guard --------------------
@@ -253,10 +273,24 @@ def test_end2end_routes_through_shared_prompt_utils():
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module and node.module.endswith("hunyuan_image3.prompt_utils"):
             imported_from_prompt_utils.update(alias.name for alias in node.names)
-    assert "build_prompt_tokens" in imported_from_prompt_utils, (
-        "end2end.py must import build_prompt_tokens from "
+    # The post-refactor two-axis design exports (task, bot_task) separately,
+    # so `_TASK_PRESETS` (the legacy single-axis compound enum) is no longer
+    # the canonical task table. `resolve_sys_type` plays the equivalent role
+    # for deriving the system prompt slot from `bot_task`. Either symbol set
+    # proves end2end is wired through the shared module.
+    must_have = {"build_prompt_tokens", "resolve_stop_token_ids"}
+    either_table = {"_TASK_PRESETS", "resolve_sys_type"}
+    assert must_have <= imported_from_prompt_utils, (
+        "end2end.py must import the HunyuanImage3 prompt and stop-token helpers from "
         "vllm_omni.diffusion.models.hunyuan_image3.prompt_utils -- the shared "
-        "helper is the single source of truth for the AR-prefill template."
+        "module is the single source of truth for the AR-prefill template and "
+        "bot_task-derived AR stop token ids."
+    )
+    assert imported_from_prompt_utils & either_table, (
+        "end2end.py must reference the shared task / bot_task preset table "
+        "(`_TASK_PRESETS` in the legacy single-axis design, or `resolve_sys_type` "
+        "in the two-axis design) so it can validate task selection rather than "
+        "duplicating the (task, sys_type) mapping locally."
     )
 
 
