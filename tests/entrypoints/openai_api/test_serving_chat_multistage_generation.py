@@ -391,7 +391,6 @@ def test_build_multistage_generation_inputs_custom_system_prompt(serving_chat):
     )
     images = [Image.new("RGB", (32, 32), color="red")]
 
-    QKEY = "prompt"
     marker = "ZZZ_CUSTOM_SYSTEM_PROMPT_MARKER_ZZZ"
 
     out, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
