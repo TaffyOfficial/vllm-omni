@@ -2282,7 +2282,7 @@ async def _load_input_images(
     # normalizes input files with ``Image.open(...).convert("RGB")`` before
     # they reach the AR stage. Keeping uploads as RGBA/P PIL objects makes
     # online IT2I observe a different visual input than offline (for example
-    # transparent-logo PNGs alpha-composited over white instead of black),
+    # transparent-logo uploads alpha-composited over white instead of black),
     # which is enough for HunyuanImage3 AR recaption to diverge before DiT
     # sees the request -- root cause of the "online 3 magnets vs offline 1
     # magnet" systematic semantic mismatch.
