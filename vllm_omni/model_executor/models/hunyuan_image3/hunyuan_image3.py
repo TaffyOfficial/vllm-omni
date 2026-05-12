@@ -907,8 +907,8 @@ class HunyuanImage3Processor:
             current_info["vit_spatial_shapes"] = _ss.squeeze(0)
 
             # VAE: per-image bucket via `reso_group.get_target_size`; mirrors
-            # HF's `resize_and_crop` default (crop_type="center", the official
-            # generate_image default when infer_align_image_size=False).
+            # HF's `resize_and_crop` (crop_type="center", the official
+            # generate_image default with infer_align_image_size=False).
             # Keep fp32 — the VAE encoder casts to model dtype at its
             # boundary (see `_vae_encode`).
             image_width, image_height = self.reso_group.get_target_size(image.width, image.height)
@@ -957,13 +957,13 @@ class HunyuanImage3Processor:
         self,
         image: Image.Image,
         target_size: tuple[int, int],
-        crop_type: str = "center",
+        crop_type: str = "resize",
     ) -> Image.Image:
-        # Default mode mirrors official `generate_image` with
-        # infer_align_image_size=False: preserve aspect ratio and center-crop
-        # to the nearest VAE bucket. Keeping this default aligned with the
-        # DiT-side condition-image helper avoids AR and DiT seeing different
-        # conditioning pixels for the same IT2I request.
+        # Default mode mirrors the official `infer_align_image_size=True`
+        # path (image_processor.py:355 → crop_type="resize") used by the
+        # IT2I demo: stretch the cond image to the bucket dims so its
+        # `<img_ratio_*>` tag and ViT/VAE features stay aligned with the
+        # bucket, instead of dropping content via center crop.
         tw, th = target_size
         if crop_type == "resize":
             return image.resize((tw, th), resample=Image.Resampling.LANCZOS)
@@ -1777,13 +1777,11 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             images = images.to(dtype=self.vae.dtype)
 
         vae_encode_result = self.vae.encode(images)
-        # Cond image is clean (t=0) conditioning -- take the posterior mean
-        # so encoding is deterministic by construction. `.sample()` without a
-        # generator consumes torch's global RNG and silently drifts between
-        # requests on a long-running server (online) while looking stable for
-        # fresh-process callers (offline). `.mode()` matches the official
-        # HunyuanImage-3 cond encode path.
-        latents = vae_encode_result.latent_dist.mode()
+        # Match HunyuanImage-3's cond encode path: sample the posterior, but
+        # use a fixed generator so online requests do not consume the global
+        # RNG and drift across a long-running server.
+        _cond_vae_gen = torch.Generator(device=images.device).manual_seed(0)
+        latents = vae_encode_result.latent_dist.sample(_cond_vae_gen)
 
         # Apply shift and scaling factors if present
         if hasattr(config, "shift_factor") and config.shift_factor:

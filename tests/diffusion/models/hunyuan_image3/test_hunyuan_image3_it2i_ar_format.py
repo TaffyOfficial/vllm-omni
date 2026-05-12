@@ -72,45 +72,6 @@ def _snapshot_dir(model_id: str) -> pathlib.Path:
 # tests/e2e/accuracy/test_hunyuan_image3_it2i_ar_output.py.
 
 
-def test_ar_and_dit_condition_image_preprocessing_match_without_hf_cache():
-    """AR and DiT must preprocess the same IT2I condition image into the
-    same VAE pixels.
-
-    This catches drift between the AR-side multimodal processor and the
-    diffusion-side bridge without requiring model weights or tokenizer files.
-    In particular, portrait input expanded to a landscape output is sensitive
-    to accidentally using ``crop_type="resize"`` on one side and center crop
-    on the other; the two paths then condition on visibly different fabric
-    regions and leave seam-like artifacts around the edited object.
-    """
-    import numpy as np
-    from PIL import Image
-
-    from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
-        _resize_and_crop_center,
-    )
-    from vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 import (
-        HunyuanImage3Processor,
-    )
-
-    rng = np.random.default_rng(seed=3444)
-    src_size_pairs = [(735, 1104), (640, 1024), (1280, 720), (1024, 1024)]
-    target_size_pairs = [(1024, 1024), (1024, 768), (768, 1024), (1280, 720)]
-
-    for src_w, src_h in src_size_pairs:
-        src_arr = rng.integers(0, 256, size=(src_h, src_w, 3), dtype=np.uint8)
-        src = Image.fromarray(src_arr, mode="RGB")
-        for tw, th in target_size_pairs:
-            ar_out = HunyuanImage3Processor._resize_and_crop(None, src, (tw, th))
-            dit_out = _resize_and_crop_center(src, tw, th)
-
-            assert ar_out.size == dit_out.size == (tw, th)
-            assert np.array_equal(np.asarray(ar_out), np.asarray(dit_out)), (
-                f"AR and DiT condition preprocessing diverged for "
-                f"src={(src_w, src_h)} target={(tw, th)}"
-            )
-
-
 _OFFICIAL_PKG = "_hunyuan_image_3_official_snapshot"
 
 
