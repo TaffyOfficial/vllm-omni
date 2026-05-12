@@ -96,12 +96,28 @@ def test_default_prompt_still_uses_it2i_think_mode():
     assert result.token_ids[-1] == FakeTokenizer.SPECIAL["<think>"]
 
 
-def test_resolve_stop_token_ids_uses_answer_for_generation_tasks():
+def test_resolve_stop_token_ids_image_tasks_stop_on_eos_not_answer():
+    """Image-output tasks must stop on <|endoftext|>, not <answer>.
+
+    Stopping on <answer> chops off the <boi><img_size_*><img_ratio_*>
+    tail forced by `_stage_transitions`, so `_extract_ratio_index` in
+    `ar2diffusion` finds nothing and the DiT output bucket collapses to
+    the first reference image's shape (e.g. 1024x1024 square when AR's
+    CoT planned a 1280x720 landscape).
+    """
     tok = FakeTokenizer()
+
+    eos_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|endoftext|>"]
     answer_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]
-    assert resolve_stop_token_ids(task="t2i", bot_task="think", tokenizer=tok) == [answer_id]
-    assert resolve_stop_token_ids(task="t2i", bot_task="recaption", tokenizer=tok) == [answer_id]
-    assert resolve_stop_token_ids(task="it2i", bot_task="think", tokenizer=tok) == [answer_id]
+
+    # Image-output: t2i / it2i must let AR emit the size/ratio tail.
+    for bot in ("think", "recaption", "think_recaption", "vanilla"):
+        assert resolve_stop_token_ids(task="t2i", bot_task=bot, tokenizer=tok) == [eos_id]
+        assert resolve_stop_token_ids(task="it2i", bot_task=bot, tokenizer=tok) == [eos_id]
+
+    # Text-output: i2t / t2t comprehension stops on <answer> (response sits inside).
+    assert resolve_stop_token_ids(task="i2t", bot_task=None, tokenizer=tok) == [answer_id]
+    assert resolve_stop_token_ids(task="t2t", bot_task=None, tokenizer=tok) == [answer_id]
 
 
 @pytest.mark.parametrize(

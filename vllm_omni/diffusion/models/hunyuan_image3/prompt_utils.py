@@ -147,11 +147,29 @@ def resolve_stop_token_ids(
     bot_task: str | None | _DefaultBotTask = _DEFAULT_BOT_TASK,
     tokenizer: Any | None = None,
 ) -> list[int]:
+    """AR stop-token ids for a given (task, bot_task) generation request.
+
+    Image-output tasks (``it2i`` / ``t2i``) must stop on ``<|endoftext|>``:
+    after ``</recaption>`` the AR's ``_stage_transitions`` force-emits
+    ``<answer><boi><img_size_*>`` and then samples ``<img_ratio_*>`` under
+    ``_apply_ratio_restriction`` followed by ``<|endoftext|>``. Stopping
+    early on ``<answer>`` chops off the size/ratio tail, leaves
+    ``_extract_ratio_index`` empty in ``ar2diffusion``, and silently
+    collapses the DiT output bucket to the first reference image's shape
+    (square logo -> 1024x1024 even when AR's CoT plans a landscape).
+
+    Text-output tasks (``i2t`` / ``t2t``) stop on ``<answer>`` -- the AR is
+    the final stage, and the comprehension response sits inside the
+    ``<answer>`` body so the answer-open is the natural cot/recaption
+    terminator.
+    """
     task, bot_task = _normalize_task_and_bot_task(task, bot_task)
     if task not in _TASKS:
         raise ValueError(f"Unknown task {task!r}. Choose from: {available_tasks()}")
     if bot_task not in _BOT_TASK_PRESETS:
         raise ValueError(f"Unknown bot_task {bot_task!r}. Choose from: {available_bot_tasks()}")
+    if task in ("it2i", "t2i"):
+        return [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|endoftext|>"]]
     return [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]]
 
 
