@@ -13,7 +13,6 @@ signature pattern as glm_image.ar2diffusion.
 from __future__ import annotations
 
 import os
-import re
 from functools import lru_cache
 from typing import Any
 
@@ -33,7 +32,6 @@ logger = init_logger(__name__)
 # (in the `/v1/images/edits` path that defaults to `pil_images[0].size`,
 # i.e. the first reference image's bucket — usually square, see
 # api_server.py:1808-1811).
-_RATIO_TOKEN_RE = re.compile(r"<img_ratio_(\d+)>")
 _DEFAULT_HUNYUAN_IMAGE3_MODEL = "tencent/HunyuanImage-3.0-Instruct"
 
 
@@ -158,42 +156,27 @@ def _build_ratio_id_lookup(model_name_or_path: str) -> dict[int, int]:
     return table
 
 
-def _extract_ratio_index(generated_text: str, generated_token_ids, model_name_or_path: str) -> int | None:
+def _extract_ratio_index(generated_token_ids, model_name_or_path: str) -> int | None:
     """Resolve the AR-predicted ratio_index from this stage's output.
 
-    Two probe paths:
-      1. Text regex on `generated_text` — works when the AR engine is
-         configured with `skip_special_tokens: False` (e.g.
-         `hunyuan_image3_it2i_kv_reuse.yaml`). Cheap and avoids loading
-         the tokenizer.
-      2. Token-id scan over `cumulative_token_ids` against the tokenizer's
-         `<img_ratio_*>` id range — survives `skip_special_tokens: True`
-         where the special tokens are stripped from text but still present
-         in the raw token stream.
-
-    Takes the LAST ratio token in the stream because the AR's
-    stage-transition logic emits exactly one such token at the tail of the
-    `<img_size_*><img_ratio_*><eos>` sequence; using "last" is robust to
-    any earlier accidental occurrences in the prompt scaffold.
+    `HunyuanImage3ForCausalMM`'s `_stage_transitions` forces the AR to emit
+    exactly one `<img_ratio_*>` token after `</recaption><answer><boi>
+    <img_size_*>`, so we scan the token stream from the tail for the first
+    id that maps to a ratio. Token-ids are the source of truth — text-side
+    regex is unreliable because most deploy yamls run AR with
+    `skip_special_tokens: True` (special tokens are stripped from text but
+    still present in `cumulative_token_ids`).
     """
-    matches = _RATIO_TOKEN_RE.findall(generated_text or "")
-    if matches:
-        try:
-            return int(matches[-1])
-        except ValueError:
-            pass
-
     if generated_token_ids is None:
         return None
     table = _build_ratio_id_lookup(model_name_or_path)
     if not table:
         return None
-    last_ratio_idx: int | None = None
-    for tid in generated_token_ids:
+    for tid in reversed(list(generated_token_ids)):
         idx = table.get(int(tid))
         if idx is not None:
-            last_ratio_idx = idx
-    return last_ratio_idx
+            return idx
+    return None
 
 
 def ar2diffusion(
@@ -237,6 +220,7 @@ def ar2diffusion(
         width = original_prompt.get("width", 1024)
         text_prompt = original_prompt.get("prompt", "")
         use_system_prompt = original_prompt.get("use_system_prompt")
+        custom_system_prompt = original_prompt.get("system_prompt")
 
         # Prefer the AR's predicted output aspect (`<img_size_*><img_ratio_*>`
         # tail emitted by `HunyuanImage3ForCausalMM.sample` under the
@@ -249,7 +233,7 @@ def ar2diffusion(
         model_name_or_path = original_prompt.get("model") or os.environ.get(
             "VLLM_OMNI_HUNYUAN_IMAGE3_MODEL", _DEFAULT_HUNYUAN_IMAGE3_MODEL
         )
-        ratio_idx = _extract_ratio_index(generated_text, generated_token_ids, model_name_or_path)
+        ratio_idx = _extract_ratio_index(generated_token_ids, model_name_or_path)
         ar_predicted = False
         if ratio_idx is not None:
             base_size = int(original_prompt.get("image_base_size", 1024))
@@ -302,9 +286,14 @@ def ar2diffusion(
             },
         }
 
-        # Forward use_system_prompt so the DiT can build the same system prefix
+        # Forward use_system_prompt so the DiT can build the same system prefix.
+        # Also forward the custom system prompt body when sys_type=custom so
+        # DiT's `get_system_prompt(use, "image", body)` doesn't fall back to
+        # an empty prefix and silently diverge from AR.
         if use_system_prompt is not None:
             diffusion_input["use_system_prompt"] = use_system_prompt
+        if custom_system_prompt is not None:
+            diffusion_input["system_prompt"] = custom_system_prompt
 
         # Forward multimodal data (original image for IT2I conditioning).
         # The diffusion pre_process_func reads multi_modal_data["image"], which

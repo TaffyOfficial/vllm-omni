@@ -30,8 +30,8 @@ from vllm_omni.inputs.data import OmniPromptType
 # think_recaption | vanilla) selects the system prompt + trigger tag.
 #
 # Both verbose (`text2img`) and short (`t2i`) forms are accepted; the short
-# forms match the internal task names (see prompt_utils._TASK_PRESETS) so
-# users who think in those terms don't have to translate.
+# forms match the internal task names (see prompt_utils.available_tasks)
+# so users who think in those terms don't have to translate.
 _MODALITY_TASK_MAP: dict[str, tuple[str, str | None]] = {
     "text2img": ("t2i", "think"),
     "t2i": ("t2i", "think"),
