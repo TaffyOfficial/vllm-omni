@@ -9,8 +9,8 @@ import pathlib
 import pytest
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
-    HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
     _TASK_PRESETS,
+    HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
     available_bot_tasks,
     available_tasks,
     build_prompt,

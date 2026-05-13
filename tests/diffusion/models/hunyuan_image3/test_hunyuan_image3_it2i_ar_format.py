@@ -106,8 +106,7 @@ def test_ar_and_dit_condition_image_preprocessing_match_without_hf_cache():
 
             assert ar_out.size == dit_out.size == (tw, th)
             assert np.array_equal(np.asarray(ar_out), np.asarray(dit_out)), (
-                f"AR and DiT condition preprocessing diverged for "
-                f"src={(src_w, src_h)} target={(tw, th)}"
+                f"AR and DiT condition preprocessing diverged for src={(src_w, src_h)} target={(tw, th)}"
             )
 
 
