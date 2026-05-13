@@ -1130,13 +1130,7 @@ class TokenizerWrapper:
 
             # Convert single round materials into standard message list
             batch_message_list = []
-            for (
-                prompt,
-                system_prompt,
-                cot_text,
-                gen_image_info,
-                cond_image_info_list,
-            ) in zip(
+            for prompt, system_prompt, cot_text, gen_image_info, cond_image_info_list in zip(
                 batch_prompt,
                 batch_system_prompt,
                 batch_cot_text,
