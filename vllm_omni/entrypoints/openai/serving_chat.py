@@ -2253,6 +2253,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # downstream uses the canonical split. Source the task enum from
         # prompt_utils so this layer stays in sync with the model side.
         from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+            MAX_IMAGES_PER_REQUEST as _hunyuan3_max_images,
             available_tasks as _hunyuan3_available_tasks,
         )
 
@@ -2272,6 +2273,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             task = bot_task
             bot_task = None
             legacy_task_from_bot_task = True
+
+        if reference_images and len(reference_images) > _hunyuan3_max_images:
+            raise ValueError(
+                f"HunyuanImage-3.0 IT2I accepts at most {_hunyuan3_max_images} input "
+                f"images per request, got {len(reference_images)}"
+            )
 
         engine_prompt_data: dict[str, Any] | None = None
         modalities = ["image"]

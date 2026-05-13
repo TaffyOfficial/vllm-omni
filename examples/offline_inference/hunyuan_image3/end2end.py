@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+    MAX_IMAGES_PER_REQUEST,
     build_prompt_tokens,
     resolve_stop_token_ids,
     resolve_sys_type,
@@ -177,6 +178,11 @@ def main():
         from PIL import Image
 
         image_paths = [p.strip() for p in args.image_path.split(",") if p.strip()]
+        if len(image_paths) > MAX_IMAGES_PER_REQUEST:
+            raise ValueError(
+                f"--image-path accepts at most {MAX_IMAGES_PER_REQUEST} images for "
+                f"HunyuanImage-3.0 IT2I, got {len(image_paths)}: {args.image_path}"
+            )
         for image_path in image_paths:
             if not os.path.exists(image_path):
                 raise ValueError(f"Image path does not exist: {image_path}")
