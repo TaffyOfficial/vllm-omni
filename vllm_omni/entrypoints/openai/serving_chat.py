@@ -2257,6 +2257,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         )
         from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
             available_tasks as _hunyuan3_available_tasks,
+        )
+        from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
             resolve_stop_token_ids as _hunyuan3_resolve_stop_token_ids,
         )
 
