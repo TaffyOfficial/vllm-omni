@@ -1366,10 +1366,13 @@ class HunyuanImage3Pipeline(
         use_system_prompt = extra_args.get("use_system_prompt")
         system_prompt = extra_args.get("system_prompt")
         # Fall back to per-prompt use_system_prompt forwarded by ar2diffusion
-        if use_system_prompt is None and req.prompts:
+        if req.prompts:
             first_prompt = req.prompts[0]
             if isinstance(first_prompt, dict):
-                use_system_prompt = first_prompt.get("use_system_prompt")
+                if use_system_prompt is None:
+                    use_system_prompt = first_prompt.get("use_system_prompt")
+                if system_prompt is None:
+                    system_prompt = first_prompt.get("system_prompt")
         if use_system_prompt is not None:
             system_prompt = get_system_prompt(use_system_prompt, "image", system_prompt)
             system_prompt = system_prompt.strip() if system_prompt is not None else ""

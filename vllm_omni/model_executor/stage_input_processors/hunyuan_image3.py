@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Stage input processor for HunyuanImage3: AR → Diffusion transition.
+"""Stage input processor for HunyuanImage3: AR to Diffusion transition.
 
 In IT2I (image editing) mode:
   - Stage 0 (AR) receives (image + edit instruction), generates CoT/latent tokens
-  - Stage 1 (DiT) receives the AR output + original image, denoises → edited image
+  - Stage 1 (DiT) receives the AR output + original image, denoises to edited image
 
 The ar2diffusion function bridges these two stages, following the same
 signature pattern as glm_image.ar2diffusion.
@@ -12,7 +12,6 @@ signature pattern as glm_image.ar2diffusion.
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from typing import Any
 
@@ -20,6 +19,9 @@ import torch
 from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+    HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
+)
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = init_logger(__name__)
@@ -27,12 +29,63 @@ logger = init_logger(__name__)
 # AR emits `<img_size_BASE><img_ratio_Y>` after `</recaption>` in IT2I/T2I
 # (see `HunyuanImage3ForCausalMM.sample` and `_stage_transitions`). The
 # ratio_index resolves to a (height, width) bucket via ResolutionGroup, which
-# is the official upstream's mechanism for AR-driven output aspect — without
+# is the official upstream's mechanism for AR-driven output aspect; without
 # this lookup the DiT pipeline falls back to the user-provided width/height
 # (in the `/v1/images/edits` path that defaults to `pil_images[0].size`,
-# i.e. the first reference image's bucket — usually square, see
+# i.e. the first reference image's bucket, usually square, see
 # api_server.py:1808-1811).
-_DEFAULT_HUNYUAN_IMAGE3_MODEL = "tencent/HunyuanImage-3.0-Instruct"
+_HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS: tuple[str, ...] = (
+    "1024x768",
+    "1280x720",
+    "768x1024",
+    "720x1280",
+)
+
+
+class _Resolution:
+    def __init__(self, size: str | int | tuple[int, int], *args: int):
+        if isinstance(size, str):
+            if "x" in size:
+                h, w = size.split("x")
+                size = (int(h), int(w))
+            else:
+                size = int(size)
+        if args:
+            size = (int(size), args[0])
+        if isinstance(size, int):
+            size = (size, size)
+
+        self.height = int(size[0])
+        self.width = int(size[1])
+        self.ratio = self.height / self.width
+
+
+def _build_resolutions_by_step(base_size: int, align: int = 1) -> list[_Resolution]:
+    step = base_size // 16
+    min_height = base_size // 2
+    min_width = base_size // 2
+    max_height = base_size * 2
+    max_width = base_size * 2
+
+    resolutions = [_Resolution(base_size, base_size)]
+
+    cur_height, cur_width = base_size, base_size
+    while True:
+        if cur_height >= max_height and cur_width <= min_width:
+            break
+        cur_height = min(cur_height + step, max_height)
+        cur_width = max(cur_width - step, min_width)
+        resolutions.append(_Resolution(cur_height // align * align, cur_width // align * align))
+
+    cur_height, cur_width = base_size, base_size
+    while True:
+        if cur_height <= min_height and cur_width >= max_width:
+            break
+        cur_height = max(cur_height - step, min_height)
+        cur_width = min(cur_width + step, max_width)
+        resolutions.append(_Resolution(cur_height // align * align, cur_width // align * align))
+
+    return sorted(resolutions, key=lambda x: x.ratio)
 
 
 @lru_cache(maxsize=4)
@@ -43,45 +96,16 @@ def _build_ratio_size_table(base_size: int) -> list[tuple[int, int]]:
     `reso_group[ratio_index]` reverse lookup. Cached because the table
     is constant per `base_size`.
     """
-    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
-        HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS,
-        Resolution,
-        ResolutionGroup,
-    )
-
-    reso_group = ResolutionGroup(
-        base_size=base_size,
-        extra_resolutions=[Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
-    )
-    return [(int(r.height), int(r.width)) for r in reso_group.data]
-
-
-@lru_cache(maxsize=4)
-def _build_cot_end_token_ids(model_name_or_path: str) -> dict[str, int]:
-    """Return `{'</recaption>': id, '</think>': id}` for cot-boundary
-    truncation. Empty dict on lookup failure so callers degrade to a
-    pure text-based search.
-    """
-    try:
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
-    except Exception as e:  # pragma: no cover - environment-dependent
-        logger.warning("[ar2diffusion] failed to load tokenizer for cot-end lookup: %s", e)
-        return {}
-
-    result: dict[str, int] = {}
-    for marker in ("</recaption>", "</think>"):
-        tid = tokenizer.convert_tokens_to_ids(marker)
-        if tid is not None and tid != tokenizer.unk_token_id:
-            result[marker] = int(tid)
-    return result
+    resolutions = _build_resolutions_by_step(base_size)
+    for extra_resolution in (_Resolution(s) for s in _HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS):
+        if not any(r.ratio == extra_resolution.ratio for r in resolutions):
+            resolutions.append(extra_resolution)
+    return [(r.height, r.width) for r in resolutions]
 
 
 def _truncate_at_cot_end(
     generated_text: str,
     generated_token_ids,
-    model_name_or_path: str,
 ) -> tuple[str, list[int]]:
     """Truncate AR output at first `</recaption>` (or `</think>` fallback).
 
@@ -89,63 +113,50 @@ def _truncate_at_cot_end(
     upstream, which decodes only `generated_tokens[0, :end_pos + 1]` as
     `cot_text` for DiT. The trailing `<answer><boi><img_size_*><img_ratio_*>`
     sequence is a stage-transition trigger consumed via `image_size` /
-    height/width — it must NOT be forwarded to DiT's prompt builder, or
+    height/width; it must NOT be forwarded to DiT's prompt builder, or
     the extra `<boi>` and ratio tokens drift the DiT's own prompt
     structure.
     """
     token_list = list(generated_token_ids) if generated_token_ids is not None else []
 
-    end_ids = _build_cot_end_token_ids(model_name_or_path)
+    end_ids = {
+        "</recaption>": HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"],
+        "</think>": HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"],
+    }
 
     for marker in ("</recaption>", "</think>"):
-        idx = generated_text.find(marker)
-        if idx == -1:
-            continue
-        text_end = idx + len(marker)
-        truncated_text = generated_text[:text_end]
-
         truncated_tokens = token_list
-        end_id = end_ids.get(marker)
-        if end_id is not None and token_list:
+        end_id = end_ids[marker]
+        if token_list:
             try:
                 token_end = token_list.index(end_id)
                 truncated_tokens = token_list[: token_end + 1]
             except ValueError:
                 pass
-        return truncated_text, truncated_tokens
+
+        idx = generated_text.find(marker)
+        if idx != -1:
+            text_end = idx + len(marker)
+            return generated_text[:text_end], truncated_tokens
+        if truncated_tokens is not token_list:
+            return generated_text, truncated_tokens
 
     return generated_text, token_list
 
 
 @lru_cache(maxsize=4)
-def _build_ratio_id_lookup(model_name_or_path: str) -> dict[int, int]:
-    """Return `{token_id: ratio_index}` for `<img_ratio_*>` in the tokenizer.
+def _build_ratio_id_lookup() -> dict[int, int]:
+    """Return `{token_id: ratio_index}` for HunyuanImage3 ratio tokens.
 
-    Loads the tokenizer once per model path and walks the contiguous
-    `<img_ratio_0>..<img_ratio_32>` plus the extra slice
-    `<img_ratio_33>..<img_ratio_36>` (the same shape
-    `HunyuanImage3ForCausalMM.__init__` registers at lines 1523-1531).
-    Empty dict on lookup failure so callers can degrade gracefully.
+    The ids are fixed in tokenizer.json and already pinned in prompt_utils.
+    Avoid loading AutoTokenizer here: this bridge runs on the hot AR->DiT
+    transition path and must keep working in offline deployments where the
+    tokenizer object is not exposed to the stage-input processor.
     """
-    try:
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
-    except Exception as e:  # pragma: no cover - environment-dependent
-        logger.warning("[ar2diffusion] failed to load tokenizer for ratio token lookup: %s", e)
-        return {}
-
-    def _id(name: str) -> int | None:
-        tid = tokenizer.convert_tokens_to_ids(name)
-        return None if tid is None or tid == tokenizer.unk_token_id else int(tid)
-
-    ratio_0 = _id("<img_ratio_0>")
-    ratio_32 = _id("<img_ratio_32>")
-    ratio_33 = _id("<img_ratio_33>")
-    ratio_36 = _id("<img_ratio_36>")
-    if None in (ratio_0, ratio_32, ratio_33, ratio_36):
-        logger.warning("[ar2diffusion] tokenizer is missing one of <img_ratio_{0,32,33,36}> tokens")
-        return {}
+    ratio_0 = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_0>"]
+    ratio_32 = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_32>"]
+    ratio_33 = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_33>"]
+    ratio_36 = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_36>"]
 
     table: dict[int, int] = {}
     for i in range(ratio_32 - ratio_0 + 1):
@@ -156,22 +167,20 @@ def _build_ratio_id_lookup(model_name_or_path: str) -> dict[int, int]:
     return table
 
 
-def _extract_ratio_index(generated_token_ids, model_name_or_path: str) -> int | None:
+def _extract_ratio_index(generated_token_ids) -> int | None:
     """Resolve the AR-predicted ratio_index from this stage's output.
 
     `HunyuanImage3ForCausalMM`'s `_stage_transitions` forces the AR to emit
     exactly one `<img_ratio_*>` token after `</recaption><answer><boi>
     <img_size_*>`, so we scan the token stream from the tail for the first
-    id that maps to a ratio. Token-ids are the source of truth — text-side
+    id that maps to a ratio. Token-ids are the source of truth; text-side
     regex is unreliable because most deploy yamls run AR with
     `skip_special_tokens: True` (special tokens are stripped from text but
     still present in `cumulative_token_ids`).
     """
     if generated_token_ids is None:
         return None
-    table = _build_ratio_id_lookup(model_name_or_path)
-    if not table:
-        return None
+    table = _build_ratio_id_lookup()
     for tid in reversed(list(generated_token_ids)):
         idx = table.get(int(tid))
         if idx is not None:
@@ -230,10 +239,7 @@ def ar2diffusion(
         # square in the multi-image / mismatched-aspect case. Mirrors the
         # official upstream where `reso_group[ratio_index]` is the
         # canonical source of the diffusion target shape.
-        model_name_or_path = original_prompt.get("model") or os.environ.get(
-            "VLLM_OMNI_HUNYUAN_IMAGE3_MODEL", _DEFAULT_HUNYUAN_IMAGE3_MODEL
-        )
-        ratio_idx = _extract_ratio_index(generated_token_ids, model_name_or_path)
+        ratio_idx = _extract_ratio_index(generated_token_ids)
         ar_predicted = False
         if ratio_idx is not None:
             base_size = int(original_prompt.get("image_base_size", 1024))
@@ -253,14 +259,12 @@ def ar2diffusion(
 
         # Truncate the AR output at `</recaption>` (or `</think>`) before
         # passing to DiT. Mirrors official `generate_image` which keeps
-        # `cot_text` clean and routes size/ratio via `image_size` only —
+        # `cot_text` clean and routes size/ratio via `image_size` only;
         # we already extracted `ratio_idx` above and translated it into
         # `height` / `width`, so the `<answer><boi><img_size_*><img_ratio_*>`
         # tail has no remaining job and would only contaminate DiT's
         # prompt builder if forwarded.
-        cot_text_for_dit, cot_token_ids_for_dit = _truncate_at_cot_end(
-            generated_text, generated_token_ids, model_name_or_path
-        )
+        cot_text_for_dit, cot_token_ids_for_dit = _truncate_at_cot_end(generated_text, generated_token_ids)
 
         logger.info(
             "[ar2diffusion] Request %d: AR generated %d tokens, text length=%d, "

@@ -265,6 +265,92 @@ def test_build_multistage_generation_inputs_legacy_bot_task_form_unchanged(servi
     )
 
 
+@pytest.mark.parametrize("legacy_task", ["i2t", "t2t"])
+def test_build_multistage_generation_inputs_legacy_plain_tasks_stay_plain(serving_chat, legacy_task: str):
+    """Legacy bot_task=i2t/t2t must preserve those tasks' plain prompt mode.
+
+    The task/bot_task split must not normalize every legacy task-enum request
+    into bot_task="think"; i2t/t2t had no <think>/<recaption> trigger before
+    the split and should stay plain unless the caller passes an explicit
+    semantic bot_task.
+    """
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.0),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+    images = [Image.new("RGB", (32, 32), color="red")]
+
+    legacy_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="describe me",
+        extra_body={"bot_task": legacy_task},
+        reference_images=images if legacy_task == "i2t" else [],
+        gen_params=OmniDiffusionSamplingParams(),
+    )
+    explicit_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="describe me",
+        extra_body={"task": legacy_task},
+        reference_images=images if legacy_task == "i2t" else [],
+        gen_params=OmniDiffusionSamplingParams(),
+    )
+
+    assert legacy_prompt["prompt"] == explicit_prompt["prompt"]
+    assert legacy_prompt["prompt"].endswith("Assistant: ")
+    assert not legacy_prompt["prompt"].endswith("<think>")
+    assert not legacy_prompt["prompt"].endswith("<recaption>")
+
+
+@pytest.mark.parametrize(
+    "legacy_task,trigger",
+    [
+        ("it2i_think", "<think>"),
+        ("it2i_recaption", "<recaption>"),
+    ],
+)
+def test_build_multistage_generation_inputs_legacy_composite_tasks_still_work(
+    serving_chat,
+    legacy_task: str,
+    trigger: str,
+):
+    """Legacy composite task names passed through bot_task must still work."""
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.0),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+    images = [Image.new("RGB", (32, 32), color="red")]
+
+    legacy_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="edit me",
+        extra_body={"bot_task": legacy_task},
+        reference_images=images,
+        gen_params=OmniDiffusionSamplingParams(),
+    )
+
+    assert legacy_prompt["prompt"].count("<img>") == 1
+    assert legacy_prompt["prompt"].endswith(f"Assistant: {trigger}")
+
+
 def test_build_multistage_generation_inputs_bot_task_semantic_changes_trigger_and_sys(serving_chat):
     """Passing bot_task=think_recaption (vs default "think") must flip the
     resolved sys_type to en_think_recaption (and trigger tag is still

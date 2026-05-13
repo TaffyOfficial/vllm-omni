@@ -2260,9 +2260,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         bot_task = extra_body.get("bot_task")
         sys_type = extra_body.get("sys_type")
         custom_system_prompt = extra_body.get("system_prompt")
-        if task is None and bot_task in set(_hunyuan3_available_tasks()):
+        legacy_task_from_bot_task = False
+        legacy_task_names = set(_hunyuan3_available_tasks()) | {
+            "it2i_think",
+            "it2i_recaption",
+            "t2i_think",
+            "t2i_recaption",
+            "t2i_vanilla",
+        }
+        if task is None and bot_task in legacy_task_names:
             task = bot_task
             bot_task = None
+            legacy_task_from_bot_task = True
 
         engine_prompt_data: dict[str, Any] | None = None
         modalities = ["image"]
@@ -2282,13 +2291,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             )
 
             num_images = len(reference_images) if reference_images else 1
-            # build_prompt defaults task="it2i"; preserve that when caller
-            # only passed bot_task semantic.
             effective_task = task if task is not None else "it2i"
-            # build_prompt defaults bot_task="think"; preserve that for legacy
-            # callers (passing bot_task=None to build_prompt explicitly gives a
-            # different (sys, trigger) than the default "think").
-            effective_bot_task = bot_task if bot_task is not None else "think"
+            build_kwargs = {
+                "task": effective_task,
+                "sys_type": sys_type,
+                "custom_system_prompt": custom_system_prompt,
+                "num_images": num_images,
+            }
+            if bot_task is not None:
+                build_kwargs["bot_task"] = bot_task
+            elif "bot_task" in extra_body and not legacy_task_from_bot_task:
+                # Preserve the prompt_utils distinction between omitted
+                # bot_task and explicit None. Omitted keeps each task's legacy
+                # default (`it2i` -> think, `i2t`/`t2t` -> plain), while
+                # explicit None is the caller's plain-mode request.
+                build_kwargs["bot_task"] = None
             if tokenizer is not None:
                 # HF byte-for-byte path: feed segment-tokenized prompt_token_ids
                 # so AR sees the same template-tokenization HF apply_chat_template
@@ -2301,11 +2318,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 result = build_prompt_tokens(
                     prompt,
                     tokenizer,
-                    task=effective_task,
-                    bot_task=effective_bot_task,
-                    sys_type=sys_type,
-                    custom_system_prompt=custom_system_prompt,
-                    num_images=num_images,
+                    **build_kwargs,
                 )
                 prompt_token_ids = result.token_ids
                 system_prompt_type = result.system_prompt_type
@@ -2313,11 +2326,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # Legacy string path (e.g. unit tests with no tokenizer plumbed).
                 prompt = build_prompt(
                     prompt,
-                    task=effective_task,
-                    bot_task=effective_bot_task,
-                    sys_type=sys_type,
-                    custom_system_prompt=custom_system_prompt,
-                    num_images=num_images,
+                    **build_kwargs,
                 )
             if reference_images and len(reference_images) == 1:
                 engine_prompt_data = {"image": reference_images[0]}

@@ -1759,11 +1759,10 @@ async def edit_images(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=detail,
             )
-        # Only convert uploads to RGB when the caller opts into the
-        # Hunyuan-aware API surface (task / bot_task / sys_type). Legacy
-        # callers that send only the older bot_task=<task-enum> shape keep
-        # whatever PIL mode the upload arrived as, to preserve pre-existing
-        # behavior for non-Hunyuan flows.
+        # Convert uploads to RGB when the caller opts into the Hunyuan-aware
+        # API surface. This includes the legacy bot_task=<task-enum> form:
+        # keeping uploads as RGBA/P PIL objects makes online IT2I observe a
+        # different visual input than the offline path.
         normalize_edit_images_rgb = task is not None or bot_task is not None or sys_type is not None
         pil_images = await _load_input_images(input_images_list, normalize_rgb=normalize_edit_images_rgb)
         prompt["multi_modal_data"] = {}
