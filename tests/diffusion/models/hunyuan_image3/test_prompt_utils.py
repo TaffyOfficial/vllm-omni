@@ -79,6 +79,14 @@ def test_legacy_base_task_omitted_bot_task_keeps_plain_mode():
     }
 
 
+def test_legacy_composite_task_with_none_bot_task_keeps_encoded_mode():
+    prompt = build_prompt("HELLO", task="it2i_think", bot_task=None)
+    assert prompt.endswith("Assistant: <think>")
+
+    result = build_prompt_tokens("hi", FakeTokenizer(), task="it2i_recaption", bot_task=None)
+    assert result.token_ids[-1] == FakeTokenizer.SPECIAL["<recaption>"]
+
+
 def test_default_prompt_still_uses_it2i_think_mode():
     prompt = build_prompt("HELLO")
     assert prompt.endswith("Assistant: <think>")

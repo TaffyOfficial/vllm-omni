@@ -95,6 +95,8 @@ _TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
     "t2i_recaption": ("en_unified", "recaption", "<recaption>"),
 }
 
+_LEGACY_COMPOSITE_TASKS: frozenset[str] = frozenset(_TASK_PRESETS) - {"t2t", "i2t", "t2i"}
+
 
 def _normalize_task_and_bot_task(
     task: str,
@@ -109,6 +111,12 @@ def _normalize_task_and_bot_task(
         if task in ("t2t", "i2t", "t2i"):
             base_task = task
         if bot_task_was_omitted:
+            bot_task = legacy_bot_task
+        elif task in _LEGACY_COMPOSITE_TASKS and bot_task is None:
+            # Composite task names already encode the legacy bot_task. Keep
+            # calls like build_prompt_tokens(task="it2i_think", bot_task=None)
+            # on their historical meaning; explicit None is the plain-mode
+            # escape hatch only for the new two-axis base tasks.
             bot_task = legacy_bot_task
         task = base_task
     elif bot_task_was_omitted:
