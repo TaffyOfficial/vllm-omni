@@ -74,6 +74,13 @@ _BOT_TASK_PRESETS: dict[str | None, tuple[str, str | None]] = {
 
 _TASKS: frozenset[str] = frozenset({"t2t", "i2t", "it2i", "t2i"})
 
+
+class _DefaultBotTask:
+    pass
+
+
+_DEFAULT_BOT_TASK = _DefaultBotTask()
+
 # Legacy composite task alias -> (task, bot_task). Keep this during rebase so
 # older callers and intermediate commits still resolve cleanly.
 _TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
@@ -89,7 +96,11 @@ _TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
 }
 
 
-def _normalize_task_and_bot_task(task: str, bot_task: str | None) -> tuple[str, str | None]:
+def _normalize_task_and_bot_task(
+    task: str,
+    bot_task: str | None | _DefaultBotTask,
+) -> tuple[str, str | None]:
+    bot_task_was_omitted = bot_task is _DEFAULT_BOT_TASK
     if task in _TASK_PRESETS:
         _, legacy_bot_task, _ = _TASK_PRESETS[task]
         base_task = task.split("_", 1)[0]
@@ -97,9 +108,11 @@ def _normalize_task_and_bot_task(task: str, bot_task: str | None) -> tuple[str, 
             base_task = "t2i"
         if task in ("t2t", "i2t", "t2i"):
             base_task = task
-        if bot_task is None:
+        if bot_task_was_omitted:
             bot_task = legacy_bot_task
         task = base_task
+    elif bot_task_was_omitted:
+        bot_task = "think"
     return task, bot_task
 
 
@@ -123,7 +136,7 @@ def resolve_sys_type(bot_task: str | None) -> str:
 
 def resolve_stop_token_ids(
     task: str = "it2i",
-    bot_task: str | None = "think",
+    bot_task: str | None | _DefaultBotTask = _DEFAULT_BOT_TASK,
     tokenizer: Any | None = None,
 ) -> list[int]:
     task, bot_task = _normalize_task_and_bot_task(task, bot_task)
@@ -158,7 +171,7 @@ def _resolve_preset(task: str, bot_task: str | None) -> tuple[str, str | None]:
 def build_prompt(
     user_prompt: str,
     task: str = "it2i",
-    bot_task: str | None = "think",
+    bot_task: str | None | _DefaultBotTask = _DEFAULT_BOT_TASK,
     sys_type: str | None = None,
     custom_system_prompt: str | None = None,
     num_images: int = 1,
@@ -205,7 +218,7 @@ def build_prompt_tokens(
     user_prompt: str,
     tokenizer,
     task: str = "it2i",
-    bot_task: str | None = "think",
+    bot_task: str | None | _DefaultBotTask = _DEFAULT_BOT_TASK,
     sys_type: str | None = None,
     custom_system_prompt: str | None = None,
     num_images: int = 1,

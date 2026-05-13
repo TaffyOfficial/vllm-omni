@@ -66,6 +66,28 @@ def test_legacy_task_presets_still_available():
     } <= set(_TASK_PRESETS)
 
 
+def test_legacy_base_task_omitted_bot_task_keeps_plain_mode():
+    prompt = build_prompt("HELLO", task="i2t")
+    assert prompt.endswith("Assistant: ")
+    assert not prompt.endswith("<think>")
+
+    result = build_prompt_tokens("hi", FakeTokenizer(), task="i2t")
+    assert result.system_prompt_type == "en_unified"
+    assert result.token_ids[-1] not in {
+        FakeTokenizer.SPECIAL["<think>"],
+        FakeTokenizer.SPECIAL["<recaption>"],
+    }
+
+
+def test_default_prompt_still_uses_it2i_think_mode():
+    prompt = build_prompt("HELLO")
+    assert prompt.endswith("Assistant: <think>")
+
+    result = build_prompt_tokens("hi", FakeTokenizer())
+    assert result.system_prompt_type == "en_unified"
+    assert result.token_ids[-1] == FakeTokenizer.SPECIAL["<think>"]
+
+
 def test_resolve_stop_token_ids_uses_answer_for_generation_tasks():
     tok = FakeTokenizer()
     answer_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]
