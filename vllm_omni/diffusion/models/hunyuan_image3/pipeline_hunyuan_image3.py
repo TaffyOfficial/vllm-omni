@@ -1377,8 +1377,7 @@ class HunyuanImage3Pipeline(
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
 
         cot_text_list = [
-            (p.get("extra", {}).get("ar_generated_text") if isinstance(p, dict) else None) or None
-            for p in req.prompts
+            (p.get("extra", {}).get("ar_generated_text") if isinstance(p, dict) else None) or None for p in req.prompts
         ]
         cot_text = (
             [self._normalize_cot_text(t) for t in cot_text_list] if any(t is not None for t in cot_text_list) else None
