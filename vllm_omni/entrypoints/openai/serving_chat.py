@@ -2247,34 +2247,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         lora_body = extra_body.get("lora")
         layers = extra_body.get("layers")
         resolution = extra_body.get("resolution")
-        from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
-            MAX_IMAGES_PER_REQUEST as _HUNYUAN3_MAX_IMAGES,
-        )
-        from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
-            resolve_stop_token_ids as _hunyuan3_resolve_stop_token_ids,
-        )
-
         bot_task = extra_body.get("bot_task")
         sys_type = extra_body.get("sys_type")
         custom_system_prompt = extra_body.get("system_prompt")
-
-        # Legacy callers passed task enums (it2i / t2i / it2i_think / ...) via
-        # bot_task. Task is now derived from reference_images presence; map
-        # composites to their semantic bot_task and drop bare task enums.
-        bot_task_omitted = False
-        if bot_task in {"it2i", "t2i", "i2t", "t2t"}:
-            bot_task = None
-            bot_task_omitted = True
-        elif bot_task in {"it2i_think", "it2i_recaption", "t2i_think", "t2i_recaption", "t2i_vanilla"}:
-            bot_task = bot_task.split("_", 1)[1]
-
-        if reference_images and len(reference_images) > _HUNYUAN3_MAX_IMAGES:
-            raise ValueError(
-                f"HunyuanImage-3.0 IT2I accepts at most {_HUNYUAN3_MAX_IMAGES} input "
-                f"images per request, got {len(reference_images)}"
-            )
-
-        task = "it2i" if reference_images else "t2i"
 
         engine_prompt_data: dict[str, Any] | None = None
         modalities = ["image"]
@@ -2287,21 +2262,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         prompt_token_ids: list[int] | None = None
         system_prompt_type: str | None = None
-        if bot_task is not None or sys_type is not None or custom_system_prompt is not None or bot_task_omitted:
+        if bot_task is not None or sys_type is not None or custom_system_prompt is not None:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
                 build_prompt,
                 build_prompt_tokens,
             )
 
             build_kwargs: dict[str, Any] = {
-                "task": task,
+                "task": "it2i" if reference_images else "t2i",
                 "sys_type": sys_type,
                 "custom_system_prompt": custom_system_prompt,
                 "num_images": len(reference_images) if reference_images else 1,
             }
             if bot_task is not None:
                 build_kwargs["bot_task"] = bot_task
-            elif "bot_task" in extra_body and not bot_task_omitted:
+            elif "bot_task" in extra_body:
                 # Explicit None from the caller is plain-mode; omitted lets
                 # each task fall back to its default trigger.
                 build_kwargs["bot_task"] = None
@@ -2380,18 +2355,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     default_stage_params.extra_args = extra_args
                 extra_args["target_h"] = int(height)
                 extra_args["target_w"] = int(width)
-
-            # Stop AR at the natural <img_ratio_*> token for image tasks; mirrors
-            # upstream modeling_hunyuan_image_3.py:3289-3303.
-            if (
-                comprehension_idx is not None
-                and idx == comprehension_idx
-                and hasattr(default_stage_params, "stop_token_ids")
-            ):
-                default_stage_params.stop_token_ids = _hunyuan3_resolve_stop_token_ids(
-                    task=task,
-                    bot_task=bot_task,
-                )
 
             if stage_type == "diffusion":
                 self._set_if_supported(
