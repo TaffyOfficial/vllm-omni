@@ -754,7 +754,6 @@ class HunyuanImage3Pipeline(
         mode="gen_image",
         system_prompt=None,
         cot_text=None,
-        cot_token_ids=None,
         num_inference_steps=50,
         guidance_scale=5.0,
         image_size="auto",
@@ -771,7 +770,6 @@ class HunyuanImage3Pipeline(
         batch_message_list = message_list
         batch_prompt = prompt
         batch_cot_text = cot_text
-        batch_cot_token_ids = cot_token_ids
         batch_system_prompt = system_prompt
         batch_gen_image_info = None
         batch_cond_image_info = kwargs.pop("batch_cond_image_info", None)
@@ -850,7 +848,6 @@ class HunyuanImage3Pipeline(
             batch_cond_image_info=batch_cond_image_info,
             batch_system_prompt=batch_system_prompt,
             batch_cot_text=batch_cot_text,
-            batch_cot_token_ids=batch_cot_token_ids,
             max_length=kwargs.get("max_length"),
             bot_task=bot_task,
             image_base_size=self.config.image_base_size,
@@ -1379,20 +1376,13 @@ class HunyuanImage3Pipeline(
             system_prompt = system_prompt.strip() if system_prompt is not None else ""
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
 
-        # Extract AR-generated CoT/recaption text from each prompt's extra dict.
-        # The AR-side stage input processor (``ar2diffusion``) already prepends
-        # the trigger tag (e.g. ``<think>``) when the AR used the KV-reuse
-        # pretrain format, so ``ar_generated_text`` is a self-contained string
-        # and ``get_cot_sections()`` can parse the think/recaption structure
-        # directly.
-        cot_text_list = []
-        for p in req.prompts:
-            extra = p.get("extra", {}) if isinstance(p, dict) else {}
-            cot_text_list.append(extra.get("ar_generated_text") or None)
+        cot_text_list = [
+            (p.get("extra", {}).get("ar_generated_text") if isinstance(p, dict) else None) or None
+            for p in req.prompts
+        ]
         cot_text = (
             [self._normalize_cot_text(t) for t in cot_text_list] if any(t is not None for t in cot_text_list) else None
         )
-        cot_token_ids = None
 
         batch_cond_image_info: list[list[JointImageInfo]] | None = None
         if any(not isinstance(p, str) for p in req.prompts):
@@ -1433,7 +1423,6 @@ class HunyuanImage3Pipeline(
         model_inputs = self.prepare_model_inputs(
             prompt=prompt,
             cot_text=cot_text,
-            cot_token_ids=cot_token_ids,
             system_prompt=system_prompt,
             mode="gen_image",
             generator=generator,

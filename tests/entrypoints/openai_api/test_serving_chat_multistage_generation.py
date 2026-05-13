@@ -219,13 +219,9 @@ def test_build_multistage_generation_inputs_tokenizer_path_emits_prompt_token_id
 
 
 def test_build_multistage_generation_inputs_legacy_bot_task_form_unchanged(serving_chat):
-    """Legacy callers passed a task-enum value (i2t/it2i/t2i/t2t) under
-    `bot_task` in extra_body. After the P1 task/bot_task split, the helper
-    must still treat that legacy form as `task=<value>, bot_task=None`
-    (i.e. defaults bot_task semantic to "think"), so the resulting prompt
-    is identical to the pre-P1 output.
-
-    Pins the back-compat contract.
+    """Legacy callers passed bot_task="it2i" as an opt-in marker. Task is now
+    inferred from reference_images; legacy bot_task must still trigger the
+    default think mode rather than getting silently dropped.
     """
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
@@ -241,7 +237,6 @@ def test_build_multistage_generation_inputs_legacy_bot_task_form_unchanged(servi
     )
     images = [Image.new("RGB", (32, 32), color="red"), Image.new("RGB", (32, 32), color="blue")]
 
-    # Legacy form: only bot_task=<task-enum>.
     legacy_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
         serving_chat,
         engine=engine,
@@ -250,65 +245,8 @@ def test_build_multistage_generation_inputs_legacy_bot_task_form_unchanged(servi
         reference_images=images,
         gen_params=OmniDiffusionSamplingParams(),
     )
-    # New form: explicit task=<task-enum>, no bot_task.
-    new_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
-        serving_chat,
-        engine=engine,
-        prompt="edit me",
-        extra_body={"task": "it2i"},
-        reference_images=images,
-        gen_params=OmniDiffusionSamplingParams(),
-    )
-    assert legacy_prompt["prompt"] == new_prompt["prompt"], (
-        f"legacy bot_task=<task> form must produce the same prompt as task=<task>; "
-        f"legacy={legacy_prompt['prompt']!r} new={new_prompt['prompt']!r}"
-    )
-
-
-@pytest.mark.parametrize("legacy_task", ["i2t", "t2t"])
-def test_build_multistage_generation_inputs_legacy_plain_tasks_stay_plain(serving_chat, legacy_task: str):
-    """Legacy bot_task=i2t/t2t must preserve those tasks' plain prompt mode.
-
-    The task/bot_task split must not normalize every legacy task-enum request
-    into bot_task="think"; i2t/t2t had no <think>/<recaption> trigger before
-    the split and should stay plain unless the caller passes an explicit
-    semantic bot_task.
-    """
-    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
-
-    engine = SimpleNamespace(
-        stage_configs=[
-            SimpleNamespace(stage_type="llm", is_comprehension=True),
-            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
-        ],
-        default_sampling_params_list=[
-            SamplingParams(temperature=0.0),
-            OmniDiffusionSamplingParams(),
-        ],
-    )
-    images = [Image.new("RGB", (32, 32), color="red")]
-
-    legacy_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
-        serving_chat,
-        engine=engine,
-        prompt="describe me",
-        extra_body={"bot_task": legacy_task},
-        reference_images=images if legacy_task == "i2t" else [],
-        gen_params=OmniDiffusionSamplingParams(),
-    )
-    explicit_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
-        serving_chat,
-        engine=engine,
-        prompt="describe me",
-        extra_body={"task": legacy_task},
-        reference_images=images if legacy_task == "i2t" else [],
-        gen_params=OmniDiffusionSamplingParams(),
-    )
-
-    assert legacy_prompt["prompt"] == explicit_prompt["prompt"]
-    assert legacy_prompt["prompt"].endswith("Assistant: ")
-    assert not legacy_prompt["prompt"].endswith("<think>")
-    assert not legacy_prompt["prompt"].endswith("<recaption>")
+    assert legacy_prompt["prompt"].count("<img>") == 2
+    assert legacy_prompt["prompt"].endswith("Assistant: <think>")
 
 
 @pytest.mark.parametrize(

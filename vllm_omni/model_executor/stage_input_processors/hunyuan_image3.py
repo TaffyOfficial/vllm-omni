@@ -102,45 +102,19 @@ def _build_ratio_size_table(base_size: int) -> list[tuple[int, int]]:
     return [(r.height, r.width) for r in resolutions]
 
 
-def _truncate_at_cot_end(
-    generated_text: str,
-    generated_token_ids,
-) -> tuple[str, list[int]]:
+def _truncate_at_cot_end(generated_text: str) -> str:
     """Truncate AR output at first `</recaption>` (or `</think>` fallback).
 
-    Mirrors `HunyuanImage3ForCausalMM.generate_image` in the official
-    upstream, which decodes only `generated_tokens[0, :end_pos + 1]` as
-    `cot_text` for DiT. The trailing `<answer><boi><img_size_*><img_ratio_*>`
-    sequence is a stage-transition trigger consumed via `image_size` /
-    height/width; it must NOT be forwarded to DiT's prompt builder, or
-    the extra `<boi>` and ratio tokens drift the DiT's own prompt
-    structure.
+    Mirrors upstream `HunyuanImage3ForCausalMM.generate_image` which feeds
+    DiT only the cot text up to the closing tag; the trailing
+    `<answer><boi><img_size_*><img_ratio_*>` is consumed via height/width
+    extraction and must not leak into DiT's prompt builder.
     """
-    token_list = list(generated_token_ids) if generated_token_ids is not None else []
-
-    end_ids = {
-        "</recaption>": HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"],
-        "</think>": HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"],
-    }
-
     for marker in ("</recaption>", "</think>"):
-        truncated_tokens = token_list
-        end_id = end_ids[marker]
-        if token_list:
-            try:
-                token_end = token_list.index(end_id)
-                truncated_tokens = token_list[: token_end + 1]
-            except ValueError:
-                pass
-
         idx = generated_text.find(marker)
         if idx != -1:
-            text_end = idx + len(marker)
-            return generated_text[:text_end], truncated_tokens
-        if truncated_tokens is not token_list:
-            return generated_text, truncated_tokens
-
-    return generated_text, token_list
+            return generated_text[: idx + len(marker)]
+    return generated_text
 
 
 @lru_cache(maxsize=4)
@@ -256,14 +230,7 @@ def ar2diffusion(
                     width,
                 )
 
-        # Truncate the AR output at `</recaption>` (or `</think>`) before
-        # passing to DiT. Mirrors official `generate_image` which keeps
-        # `cot_text` clean and routes size/ratio via `image_size` only;
-        # we already extracted `ratio_idx` above and translated it into
-        # `height` / `width`, so the `<answer><boi><img_size_*><img_ratio_*>`
-        # tail has no remaining job and would only contaminate DiT's
-        # prompt builder if forwarded.
-        cot_text_for_dit, cot_token_ids_for_dit = _truncate_at_cot_end(generated_text, generated_token_ids)
+        cot_text_for_dit = _truncate_at_cot_end(generated_text)
 
         logger.info(
             "[ar2diffusion] Request %d: AR generated %d tokens, text length=%d, "

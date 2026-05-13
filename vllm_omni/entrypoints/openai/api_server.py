@@ -1700,11 +1700,8 @@ async def edit_images(
     # vllm-omni extension for layered models (e.g., Qwen-Image-Layered)
     layers: int | None = Form(None),
     resolution: int | None = Form(None),  # See SUPPORTED_LAYERED_RESOLUTIONS
+    # /v1/images/edits is always IT2I; only the prompting knobs are exposed.
     bot_task: str | None = Form(None),
-    # ``/v1/images/edits`` is always image-to-image (IT2I); the ``task`` axis
-    # is fixed and pinned downstream. ``bot_task`` (think / recaption /
-    # think_recaption / vanilla) + ``sys_type`` / ``system_prompt`` are the
-    # only HunyuanImage-3.0 knobs callers need to express here.
     sys_type: str | None = Form(None),
     system_prompt: str | None = Form(None),
 ) -> ImageGenerationResponse:
@@ -1757,10 +1754,8 @@ async def edit_images(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=detail,
             )
-        # Convert uploads to RGB when the caller opts into the Hunyuan-aware
-        # API surface (bot_task / sys_type / system_prompt). Keeping uploads
-        # as RGBA/P PIL objects makes online IT2I observe a different visual
-        # input than the offline path.
+        # Match the offline path: RGB normalize when the caller opts into
+        # Hunyuan-aware behavior. RGBA/P uploads otherwise diverge from offline.
         normalize_edit_images_rgb = bot_task is not None or sys_type is not None
         pil_images = await _load_input_images(input_images_list, normalize_rgb=normalize_edit_images_rgb)
         prompt["multi_modal_data"] = {}
@@ -1895,12 +1890,8 @@ async def edit_images(
                 "seed": effective_seed,
                 "num_outputs_per_prompt": n,
             }
-            # When size="auto", width/height were resolved from the first
-            # input images size (e.g. 512x512 logo), NOT a client-requested
-            # output dimension. Forwarding them to extra_body would override
-            # AR-driven pipelines (e.g. HunyuanImage-3.0) AR `<img_ratio_*>`
-            # token decision via gen_params -> sampling_params. Skip the
-            # forward when auto, matching offline end2end.py img2img.
+            # size="auto" resolves width/height from input image; forwarding
+            # those would override AR-driven `<img_ratio_*>` token selection.
             if not size_was_auto:
                 if width is not None:
                     extra_body["width"] = width
@@ -1925,11 +1916,6 @@ async def edit_images(
                 lora_dict = _get_lora_from_json_str(lora)
                 _parse_lora_request(lora_dict)
                 extra_body["lora"] = lora_dict
-            # ``/v1/images/edits`` is always IT2I; the chat handler's
-            # default (``task="it2i"`` when neither ``task`` nor
-            # ``bot_task`` resolves to a task enum) covers this implicitly.
-            # Legacy callers passing the task enum via ``bot_task`` (e.g.
-            # ``bot_task="it2i"``) are normalized inside the chat handler.
             if bot_task is not None:
                 extra_body["bot_task"] = bot_task
             if sys_type is not None:

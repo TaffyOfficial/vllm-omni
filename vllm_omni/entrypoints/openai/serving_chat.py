@@ -2247,43 +2247,34 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         lora_body = extra_body.get("lora")
         layers = extra_body.get("layers")
         resolution = extra_body.get("resolution")
-        # P1: task / bot_task / sys_type / system_prompt quadruple. Legacy
-        # api_server callers may still pass a task-enum value (i2t / it2i /
-        # t2i / t2t) under `bot_task`; normalize it to `task` here so
-        # downstream uses the canonical split. Source the task enum from
-        # prompt_utils so this layer stays in sync with the model side.
         from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
             MAX_IMAGES_PER_REQUEST as _HUNYUAN3_MAX_IMAGES,
-        )
-        from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
-            available_tasks as _hunyuan3_available_tasks,
         )
         from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
             resolve_stop_token_ids as _hunyuan3_resolve_stop_token_ids,
         )
 
-        task = extra_body.get("task")
         bot_task = extra_body.get("bot_task")
         sys_type = extra_body.get("sys_type")
         custom_system_prompt = extra_body.get("system_prompt")
-        legacy_task_from_bot_task = False
-        legacy_task_names = set(_hunyuan3_available_tasks()) | {
-            "it2i_think",
-            "it2i_recaption",
-            "t2i_think",
-            "t2i_recaption",
-            "t2i_vanilla",
-        }
-        if task is None and bot_task in legacy_task_names:
-            task = bot_task
+
+        # Legacy callers passed task enums (it2i / t2i / it2i_think / ...) via
+        # bot_task. Task is now derived from reference_images presence; map
+        # composites to their semantic bot_task and drop bare task enums.
+        bot_task_omitted = False
+        if bot_task in {"it2i", "t2i", "i2t", "t2t"}:
             bot_task = None
-            legacy_task_from_bot_task = True
+            bot_task_omitted = True
+        elif bot_task in {"it2i_think", "it2i_recaption", "t2i_think", "t2i_recaption", "t2i_vanilla"}:
+            bot_task = bot_task.split("_", 1)[1]
 
         if reference_images and len(reference_images) > _HUNYUAN3_MAX_IMAGES:
             raise ValueError(
                 f"HunyuanImage-3.0 IT2I accepts at most {_HUNYUAN3_MAX_IMAGES} input "
                 f"images per request, got {len(reference_images)}"
             )
+
+        task = "it2i" if reference_images else "t2i"
 
         engine_prompt_data: dict[str, Any] | None = None
         modalities = ["image"]
@@ -2296,50 +2287,33 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         prompt_token_ids: list[int] | None = None
         system_prompt_type: str | None = None
-        if task or bot_task:
+        if bot_task is not None or sys_type is not None or custom_system_prompt is not None or bot_task_omitted:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
                 build_prompt,
                 build_prompt_tokens,
             )
 
-            num_images = len(reference_images) if reference_images else 1
-            effective_task = task if task is not None else "it2i"
-            build_kwargs = {
-                "task": effective_task,
+            build_kwargs: dict[str, Any] = {
+                "task": task,
                 "sys_type": sys_type,
                 "custom_system_prompt": custom_system_prompt,
-                "num_images": num_images,
+                "num_images": len(reference_images) if reference_images else 1,
             }
             if bot_task is not None:
                 build_kwargs["bot_task"] = bot_task
-            elif "bot_task" in extra_body and not legacy_task_from_bot_task:
-                # Preserve the prompt_utils distinction between omitted
-                # bot_task and explicit None. Omitted keeps each task's legacy
-                # default (`it2i` -> think, `i2t`/`t2t` -> plain), while
-                # explicit None is the caller's plain-mode request.
+            elif "bot_task" in extra_body and not bot_task_omitted:
+                # Explicit None from the caller is plain-mode; omitted lets
+                # each task fall back to its default trigger.
                 build_kwargs["bot_task"] = None
             if tokenizer is not None:
-                # HF byte-for-byte path: feed segment-tokenized prompt_token_ids
-                # so AR sees the same template-tokenization HF apply_chat_template
-                # produces. Without this, the engine BPE-merges across template
-                # segment boundaries (e.g. "。\n\n" -> single id) and AR
-                # diverges from training distribution -- different cot_text,
-                # different DiT input, different final image. Mirrors offline
-                # examples/.../end2end.py img2img which always feeds
-                # prompt_token_ids. See prompt_utils.build_prompt NOTE.
-                result = build_prompt_tokens(
-                    prompt,
-                    tokenizer,
-                    **build_kwargs,
-                )
+                # Feed segment-tokenized prompt_token_ids so AR matches HF
+                # apply_chat_template byte-for-byte (engine BPE would merge
+                # across template boundaries, e.g. "。\n\n" -> single id).
+                result = build_prompt_tokens(prompt, tokenizer, **build_kwargs)
                 prompt_token_ids = result.token_ids
                 system_prompt_type = result.system_prompt_type
             else:
-                # Legacy string path (e.g. unit tests with no tokenizer plumbed).
-                prompt = build_prompt(
-                    prompt,
-                    **build_kwargs,
-                )
+                prompt = build_prompt(prompt, **build_kwargs)
             if reference_images and len(reference_images) == 1:
                 engine_prompt_data = {"image": reference_images[0]}
                 modalities = ["image"]
@@ -2349,10 +2323,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             engine_prompt["prompt_token_ids"] = prompt_token_ids
         if system_prompt_type is not None:
             engine_prompt["use_system_prompt"] = system_prompt_type
-        # Forward the custom system prompt body too. DiT's
-        # `get_system_prompt(use_system_prompt, "image", system_prompt)` reads
-        # the third positional arg, so leaving it None turns a `sys_type=custom`
-        # request into an empty DiT system prefix (AR/DiT divergence).
+        # DiT's get_system_prompt(use_system_prompt, "image", system_prompt) reads
+        # this; omitting it makes sys_type=custom yield an empty DiT prefix.
         if custom_system_prompt is not None:
             engine_prompt["system_prompt"] = custom_system_prompt
         engine_prompt["modalities"] = modalities
@@ -2399,10 +2371,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             ):
                 default_stage_params.seed = seed
 
-            # Inject target_h/w into comprehension (AR) stage sampling params
-            # for models that need M-RoPE position pre-computation (e.g.
-            # GLM-Image).  max_tokens is handled via the deploy YAML default
-            # (upper-bound ceiling) rather than computed dynamically here.
+            # Inject target_h/w into AR stage for M-RoPE position pre-computation
+            # (e.g. GLM-Image). max_tokens comes from deploy YAML.
             if comprehension_idx is not None and idx == comprehension_idx and height is not None and width is not None:
                 extra_args = getattr(default_stage_params, "extra_args", None)
                 if extra_args is None:
@@ -2411,22 +2381,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 extra_args["target_h"] = int(height)
                 extra_args["target_w"] = int(width)
 
-            # Resolve AR stop tokens dynamically from (task, bot_task) so the
-            # online path matches offline ``end2end.py`` and so the AR stops
-            # at the natural ``<img_ratio_*>`` token for image-output tasks
-            # (mirrors upstream ``modeling_hunyuan_image_3.py:3289-3303``).
-            # Surviving yaml-side ``stop_token_ids`` would otherwise stop AR
-            # too early and leave ``ar2diffusion`` without a ratio token.
+            # Stop AR at the natural <img_ratio_*> token for image tasks; mirrors
+            # upstream modeling_hunyuan_image_3.py:3289-3303.
             if (
                 comprehension_idx is not None
                 and idx == comprehension_idx
                 and hasattr(default_stage_params, "stop_token_ids")
             ):
-                resolved_stops = _hunyuan3_resolve_stop_token_ids(
-                    task=task if task is not None else "it2i",
+                default_stage_params.stop_token_ids = _hunyuan3_resolve_stop_token_ids(
+                    task=task,
                     bot_task=bot_task,
                 )
-                default_stage_params.stop_token_ids = resolved_stops
 
             if stage_type == "diffusion":
                 self._set_if_supported(

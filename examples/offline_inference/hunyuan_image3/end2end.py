@@ -19,29 +19,12 @@ from vllm_omni.inputs.data import OmniPromptType
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3.yaml")
 _DEFAULT_AR_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3_ar.yaml")
-# Modality → (task, default bot_task) mapping. `task` selects only whether
-# `<img>` placeholders are emitted; `bot_task` (None | think | recaption |
-# think_recaption | vanilla) selects the system prompt + trigger tag.
-#
-# Both verbose (`text2img`) and short (`t2i`) forms are accepted; the short
-# forms match the internal task names (see prompt_utils.available_tasks)
-# so users who think in those terms don't have to translate.
+
 _MODALITY_TASK_MAP: dict[str, tuple[str, str | None]] = {
     "text2img": ("t2i", "think"),
-    "t2i": ("t2i", "think"),
     "img2img": ("it2i", "think"),
-    "it2i": ("it2i", "think"),
     "img2text": ("i2t", None),
-    "i2t": ("i2t", None),
     "text2text": ("t2t", None),
-    "t2t": ("t2t", None),
-}
-
-_MODALITY_CANONICAL = {
-    "t2i": "text2img",
-    "it2i": "img2img",
-    "i2t": "img2text",
-    "t2t": "text2text",
 }
 
 _MODALITY_DEFAULT_DEPLOY_CONFIG = {
@@ -65,8 +48,7 @@ def parse_args():
     parser.add_argument(
         "--modality",
         default="text2img",
-        choices=["text2img", "t2i", "img2img", "it2i", "img2text", "i2t", "text2text", "t2t"],
-        help="Verbose and internal short task names are both accepted.",
+        choices=list(_MODALITY_TASK_MAP),
     )
     parser.add_argument("--prompts", nargs="+", default=None, help="Input text prompts.")
     parser.add_argument(
@@ -135,7 +117,6 @@ def main():
     os.makedirs(args.output, exist_ok=True)
     additional_config = parse_additional_config(args.additional_config)
 
-    args.modality = _MODALITY_CANONICAL.get(args.modality, args.modality)
     task, default_bot_task = _MODALITY_TASK_MAP[args.modality]
     if args.bot_task is None:
         bot_task: str | None = default_bot_task

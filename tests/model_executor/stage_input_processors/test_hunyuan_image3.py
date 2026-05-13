@@ -40,20 +40,9 @@ def test_extract_ratio_index_uses_fixed_special_token_ids():
     assert _extract_ratio_index([1, ratio_33, 2, ratio_36]) == 36
 
 
-def test_truncate_at_cot_end_uses_token_ids_when_text_skips_specials():
-    end_recaption = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"]
-    answer = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]
-    boi = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<boi>"]
-    ratio = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_0>"]
-    token_ids = [100, 101, end_recaption, answer, boi, ratio]
-
-    text, truncated = _truncate_at_cot_end(
-        "recaption body without special markers",
-        token_ids,
-    )
-
-    assert text == "recaption body without special markers"
-    assert truncated == [100, 101, end_recaption]
+def test_truncate_at_cot_end_strips_tail_after_recaption_marker():
+    text = _truncate_at_cot_end("body text</recaption><answer><boi><img_size_1024><img_ratio_0>")
+    assert text == "body text</recaption>"
 
 
 def test_ar2diffusion_applies_ratio_and_truncates_tail_without_tokenizer(monkeypatch: pytest.MonkeyPatch):
