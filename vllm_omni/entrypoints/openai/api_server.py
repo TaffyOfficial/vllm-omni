@@ -1701,12 +1701,10 @@ async def edit_images(
     layers: int | None = Form(None),
     resolution: int | None = Form(None),  # See SUPPORTED_LAYERED_RESOLUTIONS
     bot_task: str | None = Form(None),
-    # P1: task / sys_type / system_prompt split out from the legacy bot_task
-    # field so callers can express the full HunyuanImage-3.0 prompt template
-    # surface (task enum + bot_task semantic + sys_type override + custom
-    # system prompt body). Legacy callers that pass a task-enum value via
-    # bot_task still work (see normalization below).
-    task: str | None = Form(None),
+    # ``/v1/images/edits`` is always image-to-image (IT2I); the ``task`` axis
+    # is fixed and pinned downstream. ``bot_task`` (think / recaption /
+    # think_recaption / vanilla) + ``sys_type`` / ``system_prompt`` are the
+    # only HunyuanImage-3.0 knobs callers need to express here.
     sys_type: str | None = Form(None),
     system_prompt: str | None = Form(None),
 ) -> ImageGenerationResponse:
@@ -1760,10 +1758,10 @@ async def edit_images(
                 detail=detail,
             )
         # Convert uploads to RGB when the caller opts into the Hunyuan-aware
-        # API surface. This includes the legacy bot_task=<task-enum> form:
-        # keeping uploads as RGBA/P PIL objects makes online IT2I observe a
-        # different visual input than the offline path.
-        normalize_edit_images_rgb = task is not None or bot_task is not None or sys_type is not None
+        # API surface (bot_task / sys_type / system_prompt). Keeping uploads
+        # as RGBA/P PIL objects makes online IT2I observe a different visual
+        # input than the offline path.
+        normalize_edit_images_rgb = bot_task is not None or sys_type is not None
         pil_images = await _load_input_images(input_images_list, normalize_rgb=normalize_edit_images_rgb)
         prompt["multi_modal_data"] = {}
         prompt["multi_modal_data"]["image"] = pil_images
@@ -1927,21 +1925,13 @@ async def edit_images(
                 lora_dict = _get_lora_from_json_str(lora)
                 _parse_lora_request(lora_dict)
                 extra_body["lora"] = lora_dict
-            # P1: normalize legacy `bot_task=<task-enum>` form. Callers historically
-            # passed the task enum (i2t / it2i / t2i / t2t) via the `bot_task`
-            # Form field; promote it to `task` here so the chat_handler can
-            # split task vs bot_task semantics cleanly. New callers pass both
-            # `task` and `bot_task` explicitly; we keep them separate.
-            _task = task
-            _bot_task = bot_task
-            _legacy_task_enum = {"t2t", "i2t", "it2i", "t2i"}
-            if _task is None and _bot_task in _legacy_task_enum:
-                _task = _bot_task
-                _bot_task = None
-            if _task is not None:
-                extra_body["task"] = _task
-            if _bot_task is not None:
-                extra_body["bot_task"] = _bot_task
+            # ``/v1/images/edits`` is always IT2I; the chat handler's
+            # default (``task="it2i"`` when neither ``task`` nor
+            # ``bot_task`` resolves to a task enum) covers this implicitly.
+            # Legacy callers passing the task enum via ``bot_task`` (e.g.
+            # ``bot_task="it2i"``) are normalized inside the chat handler.
+            if bot_task is not None:
+                extra_body["bot_task"] = bot_task
             if sys_type is not None:
                 extra_body["sys_type"] = sys_type
             if system_prompt is not None:

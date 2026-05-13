@@ -2257,6 +2257,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         )
         from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
             available_tasks as _hunyuan3_available_tasks,
+            resolve_stop_token_ids as _hunyuan3_resolve_stop_token_ids,
         )
 
         task = extra_body.get("task")
@@ -2407,6 +2408,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     default_stage_params.extra_args = extra_args
                 extra_args["target_h"] = int(height)
                 extra_args["target_w"] = int(width)
+
+            # Resolve AR stop tokens dynamically from (task, bot_task) so the
+            # online path matches offline ``end2end.py`` and so the AR stops
+            # at the natural ``<img_ratio_*>`` token for image-output tasks
+            # (mirrors upstream ``modeling_hunyuan_image_3.py:3289-3303``).
+            # Surviving yaml-side ``stop_token_ids`` would otherwise stop AR
+            # too early and leave ``ar2diffusion`` without a ratio token.
+            if (
+                comprehension_idx is not None
+                and idx == comprehension_idx
+                and hasattr(default_stage_params, "stop_token_ids")
+            ):
+                resolved_stops = _hunyuan3_resolve_stop_token_ids(
+                    task=task if task is not None else "it2i",
+                    bot_task=bot_task,
+                )
+                default_stage_params.stop_token_ids = resolved_stops
 
             if stage_type == "diffusion":
                 self._set_if_supported(

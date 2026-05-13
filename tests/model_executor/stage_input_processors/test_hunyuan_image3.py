@@ -81,7 +81,7 @@ def test_ar2diffusion_applies_ratio_and_truncates_tail_without_tokenizer(monkeyp
     assert len(result) == 1
     assert (result[0]["height"], result[0]["width"]) == (512, 2048)
     assert result[0]["extra"]["ar_generated_text"] == "decoded without special tokens"
-    assert result[0]["extra"]["ar_token_ids"].tolist() == [100, 101, end_recaption]
+    assert "ar_token_ids" not in result[0]["extra"]
 
 
 def test_ar2diffusion_forwards_custom_system_prompt_body():

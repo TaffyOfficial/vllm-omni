@@ -37,26 +37,6 @@ stages:
         rope_type: default
     omni_kv_config:
       need_send_cache: true
-      # Cap AR KV snapshot at </recaption> so the shipped KV exactly
-      # matches the prefix the DiT side reuses (positive_reuse_len =
-      # 0-based index of </recaption>, slice ``k[:positive_reuse_len]``
-      # excludes </recaption> itself). Mirrors the colleague-confirmed
-      # invariant S - N == 1. Without this the AR ships KV all the way
-      # through <answer><boi><img_size><img_ratio><eos>, which DiT
-      # silently discards (S - N == 6) and which keeps the AR pipeline
-      # busy emitting tail tokens that DiT will never use.
-      #
-      # ``stop_after_transfer: false`` keeps the AR running past the
-      # snapshot so it still emits <img_ratio_*>, which ``ar2diffusion``
-      # extracts to derive image height/width. The mid-decode kv_ready
-      # signal that this combination produces is handled in the
-      # orchestrator: forwarding to DiT is deferred until the AR's
-      # natural finish output arrives (see
-      # ``_handle_kv_ready_raw_outputs``).
-      kv_transfer_criteria:
-        type: special_token
-        token_id: 128019  # </recaption>
-        stop_after_transfer: false
     output_connectors:
       to_stage_1: shared_memory_connector
     default_sampling_params:

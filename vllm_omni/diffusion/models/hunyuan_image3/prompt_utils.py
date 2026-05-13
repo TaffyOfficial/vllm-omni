@@ -149,17 +149,19 @@ def resolve_stop_token_ids(
 ) -> list[int]:
     """AR stop-token ids for a given (task, bot_task) generation request.
 
-    Image-output tasks (``it2i`` / ``t2i``) must stop on ``<|endoftext|>``:
-    after ``</recaption>`` the AR's ``_stage_transitions`` force-emits
-    ``<answer><boi><img_size_*>`` and then samples ``<img_ratio_*>`` under
-    ``_apply_ratio_restriction`` followed by ``<|endoftext|>``. Stopping
-    early on ``<answer>`` chops off the size/ratio tail, leaves
-    ``_extract_ratio_index`` empty in ``ar2diffusion``, and silently
-    collapses the DiT output bucket to the first reference image's shape
-    (square logo -> 1024x1024 even when AR's CoT plans a landscape).
+    Image-output tasks (``it2i`` / ``t2i``) stop on any ``<img_ratio_*>``
+    token. Upstream ``modeling_hunyuan_image_3.py::generate_image``
+    (line 3289-3303) sets ``final_stop_tokens`` to the full ratio token
+    range when ``need_ratio`` is true, then strips the trailing ratio
+    token before passing the cot to the image stage. AR's natural
+    trajectory under ``_stage_transitions`` is
+    ``</recaption><answer><boi><img_size_base><img_ratio_X>``; stopping
+    AT the ratio token means KV ends exactly at the prefix DiT reuses,
+    and ``ar2diffusion`` can read the ratio off the last sampled token
+    without AR wasting decode steps on ``<|endoftext|>``.
 
-    Text-output tasks (``i2t`` / ``t2t``) stop on ``<answer>`` -- the AR is
-    the final stage, and the comprehension response sits inside the
+    Text-output tasks (``i2t`` / ``t2t``) stop on ``<answer>`` -- the AR
+    is the final stage, and the comprehension response sits inside the
     ``<answer>`` body so the answer-open is the natural cot/recaption
     terminator.
     """
@@ -169,7 +171,16 @@ def resolve_stop_token_ids(
     if bot_task not in _BOT_TASK_PRESETS:
         raise ValueError(f"Unknown bot_task {bot_task!r}. Choose from: {available_bot_tasks()}")
     if task in ("it2i", "t2i"):
-        return [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|endoftext|>"]]
+        # Main ratio range: <img_ratio_0> .. <img_ratio_32>.
+        start = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_0>"]
+        end = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_32>"]
+        stops = list(range(start, end + 1))
+        # Other slices (upstream tokenizer ``ratio_token_other_slices``):
+        # <img_ratio_33> .. <img_ratio_36>.
+        other_start = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_33>"]
+        other_end = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_36>"]
+        stops.extend(range(other_start, other_end + 1))
+        return stops
     return [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]]
 
 

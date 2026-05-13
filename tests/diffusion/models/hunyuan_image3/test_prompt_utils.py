@@ -96,26 +96,31 @@ def test_default_prompt_still_uses_it2i_think_mode():
     assert result.token_ids[-1] == FakeTokenizer.SPECIAL["<think>"]
 
 
-def test_resolve_stop_token_ids_image_tasks_stop_on_eos_not_answer():
-    """Image-output tasks must stop on <|endoftext|>, not <answer>.
+def test_resolve_stop_token_ids_image_tasks_stop_on_ratio_range():
+    """Image-output tasks stop on any ``<img_ratio_*>`` token.
 
-    Stopping on <answer> chops off the <boi><img_size_*><img_ratio_*>
-    tail forced by `_stage_transitions`, so `_extract_ratio_index` in
-    `ar2diffusion` finds nothing and the DiT output bucket collapses to
-    the first reference image's shape (e.g. 1024x1024 square when AR's
-    CoT planned a 1280x720 landscape).
+    Mirrors upstream ``modeling_hunyuan_image_3.py::generate_image``
+    (line 3289-3303): when ``need_ratio`` is true,
+    ``final_stop_tokens = list(range(start_ratio, end_ratio + 1)) +
+    ratio_token_other_slices``. AR stops AT the ratio token sampled
+    after ``<img_size_*>``; the bridge then strips the trailing ratio
+    token before passing the cot to DiT.
     """
     tok = FakeTokenizer()
 
-    eos_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|endoftext|>"]
-    answer_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]
+    start = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_0>"]
+    end = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_32>"]
+    other_start = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_33>"]
+    other_end = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_36>"]
+    expected = list(range(start, end + 1)) + list(range(other_start, other_end + 1))
 
-    # Image-output: t2i / it2i must let AR emit the size/ratio tail.
+    # Image-output: t2i / it2i stop on the full ratio token range.
     for bot in ("think", "recaption", "think_recaption", "vanilla"):
-        assert resolve_stop_token_ids(task="t2i", bot_task=bot, tokenizer=tok) == [eos_id]
-        assert resolve_stop_token_ids(task="it2i", bot_task=bot, tokenizer=tok) == [eos_id]
+        assert resolve_stop_token_ids(task="t2i", bot_task=bot, tokenizer=tok) == expected
+        assert resolve_stop_token_ids(task="it2i", bot_task=bot, tokenizer=tok) == expected
 
     # Text-output: i2t / t2t comprehension stops on <answer> (response sits inside).
+    answer_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]
     assert resolve_stop_token_ids(task="i2t", bot_task=None, tokenizer=tok) == [answer_id]
     assert resolve_stop_token_ids(task="t2t", bot_task=None, tokenizer=tok) == [answer_id]
 

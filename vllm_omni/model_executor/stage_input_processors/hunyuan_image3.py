@@ -15,7 +15,6 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any
 
-import torch
 from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
@@ -278,14 +277,11 @@ def ar2diffusion(
             f"AR ratio_idx={ratio_idx}" if ar_predicted else "from prompt (no AR ratio token)",
         )
 
-        token_tensor = torch.tensor(cot_token_ids_for_dit, dtype=torch.long)
-
         diffusion_input: dict[str, Any] = {
             "prompt": text_prompt,
             "height": height,
             "width": width,
             "extra": {
-                "ar_token_ids": token_tensor,
                 "ar_generated_text": cot_text_for_dit,
             },
         }
