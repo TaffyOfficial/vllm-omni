@@ -2254,6 +2254,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # prompt_utils so this layer stays in sync with the model side.
         from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
             MAX_IMAGES_PER_REQUEST as _hunyuan3_max_images,
+        )
+        from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
             available_tasks as _hunyuan3_available_tasks,
         )
 

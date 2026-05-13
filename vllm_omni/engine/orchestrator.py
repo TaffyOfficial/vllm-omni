@@ -704,11 +704,7 @@ class Orchestrator:
         # forward kv_ready when the same raw_outputs batch also contains a
         # finished output for that req_id; otherwise wait for AR's natural
         # completion to trigger the forward through ``_route_output``.
-        finished_in_batch = {
-            o.request_id
-            for o in raw_outputs.outputs
-            if getattr(o, "finish_reason", None) is not None
-        }
+        finished_in_batch = {o.request_id for o in raw_outputs.outputs if getattr(o, "finish_reason", None) is not None}
 
         for raw_output in raw_outputs.outputs:
             kv_params = getattr(raw_output, "kv_transfer_params", None)
