@@ -1675,7 +1675,7 @@ def test_image_edits_size_auto_preserves_bridge_size(async_omni_stage_configs_on
     for multi-image fusion).
 
     Cross-pins the multi-image fix at the API level: 2 reference images
-    with bot_task=it2i must produce 2 <img> placeholders in the captured
+    with bot_task=think must produce 2 <img> placeholders in the captured
     AR prompt (build_prompt called with num_images=2).
     """
     img_a = make_test_image_bytes((32, 32))
@@ -1686,7 +1686,7 @@ def test_image_edits_size_auto_preserves_bridge_size(async_omni_stage_configs_on
         data={
             "prompt": "fuse",
             "size": "auto",
-            "bot_task": "it2i",
+            "bot_task": "think",
         },
     )
     assert response.status_code == 200, response.text

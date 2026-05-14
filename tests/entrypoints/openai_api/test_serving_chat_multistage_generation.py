@@ -127,7 +127,7 @@ def test_build_multistage_generation_inputs_multi_image_emits_n_img_placeholders
             serving_chat,
             engine=engine,
             prompt="edit me",
-            extra_body={"bot_task": "it2i"},
+            extra_body={"bot_task": "think"},
             reference_images=images[:n],
             gen_params=OmniDiffusionSamplingParams(),
         )
@@ -196,7 +196,7 @@ def test_build_multistage_generation_inputs_tokenizer_path_emits_prompt_token_id
             serving_chat,
             engine=engine,
             prompt="edit me",
-            extra_body={"bot_task": "it2i"},
+            extra_body={"bot_task": "think"},
             reference_images=images[:n],
             gen_params=OmniDiffusionSamplingParams(),
             tokenizer=tok,
@@ -216,77 +216,6 @@ def test_build_multistage_generation_inputs_tokenizer_path_emits_prompt_token_id
         # (4) N <img> token ids (id=2 in FakeTokenizer)
         img_count = token_ids.count(2)
         assert img_count == n, f"N={n}: expected {n} <img> token ids in prompt_token_ids, got {img_count}"
-
-
-def test_build_multistage_generation_inputs_legacy_bot_task_form_unchanged(serving_chat):
-    """Legacy callers passed bot_task="it2i" as an opt-in marker. Task is now
-    inferred from reference_images; legacy bot_task must still trigger the
-    default think mode rather than getting silently dropped.
-    """
-    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
-
-    engine = SimpleNamespace(
-        stage_configs=[
-            SimpleNamespace(stage_type="llm", is_comprehension=True),
-            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
-        ],
-        default_sampling_params_list=[
-            SamplingParams(temperature=0.0),
-            OmniDiffusionSamplingParams(),
-        ],
-    )
-    images = [Image.new("RGB", (32, 32), color="red"), Image.new("RGB", (32, 32), color="blue")]
-
-    legacy_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
-        serving_chat,
-        engine=engine,
-        prompt="edit me",
-        extra_body={"bot_task": "it2i"},
-        reference_images=images,
-        gen_params=OmniDiffusionSamplingParams(),
-    )
-    assert legacy_prompt["prompt"].count("<img>") == 2
-    assert legacy_prompt["prompt"].endswith("Assistant: <think>")
-
-
-@pytest.mark.parametrize(
-    "legacy_task,trigger",
-    [
-        ("it2i_think", "<think>"),
-        ("it2i_recaption", "<recaption>"),
-    ],
-)
-def test_build_multistage_generation_inputs_legacy_composite_tasks_still_work(
-    serving_chat,
-    legacy_task: str,
-    trigger: str,
-):
-    """Legacy composite task names passed through bot_task must still work."""
-    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
-
-    engine = SimpleNamespace(
-        stage_configs=[
-            SimpleNamespace(stage_type="llm", is_comprehension=True),
-            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
-        ],
-        default_sampling_params_list=[
-            SamplingParams(temperature=0.0),
-            OmniDiffusionSamplingParams(),
-        ],
-    )
-    images = [Image.new("RGB", (32, 32), color="red")]
-
-    legacy_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
-        serving_chat,
-        engine=engine,
-        prompt="edit me",
-        extra_body={"bot_task": legacy_task},
-        reference_images=images,
-        gen_params=OmniDiffusionSamplingParams(),
-    )
-
-    assert legacy_prompt["prompt"].count("<img>") == 1
-    assert legacy_prompt["prompt"].endswith(f"Assistant: {trigger}")
 
 
 def test_build_multistage_generation_inputs_bot_task_semantic_changes_trigger_and_sys(serving_chat):
