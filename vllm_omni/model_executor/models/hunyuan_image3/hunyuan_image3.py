@@ -1398,7 +1398,7 @@ class HunyuanImage3RotaryEmbedding(nn.Module):
         query_shape = query.shape
         key_shape = key.shape
 
-        inv_freq = self.inv_freq.to(device=y_pos.device, dtype=torch.float32)
+        inv_freq = self.inv_freq
 
         inv_freq_y = inv_freq[0::2]  # even indices -> y
         inv_freq_x = inv_freq[1::2]  # odd  indices -> x
