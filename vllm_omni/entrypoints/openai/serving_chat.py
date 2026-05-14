@@ -15,6 +15,7 @@ from PIL import Image
 from pydantic import TypeAdapter
 
 from vllm_omni.diffusion.diffusion_engine import get_extra_body_params, get_extra_output_params
+from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import resolve_target_ratio_idx
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
@@ -491,6 +492,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # convert cumulative to Final Only to ensure the output is correct.
                 sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
 
+                # HunyuanImage-3.0 only generates at 33 fixed aspect-ratio buckets.
+                # When the caller supplies both height and width, pin the AR's
+                # <img_ratio_*> to the matching bucket via extra_args so AR's KV
+                # cache (forwarded to the DiT via KV reuse) and the DiT's own
+                # gen_image_info agree on the same aspect ratio. The AR sampler
+                # ignores extra_args when target_ratio_idx is absent, so other
+                # models pass through unaffected.
+                _ar_target_ratio_idx: int | None = None
+                if _image_gen_height is not None and _image_gen_width is not None:
+                    _ar_target_ratio_idx = resolve_target_ratio_idx(_image_gen_height, _image_gen_width)
+
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):
                     if hasattr(sp, "height") and _image_gen_height is not None:
@@ -508,6 +520,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             _val = extra_body.get(_key)
                             if _val is not None:
                                 sp.extra_args[_key] = _val
+                    if _ar_target_ratio_idx is not None and hasattr(sp, "extra_args"):
+                        # Initialize extra_args on stages that left it None
+                        # (e.g. the AR stage with vanilla vLLM SamplingParams).
+                        if sp.extra_args is None:
+                            sp.extra_args = {}
+                        sp.extra_args["target_ratio_idx"] = _ar_target_ratio_idx
 
                 self._log_inputs(
                     request_id,
