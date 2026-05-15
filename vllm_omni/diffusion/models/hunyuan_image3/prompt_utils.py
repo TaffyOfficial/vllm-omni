@@ -317,61 +317,6 @@ def build_prompt_tokens(
     )
 
 
-def _build_reso_group_ratios(base_size: int = 1024) -> list[tuple[float, int, int]]:
-    """Replicate ResolutionGroup._calc_by_step ordering (sorted by aspect ratio).
-
-    Mirrors `vllm_omni/diffusion/models/hunyuan_image3/hunyuan_image3_transformer.py:ResolutionGroup`.
-    Returned list index aligns with `<img_ratio_i>` token suffixes (33 entries
-    for the default base_size=1024).
-    """
-    step = base_size // 16
-    align = 1
-    min_h = base_size // 2
-    min_w = base_size // 2
-    max_h = base_size * 2
-    max_w = base_size * 2
-    resolutions: list[tuple[int, int]] = [(base_size, base_size)]
-    cur_h, cur_w = base_size, base_size
-    while not (cur_h >= max_h and cur_w <= min_w):
-        cur_h = min(cur_h + step, max_h)
-        cur_w = max(cur_w - step, min_w)
-        resolutions.append((cur_h // align * align, cur_w // align * align))
-    cur_h, cur_w = base_size, base_size
-    while not (cur_h <= min_h and cur_w >= max_w):
-        cur_h = max(cur_h - step, min_h)
-        cur_w = min(cur_w + step, max_w)
-        resolutions.append((cur_h // align * align, cur_w // align * align))
-    triples = [(h / w, h, w) for h, w in resolutions]
-    triples.sort(key=lambda x: x[0])
-    return triples
-
-
-def resolve_target_ratio_idx(
-    height: int | None,
-    width: int | None,
-    base_size: int = 1024,
-) -> int | None:
-    """Map user-requested (height, width) to a HunyuanImage-3.0 ratio bucket index.
-
-    The model only generates at the 33 fixed aspect-ratio buckets that the
-    AR's `<img_ratio_*>` tokens enumerate; this picks the bucket whose
-    aspect ratio is closest to ``height/width``. Returns None on invalid
-    input so callers fall back to the AR's greedy auto-select.
-    """
-    if height is None or width is None or height <= 0 or width <= 0:
-        return None
-    ratios = _build_reso_group_ratios(base_size)
-    target_r = height / width
-    best_idx = 0
-    best_dist = abs(ratios[0][0] - target_r)
-    for i in range(1, len(ratios)):
-        d = abs(ratios[i][0] - target_r)
-        if d < best_dist:
-            best_dist = d
-            best_idx = i
-    return best_idx
-
-
 __all__ = [
     "HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS",
     "MAX_IMAGES_PER_REQUEST",
@@ -382,5 +327,4 @@ __all__ = [
     "build_prompt_tokens",
     "resolve_stop_token_ids",
     "resolve_sys_type",
-    "resolve_target_ratio_idx",
 ]

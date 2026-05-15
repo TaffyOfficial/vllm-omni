@@ -12,7 +12,6 @@ from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     build_prompt_tokens,
     resolve_stop_token_ids,
     resolve_sys_type,
-    resolve_target_ratio_idx,
 )
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniPromptType
@@ -66,13 +65,13 @@ def parse_args():
         "--height",
         type=int,
         default=None,
-        help="Output image height. Defaults to 1024 for text2img; for img2img defaults to the input image height.",
+        help="Output image height. When unset, the AR auto-selects the bucket (1024 for text2img; input-image height for img2img).",
     )
     parser.add_argument(
         "--width",
         type=int,
         default=None,
-        help="Output image width. Defaults to 1024 for text2img; for img2img defaults to the input image width.",
+        help="Output image width. When unset, the AR auto-selects the bucket (1024 for text2img; input-image width for img2img).",
     )
     parser.add_argument("--vae-use-tiling", action="store_true", help="Enable VAE tiling.")
     parser.add_argument(
@@ -238,15 +237,14 @@ def main():
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     ar_stop_token_ids = resolve_stop_token_ids(task=task, bot_task=bot_task, tokenizer=tokenizer)
-    # Honor user-supplied (--height, --width): pin AR's <img_ratio_*> to the
-    # matching bucket so AR KV cache and DiT gen_image_info agree. Only when
-    # BOTH are set; if either is None we leave AR's greedy auto-select alone
-    # (and DiT falls back to its own 1024 default / pre_process_func input-
-    # image-dims behavior for img2img).
+    # Honor user-supplied (--height, --width): forward to the AR sampler so it
+    # can pin <img_ratio_*> to the matching ResolutionGroup bucket (AR's KV
+    # cache then encodes the user-requested aspect, and the DiT decodes at
+    # the same resolution). Only when BOTH are set; if either is None we
+    # leave AR's greedy auto-select alone (and DiT falls back to its own
+    # 1024 default / pre_process_func input-image-dims behavior for img2img).
     user_h, user_w = args.height, args.width
-    target_ratio_idx: int | None = None
-    if args.modality in ("text2img", "img2img") and user_h is not None and user_w is not None:
-        target_ratio_idx = resolve_target_ratio_idx(user_h, user_w)
+    force_ratio = args.modality in ("text2img", "img2img") and user_h is not None and user_w is not None
     for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
             sp.num_inference_steps = args.steps
@@ -261,9 +259,10 @@ def main():
                     sp.width = user_w
         elif hasattr(sp, "stop_token_ids"):
             sp.stop_token_ids = ar_stop_token_ids
-            if target_ratio_idx is not None:
+            if force_ratio:
                 sp.extra_args = sp.extra_args or {}
-                sp.extra_args["target_ratio_idx"] = target_ratio_idx
+                sp.extra_args["target_height"] = user_h
+                sp.extra_args["target_width"] = user_w
 
     print(f"\n{'=' * 60}")
     print("HunyuanImage-3.0 Generation Configuration:")
@@ -286,10 +285,7 @@ def main():
         size_h = user_h if user_h is not None else "auto"
         size_w = user_w if user_w is not None else "auto"
         print(f"  Output size: {size_w}x{size_h}")
-        if target_ratio_idx is not None:
-            print(f"  AR ratio bucket forced: <img_ratio_{target_ratio_idx}>")
-        else:
-            print("  AR ratio: auto (greedy)")
+        print(f"  AR ratio: {'forced from user size' if force_ratio else 'auto (greedy)'}")
     if args.image_path:
         print(f"  Input image: {args.image_path}")
     if additional_config is not None:
