@@ -1593,13 +1593,28 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         # Per-step cache of per-request SamplingParams.extra_args entries,
         # set by ``forward()`` and consumed by the sampler so it can read
-        # ``target_ratio_idx`` (driven by user-specified height/width and
-        # set by online/offline entry points). For generation mode we flip
-        # ``has_sampling_extra_args`` so the runtime actually forwards the
+        # ``target_height`` / ``target_width`` (set by online/offline
+        # entry points from user-supplied size). For generation mode we
+        # flip ``has_sampling_extra_args`` so the runtime forwards the
         # list — see ``vllm_omni/worker/gpu_model_runner.py``.
         self._cur_sampling_extra_args: list[dict] | None = None
+        self._reso_group: HunyuanImage3Processor.ResolutionGroup | None = None
+        self._ratio_idx_to_token_id: list[int] = []
         if not self._is_comprehension:
             self.vllm_config.model_config.has_sampling_extra_args = True
+            from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+                HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS,
+            )
+
+            self._reso_group = HunyuanImage3Processor.ResolutionGroup(
+                base_size=image_base_size,
+                extra_resolutions=[HunyuanImage3Processor.Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
+            )
+            # idx -> AR ratio token id (ratio_0..32 and 33..36 sit in two
+            # non-contiguous tokenizer ranges; convert per-name to handle both).
+            self._ratio_idx_to_token_id = [
+                tokenizer.convert_tokens_to_ids(f"<img_ratio_{i}>") for i in range(len(self._reso_group))
+            ]
 
         self._replace_rotary_embeddings()
         self._patch_moe_blocks()
@@ -1965,8 +1980,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
     ) -> torch.Tensor | IntermediateTensors:
         model_input_ids = None if inputs_embeds is not None else input_ids
         # Stash per-request extra_args so ``sample()`` can read
-        # ``target_ratio_idx`` later in the same step. None when the runtime
-        # didn't forward sampling_extra_args (e.g. comprehension mode).
+        # ``target_height`` / ``target_width`` later in the same step.
+        # None when the runtime didn't forward sampling_extra_args (e.g.
+        # comprehension mode).
         self._cur_sampling_extra_args = kwargs.get("sampling_extra_args")
         model_output = self.model(model_input_ids, positions, intermediate_tensors, inputs_embeds)
         return model_output
@@ -2069,11 +2085,12 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         """Port of official _ConditionalSliceVocabLogitsProcessor.__call__.
 
         After the size token, only allow ratio tokens and pick greedily.
-        When ``SamplingParams.extra_args["target_ratio_idx"]`` is set
-        (online/offline entry points compute it from user height/width
-        via :func:`vllm_omni.diffusion.models.hunyuan_image3.prompt_utils.resolve_target_ratio_idx`),
-        skip the greedy pick and force that specific ratio token so the
-        AR's KV cache matches the DiT's user-requested image_size.
+        When ``SamplingParams.extra_args["target_height"]`` and
+        ``"target_width"`` are set (online/offline entry points stamp them
+        from user-supplied size), resolve the matching bucket via the
+        shared ``HunyuanImage3Processor.ResolutionGroup`` and force that
+        ratio token so the AR's KV cache matches the DiT's user-requested
+        image_size.
         """
         target_token_id = self._resolve_forced_ratio_token(req_idx)
         if target_token_id is not None:
@@ -2100,19 +2117,15 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         if not extra_args_list or req_idx >= len(extra_args_list):
             return None
         ea = extra_args_list[req_idx] or {}
-        target_idx = ea.get("target_ratio_idx")
-        if target_idx is None:
+        target_h = ea.get("target_height")
+        target_w = ea.get("target_width")
+        if target_h is None or target_w is None or target_h <= 0 or target_w <= 0 or self._reso_group is None:
             return None
-        target_token_id = self._start_ratio_id + int(target_idx)
-        if target_token_id not in self._all_ratio_ids:
-            logger.warning(
-                "[HunyuanImage3] target_ratio_idx=%s maps to token id %d, "
-                "outside the supported ratio range; falling back to AR greedy.",
-                target_idx,
-                target_token_id,
-            )
+        # ResolutionGroup.get_base_size_and_ratio_index takes (width, height).
+        _, idx = self._reso_group.get_base_size_and_ratio_index(int(target_w), int(target_h))
+        if idx >= len(self._ratio_idx_to_token_id):
             return None
-        return target_token_id
+        return int(self._ratio_idx_to_token_id[idx])
 
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
