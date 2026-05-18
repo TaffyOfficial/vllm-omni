@@ -503,9 +503,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # Store height/width for applying to diffusion stage sampling params later
                 _image_gen_height = height
                 _image_gen_width = width
-                _image_gen_infer_align_image_size = (
-                    infer_align_image_size if infer_align_image_size_provided else None
-                )
+                _image_gen_infer_align_image_size = infer_align_image_size if infer_align_image_size_provided else None
             except Exception as e:
                 logger.warning("Failed to build image-generation prompt for omni multistage: %s", e)
                 _image_gen_height = None

@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for HunyuanFusedMoE (Support HunyuanImage3 Diffusion Model, 5a779b4)."""
 
-import torch
 import pytest
+import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

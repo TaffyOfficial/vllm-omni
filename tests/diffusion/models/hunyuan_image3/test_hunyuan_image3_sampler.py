@@ -23,7 +23,6 @@ RATIO_OTHER_END = 223
 
 
 class _FakeResolutionGroup:
-
     def get_base_size_and_ratio_index(self, width: int, height: int):
         if (width, height) == (1280, 768):
             return 1024, 4
