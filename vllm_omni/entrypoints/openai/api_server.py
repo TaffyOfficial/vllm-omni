@@ -1660,6 +1660,8 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 extra_body["flow_shift"] = request.flow_shift
             if request.extra_params is not None:
                 extra_body["extra_params"] = request.extra_params
+            if request.infer_align_image_size is not None:
+                extra_body["infer_align_image_size"] = request.infer_align_image_size
             if request.generator_device is not None:
                 extra_body["generator_device"] = request.generator_device
             if request.lora is not None:
@@ -1704,6 +1706,8 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             extra_args["bot_task"] = request.bot_task
         if request.flow_shift is not None:
             extra_args["flow_shift"] = request.flow_shift
+        if request.infer_align_image_size is not None:
+            extra_args["infer_align_image_size"] = request.infer_align_image_size
         if extra_args:
             gen_params.extra_args = extra_args
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
@@ -1729,6 +1733,8 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             # Backward-compatible fallback for processors reading top-level fields.
             prompt["height"] = height
             prompt["width"] = width
+        if request.infer_align_image_size is not None:
+            prompt.setdefault("mm_processor_kwargs", {})["infer_align_image_size"] = request.infer_align_image_size
         app_state_args = getattr(raw_request.app.state, "args", None)
         _check_max_generated_image_size(app_state_args, width, height)
 
@@ -1841,6 +1847,7 @@ async def edit_images(
     guidance_scale: float | None = Form(None),
     strength: float | None = Form(None),
     true_cfg_scale: float | None = Form(None),
+    infer_align_image_size: bool | None = Form(None),
     seed: int | None = Form(None),
     generator_device: str | None = Form(None),
     # vllm-omni extension for per-request LoRA.
@@ -1997,9 +2004,13 @@ async def edit_images(
             # Backward-compatible fallback for processors reading top-level fields.
             prompt["height"] = height
             prompt["width"] = width
+        if infer_align_image_size is not None:
+            prompt.setdefault("mm_processor_kwargs", {})["infer_align_image_size"] = infer_align_image_size
 
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
+        if infer_align_image_size is not None:
+            gen_params.extra_args["infer_align_image_size"] = infer_align_image_size
 
         # 3.4 Add optional parameters ONLY if provided
         _update_if_not_none(gen_params, "num_inference_steps", num_inference_steps)
@@ -2073,6 +2084,8 @@ async def edit_images(
                 extra_body["strength"] = strength
             if true_cfg_scale is not None:
                 extra_body["true_cfg_scale"] = true_cfg_scale
+            if infer_align_image_size is not None:
+                extra_body["infer_align_image_size"] = infer_align_image_size
             if layers is not None:
                 extra_body["layers"] = layers
             if resolution is not None:

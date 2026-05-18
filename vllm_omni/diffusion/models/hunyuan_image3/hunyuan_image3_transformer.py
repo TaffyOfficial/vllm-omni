@@ -591,12 +591,16 @@ class ImageInfo:
         image_token_length: int = None,
         base_size: int = None,
         ratio_index: int = None,
+        ori_image_width: int = None,
+        ori_image_height: int = None,
         **kwargs,
     ):
         self.image_type = image_type
         self.image_tensor = image_tensor
+        self.ori_image_width = ori_image_width
         self.image_width = image_width
         self.w = image_width
+        self.ori_image_height = ori_image_height
         self.image_height = image_height
         self.h = image_height
         self.token_width = token_width
@@ -635,6 +639,7 @@ class ImageInfo:
     def __repr__(self):
         return (
             f"ImageInfo(image_type={self.image_type}, image_tensor={self.image_tensor}, "
+            f"ori_image_width={self.ori_image_width}, ori_image_height={self.ori_image_height}, "
             f"image_width={self.image_width}, image_height={self.image_height}, "
             f"token_width={self.token_width}, token_height={self.token_height}, "
             f"image_token_length={self.image_token_length}, "
@@ -659,6 +664,8 @@ class ImageInfo:
                 # for bc
                 image_height=self.image_height,
                 image_width=self.image_width,
+                ori_image_height=self.ori_image_height,
+                ori_image_width=self.ori_image_width,
             )
         else:
             raise ValueError(f"Unknown image type '{self.image_type}'")

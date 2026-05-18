@@ -420,6 +420,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     extra_body = request.model_extra or {}
 
                 height, width = self._resolve_height_width_from_extra_body(extra_body)
+                infer_align_image_size_provided = "infer_align_image_size" in extra_body
+                infer_align_image_size = bool(extra_body.get("infer_align_image_size", False))
 
                 num_inference_steps = extra_body.get("num_inference_steps")
                 if num_inference_steps is not None:
@@ -466,6 +468,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # detect image-generation requests and apply their own prompt
                 # rewrites (e.g. query-token expansion, placeholder injection).
                 mm_processor_kwargs["modalities"] = ["img2img"] if is_img2img else ["image"]
+                if infer_align_image_size_provided:
+                    mm_processor_kwargs["infer_align_image_size"] = infer_align_image_size
                 tprompt["mm_processor_kwargs"] = mm_processor_kwargs
                 if engine_prompt_image is not None:
                     tprompt["multi_modal_data"] = engine_prompt_image
@@ -499,10 +503,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # Store height/width for applying to diffusion stage sampling params later
                 _image_gen_height = height
                 _image_gen_width = width
+                _image_gen_infer_align_image_size = (
+                    infer_align_image_size if infer_align_image_size_provided else None
+                )
             except Exception as e:
                 logger.warning("Failed to build image-generation prompt for omni multistage: %s", e)
                 _image_gen_height = None
                 _image_gen_width = None
+                _image_gen_infer_align_image_size = None
         elif request.modalities and ("text" in request.modalities) and is_single_stage_diffusion(self.engine_client):
             # Single-stage diffusion text output (img2text / text2text).
             # Build a diffusion-style prompt with modalities=["text"] so the
@@ -531,9 +539,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logger.warning("Failed to build text-output prompt for single-stage diffusion: %s", e)
             _image_gen_height = None
             _image_gen_width = None
+            _image_gen_infer_align_image_size = None
         else:
             _image_gen_height = None
             _image_gen_width = None
+            _image_gen_infer_align_image_size = None
 
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
@@ -560,6 +570,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):
+                    if _image_gen_infer_align_image_size is not None and hasattr(sp, "extra_args"):
+                        if sp.extra_args is None:
+                            sp.extra_args = {}
+                        sp.extra_args["infer_align_image_size"] = _image_gen_infer_align_image_size
                     if hasattr(sp, "height") and _image_gen_height is not None:
                         sp.height = _image_gen_height
                     if hasattr(sp, "width") and _image_gen_width is not None:
@@ -940,6 +954,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             extra_args = dict(getattr(params, "extra_args", {}) or {})
             extra_args["target_h"] = int(height)
             extra_args["target_w"] = int(width)
+            extra_args["target_height"] = int(height)
+            extra_args["target_width"] = int(width)
             params.extra_args = extra_args
 
         return params
@@ -2532,6 +2548,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         lora_body = extra_body.get("lora")
         layers = extra_body.get("layers")
         resolution = extra_body.get("resolution")
+        infer_align_image_size_provided = "infer_align_image_size" in extra_body
+        infer_align_image_size = bool(extra_body.get("infer_align_image_size", False))
         bot_task = extra_body.get("bot_task")
         use_system_prompt = extra_body.get("use_system_prompt") or extra_body.get("sys_type")
         custom_system_prompt = extra_body.get("system_prompt")
@@ -2616,6 +2634,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             mm_processor_kwargs["target_w"] = width
         if seed is not None and engine_prompt_data is not None:
             mm_processor_kwargs["vae_generator_seed"] = int(seed)
+        if infer_align_image_size_provided and engine_prompt_data is not None:
+            mm_processor_kwargs["infer_align_image_size"] = infer_align_image_size
         if mm_processor_kwargs:
             engine_prompt["mm_processor_kwargs"] = mm_processor_kwargs
         if engine_prompt_data is not None:
@@ -2642,6 +2662,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         for idx, stage_cfg in enumerate(stage_configs):
             stage_type = get_stage_type(stage_cfg)
             default_stage_params = sampling_params_list[idx]
+            if infer_align_image_size_provided and hasattr(default_stage_params, "extra_args"):
+                extra_args = getattr(default_stage_params, "extra_args", None)
+                if extra_args is None:
+                    extra_args = {}
+                    default_stage_params.extra_args = extra_args
+                extra_args["infer_align_image_size"] = infer_align_image_size
 
             # AR stop tokens: use stage_type=="llm" instead of comprehension_idx
             # (None for DictConfig where is_comprehension is nested in engine_args).
@@ -2665,6 +2691,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     default_stage_params.extra_args = extra_args
                 extra_args["target_h"] = int(height)
                 extra_args["target_w"] = int(width)
+                extra_args["target_height"] = int(height)
+                extra_args["target_width"] = int(width)
 
             if stage_type == "diffusion":
                 self._set_if_supported(
@@ -2730,6 +2758,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             num_outputs_per_prompt=num_outputs_per_prompt,
             seed=seed,
         )
+        if "infer_align_image_size" in extra_body:
+            gen_params.extra_args["infer_align_image_size"] = bool(extra_body["infer_align_image_size"])
         self._set_if_supported(
             gen_params,
             generator_device=generator_device,
@@ -3105,6 +3135,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 num_outputs_per_prompt=num_outputs_per_prompt,
                 seed=seed,
             )
+            if "infer_align_image_size" in extra_body:
+                gen_params.extra_args["infer_align_image_size"] = bool(extra_body["infer_align_image_size"])
 
             # Only override defaults when the user explicitly provides values
             if num_inference_steps is not None:

@@ -822,6 +822,7 @@ class HunyuanImage3Processor:
     def __init__(self, tokenizer, hf_config, **kwargs: object):
         self.tokenizer = tokenizer
         self.hf_config = hf_config
+        self.infer_align_image_size = bool(kwargs.pop("infer_align_image_size", False))
         # `HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS` mirrors the official
         # `vae_reso_group` extras (image_processor.py:147-152). Build with
         # this processor's inner Resolution class so `data` stays
@@ -909,16 +910,19 @@ class HunyuanImage3Processor:
             current_info["vit_spatial_shapes"] = _ss.squeeze(0)
 
             # VAE: per-image bucket via `reso_group.get_target_size`; mirrors
-            # HF's `resize_and_crop` (crop_type="center", the official
-            # generate_image default with infer_align_image_size=False).
+            # HF's `resize_and_crop` crop_type switch. Official default is
+            # center crop; `infer_align_image_size=True` uses direct resize.
             # Keep fp32 — the VAE encoder casts to model dtype at its
             # boundary (see `_vae_encode`).
             image_width, image_height = self.reso_group.get_target_size(image.width, image.height)
-            resized_image = self._resize_and_crop(image, (image_width, image_height))
+            crop_type = "resize" if self.infer_align_image_size else "center"
+            resized_image = self._resize_and_crop(image, (image_width, image_height), crop_type=crop_type)
             vae_pixel_values = self.vae_processor(resized_image).squeeze(0)
             token_height = image_height // (self.hf_config.vae_downsample_factor[0] * self.hf_config.patch_size)
             token_width = image_width // (self.hf_config.vae_downsample_factor[1] * self.hf_config.patch_size)
 
+            current_info["ori_image_width"] = torch.tensor(image.width, dtype=torch.long)
+            current_info["ori_image_height"] = torch.tensor(image.height, dtype=torch.long)
             current_info["vae_pixel_values_flat"] = vae_pixel_values.reshape(-1)
             current_info["vae_pixel_size"] = torch.tensor(vae_pixel_values.numel(), dtype=torch.long)
             current_info["vae_token_grid_hw"] = torch.tensor([token_height, token_width])
@@ -942,6 +946,8 @@ class HunyuanImage3Processor:
             "vae_pixel_size",
             "base_size",
             "ratio_index",
+            "ori_image_width",
+            "ori_image_height",
         ]
         for key in same_shape_keys:
             final_image_info[key] = torch.stack([d[key] for d in batch_data], dim=0)
@@ -959,13 +965,8 @@ class HunyuanImage3Processor:
         self,
         image: Image.Image,
         target_size: tuple[int, int],
-        crop_type: str = "resize",
+        crop_type: str = "center",
     ) -> Image.Image:
-        # Default mode mirrors the official `infer_align_image_size=True`
-        # path (image_processor.py:355 → crop_type="resize") used by the
-        # IT2I demo: stretch the cond image to the bucket dims so its
-        # `<img_ratio_*>` tag and ViT/VAE features stay aligned with the
-        # bucket, instead of dropping content via center crop.
         tw, th = target_size
         if crop_type == "resize":
             return image.resize((tw, th), resample=Image.Resampling.LANCZOS)
@@ -1085,6 +1086,10 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
             config["ratio_index"] = MultiModalFieldConfig.batched("image")
         if "vae_generator_seed" in hf_inputs:
             config["vae_generator_seed"] = MultiModalFieldConfig.batched("image")
+        if "ori_image_width" in hf_inputs:
+            config["ori_image_width"] = MultiModalFieldConfig.batched("image")
+        if "ori_image_height" in hf_inputs:
+            config["ori_image_height"] = MultiModalFieldConfig.batched("image")
         return config
 
     def _get_prompt_updates(

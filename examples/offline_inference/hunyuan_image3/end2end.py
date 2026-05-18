@@ -73,6 +73,11 @@ def parse_args():
         default=None,
         help="Output image width. When unset, the AR auto-selects the bucket (1024 for text2img; input-image width for img2img).",
     )
+    parser.add_argument(
+        "--infer-align-image-size",
+        action="store_true",
+        help="Match HF infer_align_image_size=True: resize condition images and align output size to input image ratio.",
+    )
     parser.add_argument("--vae-use-tiling", action="store_true", help="Enable VAE tiling.")
     parser.add_argument(
         "--bot-task",
@@ -225,6 +230,9 @@ def main():
             prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
             prompt_dict["height"] = input_images[0].height
             prompt_dict["width"] = input_images[0].width
+            prompt_dict["mm_processor_kwargs"] = {
+                "infer_align_image_size": args.infer_align_image_size,
+            }
         elif args.modality == "img2text":
             prompt_dict["modalities"] = ["text"]
             prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
@@ -257,10 +265,12 @@ def main():
                     sp.height = user_h
                 if user_w is not None:
                     sp.width = user_w
+                sp.extra_args["infer_align_image_size"] = args.infer_align_image_size
         elif hasattr(sp, "stop_token_ids"):
             sp.stop_token_ids = ar_stop_token_ids
+            sp.extra_args = sp.extra_args or {}
+            sp.extra_args["infer_align_image_size"] = args.infer_align_image_size
             if force_ratio:
-                sp.extra_args = sp.extra_args or {}
                 sp.extra_args["target_height"] = user_h
                 sp.extra_args["target_width"] = user_w
 
@@ -286,6 +296,7 @@ def main():
         size_w = user_w if user_w is not None else "auto"
         print(f"  Output size: {size_w}x{size_h}")
         print(f"  AR ratio: {'forced from user size' if force_ratio else 'auto (greedy)'}")
+        print(f"  infer_align_image_size: {args.infer_align_image_size}")
     if args.image_path:
         print(f"  Input image: {args.image_path}")
     if additional_config is not None:
