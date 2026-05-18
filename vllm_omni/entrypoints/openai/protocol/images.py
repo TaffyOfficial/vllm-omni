@@ -117,6 +117,14 @@ class ImageGenerationRequest(BaseModel):
         le=20.0,
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
+    infer_align_image_size: bool | None = Field(
+        default=None,
+        description=(
+            "HunyuanImage3 img2img alignment flag. When true, condition images "
+            "are resized instead of center-cropped and outputs may be resized "
+            "back to the input image aspect ratio."
+        ),
+    )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
     generator_device: str | None = Field(
         default=None,

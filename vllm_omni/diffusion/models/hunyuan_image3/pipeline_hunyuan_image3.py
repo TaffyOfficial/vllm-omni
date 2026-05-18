@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+import math
 from collections.abc import Iterable
 from typing import Any
 
@@ -127,6 +128,10 @@ def _resize_and_crop_center(image: PILImage.Image, target_width: int, target_hei
     return resized.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
 
 
+def _resize_to_target(image: PILImage.Image, target_width: int, target_height: int) -> PILImage.Image:
+    return image.resize((target_width, target_height), PILImage.Resampling.LANCZOS)
+
+
 def _to_python_scalar(value: Any) -> Any:
     if isinstance(value, np.generic):
         return value.item()
@@ -144,6 +149,8 @@ def _image_info_to_payload(image_info: ImageInfo) -> dict[str, Any]:
         "image_token_length": _to_python_scalar(image_info.image_token_length),
         "base_size": _to_python_scalar(image_info.base_size),
         "ratio_index": _to_python_scalar(image_info.ratio_index),
+        "ori_image_width": _to_python_scalar(image_info.ori_image_width),
+        "ori_image_height": _to_python_scalar(image_info.ori_image_height),
         "add_timestep_token": image_info.add_timestep_token,
         "add_guidance_token": image_info.add_guidance_token,
         "use_front_boi_token": image_info.use_front_boi_token,
@@ -170,6 +177,8 @@ def _image_info_from_payload(payload: dict[str, Any]) -> ImageInfo:
         image_token_length=payload.get("image_token_length"),
         base_size=payload.get("base_size"),
         ratio_index=payload.get("ratio_index"),
+        ori_image_width=payload.get("ori_image_width"),
+        ori_image_height=payload.get("ori_image_height"),
         add_timestep_token=payload.get("add_timestep_token", True),
         add_guidance_token=payload.get("add_guidance_token", False),
         use_front_boi_token=payload.get("use_front_boi_token", True),
@@ -204,6 +213,62 @@ def _joint_image_info_from_payload(payload: Any) -> JointImageInfo:
     )
 
 
+def _postprocess_infer_aligned_outputs(
+    outputs: list[PILImage.Image],
+    batch_cond_image_info: list[list[JointImageInfo]] | None,
+    image_processor: HunyuanImage3ImageProcessor,
+) -> list[PILImage.Image]:
+    if not batch_cond_image_info:
+        return outputs
+
+    target_area = image_processor.reso_group.base_size**2
+    for batch_index, (output_image, cond_images) in enumerate(zip(outputs, batch_cond_image_info)):
+        if not cond_images:
+            continue
+        output_ratio_index = image_processor.reso_group.get_base_size_and_ratio_index(
+            width=output_image.width,
+            height=output_image.height,
+        )[1]
+        cond_ratio_indices: list[int] = []
+        cond_ori_widths: list[int | None] = []
+        cond_ori_heights: list[int | None] = []
+        for cond_image in cond_images:
+            vae_info = cond_image.vae_image_info
+            cond_ratio_indices.append(vae_info.ratio_index)
+            cond_ori_widths.append(vae_info.ori_image_width)
+            cond_ori_heights.append(vae_info.ori_image_height)
+
+        if len(cond_images) == 1:
+            ratio_index = cond_ratio_indices[0]
+            ori_width = cond_ori_widths[0]
+            ori_height = cond_ori_heights[0]
+            if (
+                output_ratio_index == ratio_index
+                and ori_width is not None
+                and ori_height is not None
+                and abs(ori_height / ori_width - image_processor.reso_group[output_ratio_index].ratio) >= 0.01
+            ):
+                scale = math.sqrt(target_area / (ori_width * ori_height))
+                new_w = round(ori_width * scale)
+                new_h = round(ori_height * scale)
+                outputs[batch_index] = output_image.resize((new_w, new_h), resample=PILImage.Resampling.LANCZOS)
+        else:
+            for ratio_index, ori_width, ori_height in zip(cond_ratio_indices, cond_ori_widths, cond_ori_heights):
+                if (
+                    output_ratio_index == ratio_index
+                    and ori_width is not None
+                    and ori_height is not None
+                    and abs(ori_height / ori_width - image_processor.reso_group[output_ratio_index].ratio) >= 0.01
+                ):
+                    scale = math.sqrt(target_area / (ori_width * ori_height))
+                    new_w = round(ori_width * scale)
+                    new_h = round(ori_height * scale)
+                    outputs[batch_index] = output_image.resize((new_w, new_h), resample=PILImage.Resampling.LANCZOS)
+                    break
+
+    return outputs
+
+
 def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
     hf_config = get_config(od_config.model, trust_remote_code=True)
     image_processor = HunyuanImage3ImageProcessor(hf_config)
@@ -213,16 +278,19 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
     if isinstance(vit_patch_size, tuple | list):
         vit_patch_size = int(vit_patch_size[0])
 
-    def _build_cond_joint_image(raw_image: Any) -> dict[str, Any]:
+    def _build_cond_joint_image(raw_image: Any, infer_align_image_size: bool) -> dict[str, Any]:
         pil_image = _to_pil_image(raw_image).convert("RGB")
         orig_width, orig_height = pil_image.size
 
         target_width, target_height = image_processor.reso_group.get_target_size(orig_width, orig_height)
         target_width = int(target_width)
         target_height = int(target_height)
-        vae_input = _resize_and_crop_center(pil_image, target_width, target_height)
+        if infer_align_image_size:
+            vae_input = _resize_to_target(pil_image, target_width, target_height)
+        else:
+            vae_input = _resize_and_crop_center(pil_image, target_width, target_height)
         vae_tensor = image_processor.vae_processor(vae_input)
-        base_size, ratio_idx = image_processor.reso_group.get_base_size_and_ratio_index(orig_width, orig_height)
+        base_size, ratio_idx = image_processor.reso_group.get_base_size_and_ratio_index(target_width, target_height)
         base_size = int(base_size)
         ratio_idx = int(ratio_idx)
 
@@ -235,6 +303,8 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
             token_height=target_height // vae_h_factor,
             base_size=base_size,
             ratio_index=ratio_idx,
+            ori_image_width=orig_width,
+            ori_image_height=orig_height,
         )
 
         vit_inputs = image_processor.vision_encoder_processor(pil_image, return_tensors="pt")
@@ -252,6 +322,8 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
             token_width=vit_token_w,
             token_height=vit_token_h,
             image_token_length=int(vit_tensor.shape[1]),
+            ori_image_width=orig_width,
+            ori_image_height=orig_height,
         )
 
         return _joint_image_info_to_payload(
@@ -266,6 +338,8 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
         )
 
     def pre_process_func(request: OmniDiffusionRequest):
+        extra_args = getattr(getattr(request, "sampling_params", None), "extra_args", {}) or {}
+        infer_align_image_size = bool(extra_args.get("infer_align_image_size", False))
         for i, prompt in enumerate(request.prompts):
             if isinstance(prompt, str):
                 prompt = OmniTextPrompt(prompt=prompt)
@@ -280,7 +354,10 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
             has_images = raw_images is not None and (not isinstance(raw_images, list) or len(raw_images) > 0)
             if has_images:
                 image_list = raw_images if isinstance(raw_images, list) else [raw_images]
-                cond_image_infos = [_build_cond_joint_image(image) for image in image_list]
+                cond_image_infos = [
+                    _build_cond_joint_image(image, infer_align_image_size=infer_align_image_size)
+                    for image in image_list
+                ]
                 prompt["additional_information"]["batch_cond_image_info"] = cond_image_infos
 
                 bridge_h = prompt.get("height") if isinstance(prompt, dict) else None
@@ -304,6 +381,8 @@ class HunyuanImage3Pipeline(
     SupportImageInput,
     DiffusionPipelineProfilerMixin,
 ):
+    EXTRA_BODY_PARAMS = frozenset({"infer_align_image_size"})
+
     support_image_input = True
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -1409,6 +1488,7 @@ class HunyuanImage3Pipeline(
         generator = req.sampling_params.generator or generator
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
+        infer_align_image_size = bool(extra_args.get("infer_align_image_size", False))
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
@@ -1434,6 +1514,12 @@ class HunyuanImage3Pipeline(
         model_inputs.update(ar_kv_kwargs)
 
         outputs = self._generate(**model_inputs, **kwargs)
+        if infer_align_image_size:
+            outputs = _postprocess_infer_aligned_outputs(
+                outputs,
+                batch_cond_image_info=batch_cond_image_info,
+                image_processor=self.image_processor,
+            )
         custom_output = {}
         if any(t is not None for t in cot_text_list):
             custom_output["ar_generated_text"] = cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list

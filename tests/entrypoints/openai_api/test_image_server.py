@@ -906,6 +906,7 @@ def test_parameter_validation():
     assert req.size is None  # Engine will use model defaults
     assert req.num_inference_steps is None  # Engine will use model defaults
     assert req.true_cfg_scale is None  # Engine will use model defaults
+    assert req.infer_align_image_size is None  # Only explicit values are forwarded
 
     # Invalid num_inference_steps (out of range)
     with pytest.raises(ValueError):
@@ -952,6 +953,37 @@ def test_parameters_passed_through(test_client, mock_async_diffusion):
     assert captured.guidance_scale == 7.5
     assert captured.true_cfg_scale == 3.0
     assert captured.seed == 42
+
+
+def test_image_generation_forwards_explicit_infer_align_image_size(test_client, mock_async_diffusion):
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "test",
+            "infer_align_image_size": False,
+        },
+    )
+    assert response.status_code == 200
+
+    captured_prompt = mock_async_diffusion.captured_prompt
+    captured_params = mock_async_diffusion.captured_sampling_params_list[0]
+    assert captured_prompt["mm_processor_kwargs"]["infer_align_image_size"] is False
+    assert captured_params.extra_args["infer_align_image_size"] is False
+
+
+def test_image_generation_omits_infer_align_image_size_by_default(test_client, mock_async_diffusion):
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "test",
+        },
+    )
+    assert response.status_code == 200
+
+    captured_prompt = mock_async_diffusion.captured_prompt
+    captured_params = mock_async_diffusion.captured_sampling_params_list[0]
+    assert "mm_processor_kwargs" not in captured_prompt
+    assert "infer_align_image_size" not in captured_params.extra_args
 
 
 def test_model_field_omitted_works(test_client):
@@ -1569,6 +1601,26 @@ def test_image_edit_with_seed_zero_single_stage(test_client):
         f"Expected seed=0, but got seed={captured_sampling_params.seed}. "
         "This indicates the bug where seed=0 is treated as falsy."
     )
+
+
+def test_image_edit_forwards_explicit_infer_align_image_size(async_omni_test_client):
+    img_bytes = make_test_image_bytes((16, 16))
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "edit this image",
+            "infer_align_image_size": "false",
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    engine = async_omni_test_client.app.state.engine_client
+    captured_prompt = engine.captured_prompt
+    captured_params = engine.captured_sampling_params_list[-1]
+    assert captured_prompt["mm_processor_kwargs"]["infer_align_image_size"] is False
+    assert captured_params.extra_args["infer_align_image_size"] is False
 
 
 def test_normalize_image():
