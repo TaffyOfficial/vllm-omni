@@ -57,7 +57,10 @@ class ExecuteModelState(NamedTuple):
     spec_decode_metadata: Any
     spec_decode_common_attn_metadata: Any
     hidden_states: torch.Tensor
-    hidden_states_cpu: torch.Tensor | None
+    hidden_states_cpu_staging: HiddenStatesCPUStaging | None
+    prefix_cache_slot_mapping_cpu: torch.Tensor | None
+    num_tokens_unpadded: int
+    num_tokens_padded: int
     sample_hidden_states: torch.Tensor
     aux_hidden_states: list[torch.Tensor] | None
     ec_connector_output: Any
@@ -66,6 +69,25 @@ class ExecuteModelState(NamedTuple):
     multimodal_outputs: Any
     # slot_mappings for attention/drafter (aligned with upstream v1 API)
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
+
+
+class HiddenStatesCPUStaging(NamedTuple):
+    """CPU staging tensor for a hidden-state slice.
+
+    `ready_event` is set only for asynchronous CUDA->CPU copies. Consumers must
+    synchronize it before reading `tensor`.
+    """
+
+    tensor: torch.Tensor
+    ready_event: Any | None
+
+
+class ClaimedHiddenStatesCPUStagingBuffer(NamedTuple):
+    """Reusable CPU staging buffer selected from the runner-owned pool."""
+
+    key: tuple[tuple[int, ...], torch.dtype]
+    index: int
+    tensor: torch.Tensor
 
 
 class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
@@ -96,6 +118,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 kv_transfer_manager=self.kv_transfer_manager,
             )
         self._downstream_payload_cache: dict[str, bool] = {}
+        self._prefix_cache_staging_buffers: dict[
+            tuple[tuple[int, ...], torch.dtype],
+            list[HiddenStatesCPUStaging],
+        ] = {}
+        self._prefix_cache_staging_next_index: dict[tuple[tuple[int, ...], torch.dtype], int] = {}
+        self._prefix_cache_staging_buffer_count = 2
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -258,10 +286,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         multimodal_outputs: dict,
         num_tokens_unpadded: int,
         num_tokens_padded: int,
+        slot_mapping_cpu: torch.Tensor | None = None,
     ):
         """If prefix caching is enabled and it's the last pipeline parallelism rank,
         retrieve the hidden states & multimodal outputs from the prefix cache based
         on our batch slot mappings.
+
+        Args:
+            slot_mapping_cpu: Optional CPU snapshot of the slot mapping captured
+                before runner state bookkeeping mutates `self.input_batch`. When
+                omitted, this method keeps the legacy behavior and reads the
+                current slot mapping from `self.input_batch`.
         """
         # Cache hidden states if we've enabled hidden state prefix caching
         # unless this isn't the last pipeline parallelism rank.
@@ -278,10 +313,105 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 hidden_states=hidden_states,
                 multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
-                slot_mapping=self.input_batch.block_table[0].slot_mapping.cpu,
+                slot_mapping=slot_mapping_cpu
+                if slot_mapping_cpu is not None
+                else self.input_batch.block_table[0].slot_mapping.cpu,
                 num_tokens_padded=num_tokens_padded,
                 hidden_states_cpu=hidden_states_cpu,
             )
+
+    def _stage_hidden_states_cpu(
+        self,
+        hidden_states: torch.Tensor,
+        num_tokens_unpadded: int,
+    ) -> HiddenStatesCPUStaging | None:
+        """Start the per-step hidden-state CPU staging copy for prefix cache.
+
+        The returned tensor covers `hidden_states[:num_tokens_unpadded]`. CUDA
+        sources use a pinned CPU buffer from the runner pool and a ready event;
+        CPU or non-async paths return a ready contiguous CPU tensor directly.
+        """
+        if self.omni_prefix_cache is None or not get_pp_group().is_last_rank:
+            return None
+
+        src = hidden_states[:num_tokens_unpadded].detach()
+        copy_stream = getattr(self, "async_output_copy_stream", None)
+        if copy_stream is None or src.device.type != "cuda":
+            return HiddenStatesCPUStaging(src.to("cpu").contiguous(), None)
+
+        try:
+            claimed_buffer = self._claim_hidden_states_cpu_staging_buffer(src)
+            current_stream = torch.cuda.current_stream(src.device)
+            copy_stream.wait_stream(current_stream)
+            with torch.cuda.stream(copy_stream):
+                claimed_buffer.tensor.copy_(src, non_blocking=True)
+                ready_event = torch.cuda.Event()
+                ready_event.record(copy_stream)
+            staging = HiddenStatesCPUStaging(claimed_buffer.tensor, ready_event)
+            self._prefix_cache_staging_buffers[claimed_buffer.key][claimed_buffer.index] = staging
+            return staging
+        except RuntimeError as e:
+            logger.warning_once(
+                "Falling back to synchronous hidden-state CPU staging for prefix cache: %s",
+                e,
+            )
+            return HiddenStatesCPUStaging(src.to("cpu").contiguous(), None)
+
+    def _claim_hidden_states_cpu_staging_buffer(
+        self,
+        src: torch.Tensor,
+    ) -> ClaimedHiddenStatesCPUStagingBuffer:
+        key = (tuple(src.shape), src.dtype)
+        buffers = self._prefix_cache_staging_buffers.get(key)
+        if buffers is None:
+            buffers = [
+                HiddenStatesCPUStaging(
+                    torch.empty(
+                        src.shape,
+                        dtype=src.dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    ),
+                    None,
+                )
+                for _ in range(self._prefix_cache_staging_buffer_count)
+            ]
+            self._prefix_cache_staging_buffers[key] = buffers
+            self._prefix_cache_staging_next_index[key] = 0
+
+        start_index = self._prefix_cache_staging_next_index.get(key, 0)
+        selected_index = start_index
+        for offset in range(len(buffers)):
+            index = (start_index + offset) % len(buffers)
+            ready_event = buffers[index].ready_event
+            if ready_event is None or ready_event.query():
+                selected_index = index
+                break
+        else:
+            # All reusable buffers are still being copied into. Waiting here is
+            # cheaper than allocating pinned memory every decode step and keeps
+            # returned buffers from being overwritten mid-copy.
+            ready_event = buffers[start_index].ready_event
+            if ready_event is not None:
+                ready_event.synchronize()
+            selected_index = start_index
+
+        self._prefix_cache_staging_next_index[key] = (selected_index + 1) % len(buffers)
+        return ClaimedHiddenStatesCPUStagingBuffer(
+            key=key,
+            index=selected_index,
+            tensor=buffers[selected_index].tensor,
+        )
+
+    @staticmethod
+    def _resolve_hidden_states_cpu_staging(
+        hidden_states_cpu_staging: HiddenStatesCPUStaging | None,
+    ) -> torch.Tensor | None:
+        if hidden_states_cpu_staging is None:
+            return None
+        if hidden_states_cpu_staging.ready_event is not None:
+            hidden_states_cpu_staging.ready_event.synchronize()
+        return hidden_states_cpu_staging.tensor
 
     def _maybe_get_combined_prefix_cache_tensors(
         self,
@@ -608,18 +738,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 aux_hidden_states = None
 
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
-            hidden_states_cpu = None
-            if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
-                hidden_states_cpu = hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
-
-            # Cache hidden states & multimodal outputs if we've enabled hidden state
-            # prefix caching unless this isn't the last pipeline parallelism rank.
-            self._maybe_update_prefix_cache(
-                hidden_states=hidden_states,
-                hidden_states_cpu=hidden_states_cpu,
-                multimodal_outputs=multimodal_outputs,
-                num_tokens_unpadded=num_tokens_unpadded,
-                num_tokens_padded=num_tokens_padded,
+            hidden_states_cpu_staging = self._stage_hidden_states_cpu(
+                hidden_states,
+                num_tokens_unpadded,
+            )
+            prefix_cache_slot_mapping_cpu = (
+                self.input_batch.block_table[0].slot_mapping.cpu
+                if self.omni_prefix_cache is not None and get_pp_group().is_last_rank
+                else None
             )
 
             if not self.broadcast_pp_output:
@@ -632,6 +758,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     return hidden_states
 
                 if self.is_pooling_model:
+                    hidden_states_cpu = self._resolve_hidden_states_cpu_staging(
+                        hidden_states_cpu_staging,
+                    )
+                    self._maybe_update_prefix_cache(
+                        hidden_states=hidden_states,
+                        hidden_states_cpu=hidden_states_cpu,
+                        multimodal_outputs=multimodal_outputs,
+                        num_tokens_unpadded=num_tokens_unpadded,
+                        num_tokens_padded=num_tokens_padded,
+                        slot_mapping_cpu=prefix_cache_slot_mapping_cpu,
+                    )
                     # Return the pooling output.
                     return self._pool(
                         hidden_states,
@@ -688,7 +825,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
-            hidden_states_cpu,
+            hidden_states_cpu_staging,
+            prefix_cache_slot_mapping_cpu,
+            num_tokens_unpadded,
+            num_tokens_padded,
             sample_hidden_states,
             aux_hidden_states,
             ec_connector_output,
@@ -799,7 +939,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
-            staged_hidden_states_cpu,
+            hidden_states_cpu_staging,
+            prefix_cache_slot_mapping_cpu,
+            num_tokens_unpadded,
+            num_tokens_padded,
             sample_hidden_states,
             aux_hidden_states,
             ec_connector_output,
@@ -942,6 +1085,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 dtype=np.int32,
             )
         query_start_loc_cpu = self.query_start_loc.cpu
+        prefix_hidden_states_cpu = self._resolve_hidden_states_cpu_staging(
+            hidden_states_cpu_staging,
+        )
+        self._maybe_update_prefix_cache(
+            hidden_states=hidden_states,
+            hidden_states_cpu=prefix_hidden_states_cpu,
+            multimodal_outputs=multimodal_outputs,
+            num_tokens_unpadded=num_tokens_unpadded,
+            num_tokens_padded=num_tokens_padded,
+            slot_mapping_cpu=prefix_cache_slot_mapping_cpu,
+        )
 
         pooler_output: list[dict[str, object]] | None = None
         if needs_pooler_payload:
@@ -953,7 +1107,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     combined_multimodal_outputs,
                 ) = self._maybe_get_combined_prefix_cache_tensors(
                     hidden_states,
-                    staged_hidden_states_cpu,
+                    prefix_hidden_states_cpu,
                     multimodal_outputs,
                     scheduler_output.num_scheduled_tokens,
                 )
@@ -1000,6 +1154,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         start,
                         end,
                     )
+                if self.omni_prefix_cache is not None:
+                    # Prefix-cache merged tensors may alias the reusable CPU
+                    # staging buffer. Clone before returning them outside this
+                    # runner step so the next copy cannot mutate payload data.
+                    req_hidden_states = req_hidden_states.clone()
                 payload: dict[str, object] = {"hidden": req_hidden_states}
 
                 mm_payload: dict[str, object] = {}
