@@ -107,30 +107,6 @@ def _to_pil_image(image: Any) -> PILImage.Image:
     raise TypeError(f"Unsupported image input type: {type(image)}")
 
 
-def _resize_and_crop_center(image: PILImage.Image, target_width: int, target_height: int) -> PILImage.Image:
-    # Mirrors HunyuanImage3Processor._resize_and_crop in
-    # vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 so the AR
-    # and DiT stages preprocess condition images identically.
-    tw, th = target_width, target_height
-    w, h = image.size
-    tr = th / tw
-    r = h / w
-    if r < tr:
-        resize_height = th
-        resize_width = int(round(th / h * w))
-    else:
-        resize_width = tw
-        resize_height = int(round(tw / w * h))
-    resized = image.resize((resize_width, resize_height), PILImage.Resampling.LANCZOS)
-    crop_top = int(round((resize_height - th) / 2.0))
-    crop_left = int(round((resize_width - tw) / 2.0))
-    return resized.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
-
-
-def _resize_to_target(image: PILImage.Image, target_width: int, target_height: int) -> PILImage.Image:
-    return image.resize((target_width, target_height), PILImage.Resampling.LANCZOS)
-
-
 def _to_python_scalar(value: Any) -> Any:
     if isinstance(value, np.generic):
         return value.item()
@@ -217,6 +193,14 @@ def _postprocess_infer_aligned_outputs(
     batch_cond_image_info: list[list[JointImageInfo]] | None,
     image_processor: HunyuanImage3ImageProcessor,
 ) -> list[PILImage.Image]:
+    """Match official infer_align_image_size output-size alignment.
+
+    The DiT output is generated at a bucket size. For infer-align mode, HF
+    postprocesses a matching single image back to the original input-image
+    ratio while preserving approximately ``base_size ** 2`` area. With
+    multiple condition images, use the first condition whose bucket matches
+    the generated output bucket; otherwise keep the bucket-sized output.
+    """
     if not batch_cond_image_info:
         return outputs
 
@@ -284,10 +268,8 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
         target_width, target_height = image_processor.reso_group.get_target_size(orig_width, orig_height)
         target_width = int(target_width)
         target_height = int(target_height)
-        if infer_align_image_size:
-            vae_input = _resize_to_target(pil_image, target_width, target_height)
-        else:
-            vae_input = _resize_and_crop_center(pil_image, target_width, target_height)
+        crop_type = "resize" if infer_align_image_size else "center"
+        vae_input = image_processor._resize_and_crop(pil_image, (target_width, target_height), crop_type=crop_type)
         vae_tensor = image_processor.vae_processor(vae_input)
         base_size, ratio_idx = image_processor.reso_group.get_base_size_and_ratio_index(target_width, target_height)
         base_size = int(base_size)

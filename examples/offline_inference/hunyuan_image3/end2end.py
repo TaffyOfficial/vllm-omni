@@ -245,14 +245,16 @@ def main():
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     ar_stop_token_ids = resolve_stop_token_ids(task=task, bot_task=bot_task, tokenizer=tokenizer)
-    # Honor user-supplied (--height, --width): forward to the AR sampler so it
-    # can pin <img_ratio_*> to the matching ResolutionGroup bucket (AR's KV
-    # cache then encodes the user-requested aspect, and the DiT decodes at
-    # the same resolution). Only when BOTH are set; if either is None we
-    # leave AR's greedy auto-select alone (and DiT falls back to its own
-    # 1024 default / pre_process_func input-image-dims behavior for img2img).
+    # Honor user-supplied (--height, --width): DiT receives the concrete
+    # output size, while AR only needs the matching <img_ratio_*> token.
+    # Only pin that ratio token when BOTH dimensions are set; if either is
+    # None, leave AR's greedy auto-select alone (and DiT falls back to its
+    # own 1024 default / pre_process_func input-image-dims behavior for
+    # img2img).
     user_h, user_w = args.height, args.width
-    force_ratio = args.modality in ("text2img", "img2img") and user_h is not None and user_w is not None
+    force_ratio_token_from_user_size = (
+        args.modality in ("text2img", "img2img") and user_h is not None and user_w is not None
+    )
     for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
             sp.num_inference_steps = args.steps
@@ -270,7 +272,7 @@ def main():
             sp.stop_token_ids = ar_stop_token_ids
             sp.extra_args = sp.extra_args or {}
             sp.extra_args["infer_align_image_size"] = args.infer_align_image_size
-            if force_ratio:
+            if force_ratio_token_from_user_size:
                 sp.extra_args["target_height"] = user_h
                 sp.extra_args["target_width"] = user_w
 
@@ -295,7 +297,7 @@ def main():
         size_h = user_h if user_h is not None else "auto"
         size_w = user_w if user_w is not None else "auto"
         print(f"  Output size: {size_w}x{size_h}")
-        print(f"  AR ratio: {'forced from user size' if force_ratio else 'auto (greedy)'}")
+        print(f"  AR ratio token: {'forced from user size' if force_ratio_token_from_user_size else 'auto (greedy)'}")
         print(f"  infer_align_image_size: {args.infer_align_image_size}")
     if args.image_path:
         print(f"  Input image: {args.image_path}")
