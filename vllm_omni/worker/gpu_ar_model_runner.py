@@ -57,6 +57,7 @@ class ExecuteModelState(NamedTuple):
     spec_decode_metadata: Any
     spec_decode_common_attn_metadata: Any
     hidden_states: torch.Tensor
+    hidden_states_cpu: torch.Tensor | None
     sample_hidden_states: torch.Tensor
     aux_hidden_states: list[torch.Tensor] | None
     ec_connector_output: Any
@@ -253,6 +254,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     def _maybe_update_prefix_cache(
         self,
         hidden_states: torch.Tensor,
+        hidden_states_cpu: torch.Tensor | None,
         multimodal_outputs: dict,
         num_tokens_unpadded: int,
         num_tokens_padded: int,
@@ -278,11 +280,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 num_tokens_unpadded=num_tokens_unpadded,
                 slot_mapping=self.input_batch.block_table[0].slot_mapping.cpu,
                 num_tokens_padded=num_tokens_padded,
+                hidden_states_cpu=hidden_states_cpu,
             )
 
     def _maybe_get_combined_prefix_cache_tensors(
         self,
         hidden_states: torch.Tensor,
+        hidden_states_cpu: torch.Tensor | None,
         multimodal_outputs: dict,
         num_scheduled_tokens: dict[str, int],
     ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
@@ -297,6 +301,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 query_start_loc=self.query_start_loc.cpu,
                 input_batch=self.input_batch,
                 hidden_states=hidden_states,
+                hidden_states_cpu=hidden_states_cpu,
                 num_scheduled_tokens=num_scheduled_tokens,
             )
             combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
@@ -603,11 +608,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 aux_hidden_states = None
 
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
+            hidden_states_cpu = None
+            if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
+                hidden_states_cpu = hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
 
             # Cache hidden states & multimodal outputs if we've enabled hidden state
             # prefix caching unless this isn't the last pipeline parallelism rank.
             self._maybe_update_prefix_cache(
                 hidden_states=hidden_states,
+                hidden_states_cpu=hidden_states_cpu,
                 multimodal_outputs=multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
@@ -679,6 +688,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
+            hidden_states_cpu,
             sample_hidden_states,
             aux_hidden_states,
             ec_connector_output,
@@ -789,6 +799,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
+            staged_hidden_states_cpu,
             sample_hidden_states,
             aux_hidden_states,
             ec_connector_output,
@@ -914,7 +925,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         downstream_req_id_set = set(downstream_req_ids)
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
-        if needs_pooler_payload:
+        if needs_pooler_payload and self.omni_prefix_cache is None:
             num_valid_tokens = min(
                 int(scheduler_output.total_num_scheduled_tokens),
                 int(hidden_states.shape[0]),
@@ -942,6 +953,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     combined_multimodal_outputs,
                 ) = self._maybe_get_combined_prefix_cache_tensors(
                     hidden_states,
+                    staged_hidden_states_cpu,
                     multimodal_outputs,
                     scheduler_output.num_scheduled_tokens,
                 )

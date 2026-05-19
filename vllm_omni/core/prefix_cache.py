@@ -94,6 +94,30 @@ class OmniTensorPrefixCache:
         """Convert GPU tensors -> contiguous CPU tensors if needed."""
         return maybe_gpu_tensor.detach().cpu().contiguous()
 
+    @staticmethod
+    def _resolve_hidden_states_cpu(
+        hidden_states: torch.Tensor,
+        num_tokens: int,
+        hidden_states_cpu: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if hidden_states_cpu is None:
+            return OmniTensorPrefixCache._coerce_to_cpu_tensor(hidden_states[:num_tokens])
+        if hidden_states_cpu.device.type != "cpu":
+            raise RuntimeError("hidden_states_cpu must be a CPU tensor.")
+        if not hidden_states_cpu.is_contiguous():
+            raise RuntimeError("hidden_states_cpu must be contiguous.")
+        if hidden_states_cpu.shape[1:] != hidden_states.shape[1:]:
+            raise RuntimeError(
+                "hidden_states_cpu has an incompatible feature shape: "
+                f"got {tuple(hidden_states_cpu.shape[1:])}, expected {tuple(hidden_states.shape[1:])}."
+            )
+        if hidden_states_cpu.shape[0] < num_tokens:
+            raise RuntimeError(
+                "hidden_states_cpu does not cover the requested hidden states "
+                f"slice: got {hidden_states_cpu.shape[0]} tokens, need {num_tokens}."
+            )
+        return hidden_states_cpu[:num_tokens]
+
     def update_omni_tensor_prefix_cache(
         self,
         hidden_states: torch.Tensor | None,
@@ -101,6 +125,7 @@ class OmniTensorPrefixCache:
         num_tokens_unpadded: int,
         slot_mapping: torch.Tensor,
         num_tokens_padded: int | None = None,
+        hidden_states_cpu: torch.Tensor | None = None,
     ):
         """Updates the hidden cache state for the provided hidden states and multimodal outputs.
 
@@ -117,9 +142,11 @@ class OmniTensorPrefixCache:
 
         if hidden_states is not None:
             # Slice to unpadded portion before caching
-            hidden_states = hidden_states[:num_tokens_unpadded]
-            # Ensure that hidden states are on the CPU
-            hidden_states = OmniTensorPrefixCache._coerce_to_cpu_tensor(hidden_states)
+            hidden_states = OmniTensorPrefixCache._resolve_hidden_states_cpu(
+                hidden_states,
+                num_tokens_unpadded,
+                hidden_states_cpu,
+            )
             # View the cache as 2D so that we can treat our slots as row indices
             flat_cache = self.hidden_states_cache.view(-1, self.hidden_states_cache.shape[-1])
             flat_cache[unpadded_slot_mapping] = hidden_states
@@ -216,6 +243,7 @@ class OmniTensorPrefixCache:
         cache: torch.Tensor,
         hidden_states: torch.Tensor,
         num_scheduled_tokens: dict[str, int],
+        hidden_states_cpu: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """When hidden state caching is enabled, takes the input hidden_states,
         which only correspond to the scheduled tokens, and returns a mapping
@@ -231,7 +259,17 @@ class OmniTensorPrefixCache:
             )
 
         combined_hidden_states = {}
-        hidden_states = OmniTensorPrefixCache._coerce_to_cpu_tensor(hidden_states)
+        required_tokens = 0
+        for req_id in input_batch.req_ids:
+            req_idx = input_batch.req_id_to_index[req_id]
+            start = query_start_loc[req_idx]
+            end = start + num_scheduled_tokens[req_id]
+            required_tokens = max(required_tokens, int(end))
+        hidden_states = OmniTensorPrefixCache._resolve_hidden_states_cpu(
+            hidden_states,
+            required_tokens,
+            hidden_states_cpu,
+        )
         for req_id in input_batch.req_ids:
             req_idx = input_batch.req_id_to_index[req_id]
 
