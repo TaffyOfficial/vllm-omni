@@ -12,13 +12,12 @@ import torch
 from PIL import Image
 
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+    HunyuanImage3ImageProcessor,
     ImageInfo,
     JointImageInfo,
 )
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _postprocess_infer_aligned_outputs,
-    _resize_and_crop_center,
-    _resize_to_target,
 )
 from vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 import (
     HunyuanImage3Processor,
@@ -40,8 +39,8 @@ def test_ar_processor_default_center_crop_matches_official_default():
     processor = object.__new__(HunyuanImage3Processor)
 
     ar_default = processor._resize_and_crop(src, (4, 4))
-    official_default = _resize_and_crop_center(src, 4, 4)
-    resize_path = _resize_to_target(src, 4, 4)
+    official_default = HunyuanImage3ImageProcessor._resize_and_crop(src, (4, 4), crop_type="center")
+    resize_path = HunyuanImage3ImageProcessor._resize_and_crop(src, (4, 4), crop_type="resize")
 
     assert ar_default.size == (4, 4)
     assert np.array_equal(np.asarray(ar_default), np.asarray(official_default))
@@ -53,8 +52,8 @@ def test_ar_processor_infer_align_true_uses_resize():
     processor = object.__new__(HunyuanImage3Processor)
 
     ar_resize = processor._resize_and_crop(src, (4, 4), crop_type="resize")
-    official_resize = _resize_to_target(src, 4, 4)
-    center_crop = _resize_and_crop_center(src, 4, 4)
+    official_resize = HunyuanImage3ImageProcessor._resize_and_crop(src, (4, 4), crop_type="resize")
+    center_crop = HunyuanImage3ImageProcessor._resize_and_crop(src, (4, 4), crop_type="center")
 
     assert ar_resize.size == (4, 4)
     assert np.array_equal(np.asarray(ar_resize), np.asarray(official_resize))
@@ -86,8 +85,8 @@ def _fake_vit_processor(_image: Image.Image):
 @pytest.mark.parametrize(
     ("infer_align_image_size", "expected_image"),
     [
-        (False, lambda src: _resize_and_crop_center(src, 4, 4)),
-        (True, lambda src: _resize_to_target(src, 4, 4)),
+        (False, lambda src: HunyuanImage3ImageProcessor._resize_and_crop(src, (4, 4), crop_type="center")),
+        (True, lambda src: HunyuanImage3ImageProcessor._resize_and_crop(src, (4, 4), crop_type="resize")),
     ],
 )
 def test_ar_process_image_uses_official_crop_mode_and_preserves_original_size(
