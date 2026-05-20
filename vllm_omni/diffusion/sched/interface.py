@@ -51,6 +51,7 @@ class SamplingParamsKey:
     height: int | None = None
     width: int | None = None
     num_frames: int = 1
+    num_inference_steps: int | None = None
     resolution: int | str | None = None
     fps: int | None = None
     frame_rate: float | None = None

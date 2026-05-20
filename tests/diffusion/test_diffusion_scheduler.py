@@ -683,7 +683,7 @@ class TestStepScheduler:
         assert sched_output.num_running_reqs == 2
         assert sched_output.num_waiting_reqs == 0
 
-    def test_step_batch_allows_different_num_inference_steps(self) -> None:
+    def test_step_batch_rejects_different_num_inference_steps(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=2))
 
@@ -692,9 +692,19 @@ class TestStepScheduler:
 
         sched_output = scheduler.schedule()
 
-        assert _new_ids(sched_output) == [req_a, req_b]
-        assert sched_output.num_running_reqs == 2
-        assert sched_output.num_waiting_reqs == 0
+        assert _new_ids(sched_output) == [req_a]
+        assert sched_output.num_running_reqs == 1
+        assert sched_output.num_waiting_reqs == 1
+
+        scheduler.update_from_output(
+            sched_output,
+            _make_step_output(req_a, step_index=2, finished=True),
+        )
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == [req_b]
+        assert second.num_running_reqs == 1
+        assert second.num_waiting_reqs == 0
 
     def test_step_batch_rejects_different_sampling_key(self) -> None:
         scheduler = StepScheduler()

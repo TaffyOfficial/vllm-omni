@@ -26,6 +26,7 @@ Current in-tree support:
 | Pipeline | Example models | Step execution |
 |----------|----------------|----------------|
 | `QwenImagePipeline` | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes |
+| `HunyuanImage3Pipeline` | HunyuanImage-3 DiT stage | Experimental: same-resolution grouped DiT batching only |
 | All other diffusion pipelines | `QwenImageEditPipeline`, `QwenImageEditPlusPipeline`, `QwenImageLayeredPipeline`, GLM-Image, Wan, Flux, etc. | No |
 
 Current engine/runtime limitations:
@@ -34,7 +35,14 @@ Current engine/runtime limitations:
   [Continuous Batching for Step-Wise Diffusion](diffusion_continuous_batching.md).
   Keep `max_num_seqs=1` if you want the older conservative behavior.
 - `cache_backend` is not supported in step mode.
-- Request-mode extras such as KV transfer are not wired into step mode yet.
+- Request-mode extras such as KV transfer are not generally wired into step
+  mode yet. HunyuanImage3 carries its AR KV reuse metadata through
+  request-local step state for its DiT path.
+- HunyuanImage3 grouped batching follows the shared sampling-parameter grouping
+  contract. Per-request prompt encoding remains independent, and the DiT
+  step-wise merge right-pads variable prompt-token sequence fields within the
+  active batch. Custom timesteps/sigmas are rejected, and staggered AR-to-DiT
+  arrivals can still execute as separate DiT batches.
 - Unsupported pipelines now fail early during model loading instead of failing on the first request.
 
 ## Execution Contract

@@ -39,7 +39,8 @@ from vllm_omni.diffusion.sched.interface import (
 )
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.worker.input_batch import InputBatch
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState, RunnerOutput
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -294,6 +295,27 @@ def _make_cached_scheduler_output(sched_req_id="req-1", step_id=1, finished_req_
         num_running_reqs=1,
         num_waiting_reqs=0,
     )
+
+
+def test_input_batch_retains_request_states_across_cached_repack():
+    sampling = OmniDiffusionSamplingParams(num_inference_steps=2)
+    state_a = DiffusionRequestState(req_id="a", sampling=sampling, prompts=["a"])
+    state_b = DiffusionRequestState(req_id="b", sampling=sampling, prompts=["b"])
+    for idx, state in enumerate((state_a, state_b)):
+        state.latents = torch.full((1, 2), float(idx))
+        state.timesteps = torch.tensor([10, 5])
+
+    batch = InputBatch.make_batch([state_a, state_b])
+    assert list(batch.states) == [state_a, state_b]
+    assert batch.prompt_embeds is None
+
+    state_a.step_index = 1
+    state_b.step_index = 1
+    repacked = InputBatch.make_batch([state_a, state_b], cached_batch=batch)
+
+    assert repacked is batch
+    assert list(repacked.states) == [state_a, state_b]
+    assert repacked.timesteps.tolist() == [5, 5]
 
 
 def _make_engine(scheduler, execute_fn=None) -> DiffusionEngine:

@@ -494,8 +494,8 @@ def _prepare_prompt_embeds(
     *,
     embeds_out: torch.Tensor | None = None,
     mask_out: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    prompt_embeds, prompt_embeds_mask = _prepare_padded_prompt_fields(
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    return _prepare_padded_prompt_fields(
         states,
         embeds_attr="prompt_embeds",
         mask_attr="prompt_embeds_mask",
@@ -503,9 +503,6 @@ def _prepare_prompt_embeds(
         embeds_out=embeds_out,
         mask_out=mask_out,
     )
-    if prompt_embeds is None:
-        raise ValueError("All requests must have `prompt_embeds` initialized.")
-    return prompt_embeds, prompt_embeds_mask
 
 
 def _prepare_negative_prompt_embeds(
@@ -582,6 +579,7 @@ class InputBatch:
     """
 
     req_ids: list[str]
+    states: Sequence[DiffusionRequestState]
     num_reqs: int
     num_reqs_after_padding: int
     idx_mapping: torch.Tensor
@@ -589,7 +587,7 @@ class InputBatch:
 
     latents: torch.Tensor
     timesteps: torch.Tensor
-    prompt_embeds: torch.Tensor
+    prompt_embeds: torch.Tensor | None
     prompt_embeds_mask: torch.Tensor | None
     negative_prompt_embeds: torch.Tensor | None
     negative_prompt_embeds_mask: torch.Tensor | None
@@ -608,6 +606,8 @@ class InputBatch:
             raise ValueError("`req_ids` and `idx_mapping` must have the same length.")
         if self.num_reqs != len(self.req_ids):
             raise ValueError("`num_reqs` must match the number of request ids.")
+        if self.num_reqs != len(self.states):
+            raise ValueError("`num_reqs` must match the number of request states.")
         if self.num_reqs_after_padding < self.num_reqs:
             raise ValueError("`num_reqs_after_padding` must be >= `num_reqs`.")
 
@@ -646,6 +646,7 @@ class InputBatch:
         self,
         selected_states: Sequence[DiffusionRequestState],
     ) -> None:
+        self.states = selected_states
         self._refresh_dynamic_fields(selected_states)
 
     def _rebuild(
@@ -656,6 +657,7 @@ class InputBatch:
         req_ids: list[str],
     ) -> InputBatch:
         self.req_ids = req_ids
+        self.states = selected_states
         self.num_reqs = len(req_ids)
         self.num_reqs_after_padding = len(req_ids)
         self.idx_mapping = idx_mapping
@@ -695,6 +697,7 @@ class InputBatch:
         do_true_cfg, true_cfg_scale, cfg_normalize = _prepare_cfg_scalars(selected_states)
         return cls(
             req_ids=req_ids,
+            states=selected_states,
             num_reqs=len(selected_states),
             num_reqs_after_padding=len(selected_states),
             idx_mapping=idx_mapping,

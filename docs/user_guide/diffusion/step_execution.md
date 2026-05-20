@@ -39,11 +39,16 @@ vllm serve Qwen/Qwen-Image --omni \
 For serving, `--step-execution` enables the step-wise runtime. Continuous
 batching only becomes relevant when `--max-num-seqs > 1`.
 
+For HunyuanImage3 DiT-stage experiments, keep the default deploy YAMLs
+unchanged and opt in explicitly on the DiT stage with `step_execution: true`
+and a small `max_num_seqs`, such as `2` or `4`.
+
 ## Supported Pipelines
 
 | Pipeline | Example models | Step execution |
 |----------|----------------|----------------|
 | `QwenImagePipeline` | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes |
+| `HunyuanImage3Pipeline` | HunyuanImage-3 DiT stage | Experimental: same-resolution grouped DiT batching only |
 | All other diffusion pipelines | `QwenImageEditPipeline`, `QwenImageEditPlusPipeline`, `QwenImageLayeredPipeline`, GLM-Image, Wan, Flux, etc. | No |
 
 !!! warning "Experimental continuous batching"
@@ -57,6 +62,14 @@ batching only becomes relevant when `--max-num-seqs > 1`.
 
 - Continuous batching under `step_execution` is experimental and only batches
   compatible requests.
+- HunyuanImage3 step execution currently requires one prompt per request and
+  batches only same-resolution requests with matching denoise step counts and
+  guidance settings. Per-request prompt encoding remains independent, and the
+  DiT step-wise merge right-pads variable prompt-token sequence fields within
+  the active batch. Custom timesteps/sigmas are rejected, and staggered
+  AR-to-DiT arrivals may still run as separate DiT batches. Sequence
+  parallelism, CFG parallelism, and multi-output-per-prompt are rejected in
+  this path.
 - `cache_backend` is not supported together with step execution.
 - Unsupported pipelines fail early during model loading.
 - Request-mode extras such as KV transfer are not wired into step mode yet.

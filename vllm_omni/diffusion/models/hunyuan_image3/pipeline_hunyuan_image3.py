@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 import logging
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -20,7 +21,9 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.transformers_utils.config import get_config
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
@@ -30,7 +33,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import Siglip2VisionTransformer
 
-from .hunyuan_image3_tokenizer import TokenizerWrapper
+from .hunyuan_image3_tokenizer import TokenizerEncodeOutput, TokenizerWrapper
 from .hunyuan_image3_transformer import (
     CausalMMOutputWithPast,
     HunyuanImage3ImageProcessor,
@@ -45,6 +48,7 @@ from .hunyuan_image3_transformer import (
     UNetUp,
     build_batch_2d_rope,
     real_batched_index_select,
+    retrieve_timesteps,
 )
 from .system_prompt import get_system_prompt
 
@@ -52,6 +56,10 @@ logger = logging.getLogger(__name__)
 
 BatchRaggedImages = torch.Tensor | list[torch.Tensor | list[torch.Tensor]]
 BatchRaggedTensor = torch.Tensor | list[torch.Tensor]
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 
 def default(val, d):
@@ -304,6 +312,7 @@ class HunyuanImage3Pipeline(
     DiffusionPipelineProfilerMixin,
 ):
     support_image_input = True
+    supports_step_execution: ClassVar[bool] = True
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "model.": "",
@@ -442,6 +451,346 @@ class HunyuanImage3Pipeline(
             )
             self._pipeline = HunyuanImage3Text2ImagePipeline(model=self, scheduler=self.scheduler, vae=self.vae)
         return self._pipeline
+
+    def _ensure_step_execution_supported(self, state: "DiffusionRequestState") -> None:
+        if len(state.prompts or []) != 1:
+            raise ValueError("HunyuanImage3 step_execution supports one prompt per request; batch via max_num_seqs.")
+        if state.sampling.num_outputs_per_prompt not in (None, 1):
+            raise ValueError("HunyuanImage3 step_execution does not support num_outputs_per_prompt > 1 yet.")
+        if state.sampling.timesteps is not None or state.sampling.sigmas is not None:
+            raise ValueError("HunyuanImage3 step_execution does not support custom timesteps or sigmas yet.")
+        parallel_config = self.od_config.parallel_config
+        sp_size = parallel_config.sequence_parallel_size
+        if sp_size is not None and sp_size > 1:
+            raise ValueError("HunyuanImage3 step_execution does not support sequence parallelism yet.")
+        if get_classifier_free_guidance_world_size() > 1:
+            raise ValueError("HunyuanImage3 step_execution does not support CFG parallelism yet.")
+
+    def _extract_step_prompt_inputs(
+        self,
+        state: "DiffusionRequestState",
+    ) -> tuple[list[str], list[str | None] | None, str | None, list[list[JointImageInfo]] | None]:
+        extra_args = state.sampling.extra_args or {}
+        use_system_prompt = extra_args.get("use_system_prompt")
+        system_prompt = extra_args.get("system_prompt")
+        prompts = state.prompts or []
+        if prompts and isinstance(prompts[0], dict):
+            first_prompt = prompts[0]
+            if use_system_prompt is None:
+                use_system_prompt = first_prompt.get("use_system_prompt")
+            if system_prompt is None:
+                system_prompt = first_prompt.get("system_prompt")
+        if use_system_prompt is not None:
+            system_prompt = get_system_prompt(use_system_prompt, "image", system_prompt)
+            system_prompt = system_prompt.strip() if system_prompt is not None else ""
+
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in prompts]
+        cot_text_list = [
+            (p.get("extra", {}).get("ar_generated_text") if isinstance(p, dict) else None) or None for p in prompts
+        ]
+        cot_text = (
+            [self._normalize_cot_text(t) for t in cot_text_list] if any(t is not None for t in cot_text_list) else None
+        )
+
+        batch_cond_image_info: list[list[JointImageInfo]] | None = None
+        if any(not isinstance(p, str) for p in prompts):
+            batch_cond_image_info = []
+            for prompt_item in prompts:
+                if isinstance(prompt_item, str):
+                    batch_cond_image_info.append([])
+                    continue
+                prompt_additional_information = prompt_item.get("additional_information") or {}
+                prompt_cond_infos = prompt_additional_information.get("batch_cond_image_info", [])
+                if isinstance(prompt_cond_infos, JointImageInfo | dict):
+                    prompt_cond_infos = [prompt_cond_infos]
+                if prompt_cond_infos is None:
+                    prompt_cond_infos = []
+                batch_cond_image_info.append([_joint_image_info_from_payload(item) for item in prompt_cond_infos])
+
+            has_cond_image = [len(cond_infos) > 0 for cond_infos in batch_cond_image_info]
+            if any(has_cond_image) and not all(has_cond_image):
+                raise ValueError("HunyuanImage3 step_execution cannot mix editing and text-only requests.")
+            if not any(has_cond_image):
+                batch_cond_image_info = None
+
+        return prompt, cot_text, system_prompt, batch_cond_image_info
+
+    def _extract_ar_kv_from_sampling(self, sampling) -> dict[str, Any]:
+        kv = sampling.past_key_values
+        if kv is None:
+            return {}
+        key_cache = kv.key_cache
+        value_cache = kv.value_cache
+        if not key_cache or not value_cache:
+            return {}
+        ar_kv_data = {
+            i: {"key": k, "value": v}
+            for i, (k, v) in enumerate(zip(key_cache, value_cache))
+            if k is not None and v is not None
+        }
+        if not ar_kv_data:
+            return {}
+        logger.info(
+            f"[AR KV Reuse] Extracted {len(ar_kv_data)} layers of AR KV, "
+            f"each with length: {next(iter(ar_kv_data.values()))['key'].shape}"
+        )
+        return {"ar_kv_data": ar_kv_data}
+
+    def _snapshot_injected_ar_kv(self, clear: bool = True) -> dict[int, list[tuple[torch.Tensor, torch.Tensor]]]:
+        snapshot: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+        for layer in self.model.layers:
+            cache_mgr = layer.self_attn.image_attn
+            injected = cache_mgr._injected_ar_kv
+            if injected is not None:
+                snapshot[layer.layer_idx] = list(injected)
+                if clear:
+                    cache_mgr._injected_ar_kv = None
+        return snapshot
+
+    def _restore_injected_ar_kv(
+        self,
+        states: list["DiffusionRequestState"],
+        cfg_factor: int,
+    ) -> None:
+        snapshots = [state.extra["ar_kv_reuse"] for state in states]
+        if not any(snapshots):
+            return
+        if not all(snapshots):
+            raise ValueError("HunyuanImage3 step_execution cannot batch mixed AR-KV-reuse and non-reuse requests.")
+        for layer in self.model.layers:
+            rows: list[tuple[torch.Tensor, torch.Tensor]] = []
+            for branch in range(cfg_factor):
+                for snapshot in snapshots:
+                    layer_rows = snapshot.get(layer.layer_idx)
+                    if layer_rows is None or len(layer_rows) != cfg_factor:
+                        raise ValueError("HunyuanImage3 AR KV reuse metadata is incompatible across the batch.")
+                    rows.append(layer_rows[branch])
+            layer.self_attn.image_attn._injected_ar_kv = rows
+
+    def _capture_prompt_kv_cache(
+        self,
+        states: list["DiffusionRequestState"],
+        cfg_factor: int,
+    ) -> None:
+        bsz = len(states) * cfg_factor
+        for state in states:
+            state.extra["prompt_kv_cache"] = {}
+        for layer in self.model.layers:
+            cache_mgr = layer.self_attn.image_attn
+            cache = cache_mgr.image_kv_cache_map
+            if cache is None:
+                continue
+            key, value = cache
+            if key.shape[0] % bsz != 0:
+                raise ValueError("HunyuanImage3 prompt KV cache shape is not divisible by the active batch.")
+            rows_per_branch = key.shape[0] // bsz
+            for state_idx, state in enumerate(states):
+                row_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+                for branch in range(cfg_factor):
+                    row_idx = branch * len(states) + state_idx
+                    start = row_idx * rows_per_branch
+                    stop = start + rows_per_branch
+                    row_cache.append((key[start:stop].clone(), value[start:stop].clone()))
+                state.extra["prompt_kv_cache"][layer.layer_idx] = row_cache
+
+    def _restore_prompt_kv_cache(
+        self,
+        states: list["DiffusionRequestState"],
+        cfg_factor: int,
+    ) -> None:
+        if not states or states[0].step_index == 0:
+            return
+        for layer in self.model.layers:
+            keys: list[torch.Tensor] = []
+            values: list[torch.Tensor] = []
+            for branch in range(cfg_factor):
+                for state in states:
+                    cache = state.extra["prompt_kv_cache"].get(layer.layer_idx)
+                    if cache is None or len(cache) != cfg_factor:
+                        raise ValueError("HunyuanImage3 prompt KV cache is missing for an active step request.")
+                    key, value = cache[branch]
+                    keys.append(key)
+                    values.append(value)
+            layer.self_attn.image_attn.image_kv_cache_map = (torch.cat(keys, dim=0), torch.cat(values, dim=0))
+
+    def _step_sequence_pad_value(self, field_name: str, tensor: torch.Tensor) -> int | float | bool | None:
+        if field_name == "input_ids" or field_name.endswith(".tokens"):
+            return getattr(getattr(self, "_tkwrapper", None), "pad_token_id", 0)
+        if field_name == "attention_mask":
+            return False
+        if field_name == "position_ids" or field_name.startswith("custom_pos_emb["):
+            return 0
+        if field_name.endswith("_mask") or field_name.endswith(".text_mask"):
+            return False if tensor.dtype == torch.bool else 0
+        return None
+
+    def _right_pad_step_tensors(self, chunks: list[torch.Tensor], field_name: str) -> list[torch.Tensor]:
+        shapes = [tuple(chunk.shape) for chunk in chunks]
+        if all(shape == shapes[0] for shape in shapes):
+            return chunks
+
+        pad_value = self._step_sequence_pad_value(field_name, chunks[0])
+        if pad_value is None:
+            raise ValueError(
+                f"HunyuanImage3 step_execution cannot batch incompatible shapes for {field_name}: {shapes}."
+            )
+
+        if field_name == "attention_mask":
+            if any(chunk.ndim != 4 for chunk in chunks):
+                raise ValueError("HunyuanImage3 attention_mask must be 4-D in step_execution batching.")
+            batch_heads = {(chunk.shape[0], chunk.shape[1]) for chunk in chunks}
+            if len(batch_heads) != 1:
+                raise ValueError(f"HunyuanImage3 attention_mask has incompatible leading shapes: {shapes}.")
+            max_q_len = max(chunk.shape[2] for chunk in chunks)
+            max_seq_len = max(chunk.shape[3] for chunk in chunks)
+            target_shapes = [(chunk.shape[0], chunk.shape[1], max_q_len, max_seq_len) for chunk in chunks]
+        else:
+            if any(chunk.ndim not in (2, 3) for chunk in chunks):
+                raise ValueError(
+                    f"HunyuanImage3 field {field_name} has unsupported ragged tensor ranks: {shapes}."
+                )
+            comparable_shapes = {chunk.shape[:1] + chunk.shape[2:] for chunk in chunks}
+            if len(comparable_shapes) != 1:
+                raise ValueError(f"HunyuanImage3 field {field_name} has incompatible non-sequence shapes: {shapes}.")
+            max_seq_len = max(chunk.shape[1] for chunk in chunks)
+            target_shapes = [
+                (chunk.shape[0], max_seq_len, *chunk.shape[2:]) if chunk.ndim == 3 else (chunk.shape[0], max_seq_len)
+                for chunk in chunks
+            ]
+
+        padded_chunks: list[torch.Tensor] = []
+        for chunk, target_shape in zip(chunks, target_shapes):
+            if tuple(chunk.shape) == target_shape:
+                padded_chunks.append(chunk)
+                continue
+            padded = chunk.new_full(target_shape, pad_value)
+            slices = tuple(slice(0, size) for size in chunk.shape)
+            padded[slices] = chunk
+            padded_chunks.append(padded)
+        return padded_chunks
+
+    def _merge_batch_value(self, values: list[Any], cfg_factor: int, field_name: str) -> Any:
+        if all(value is None for value in values):
+            return None
+        if any(value is None for value in values):
+            raise ValueError(f"HunyuanImage3 step_execution cannot batch mixed None/non-None field {field_name}.")
+        first = values[0]
+        if isinstance(first, torch.Tensor):
+            chunks: list[torch.Tensor] = []
+            for branch in range(cfg_factor):
+                for value in values:
+                    if not isinstance(value, torch.Tensor) or value.shape[0] != cfg_factor:
+                        raise ValueError(f"HunyuanImage3 field {field_name} has incompatible CFG shape.")
+                    chunks.append(value[branch : branch + 1])
+            chunks = self._right_pad_step_tensors(chunks, field_name)
+            return torch.cat(chunks, dim=0)
+        if isinstance(first, list):
+            if any(not isinstance(value, list) or len(value) != cfg_factor for value in values):
+                raise ValueError(f"HunyuanImage3 field {field_name} has incompatible list shape.")
+            return [value[branch] for branch in range(cfg_factor) for value in values]
+        if isinstance(first, tuple) and len(first) == 2 and all(isinstance(item, torch.Tensor) for item in first):
+            left = self._merge_batch_value([value[0] for value in values], cfg_factor, f"{field_name}[0]")
+            right = self._merge_batch_value([value[1] for value in values], cfg_factor, f"{field_name}[1]")
+            return left, right
+        if isinstance(first, TokenizerEncodeOutput):
+            return type(first)(
+                **{
+                    key: self._merge_batch_value(
+                        [getattr(value, key) for value in values],
+                        cfg_factor,
+                        f"{field_name}.{key}",
+                    )
+                    for key in TokenizerEncodeOutput.__annotations__
+                }
+            )
+        if isinstance(first, dict):
+            return {
+                key: self._merge_batch_value([value[key] for value in values], cfg_factor, f"{field_name}.{key}")
+                for key in first
+            }
+        if all(value == first for value in values):
+            return first
+        raise ValueError(f"HunyuanImage3 step_execution field {field_name} differs across the active batch.")
+
+    def _split_batch_value(self, value: Any, state_idx: int, num_states: int, cfg_factor: int) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            indices = [branch * num_states + state_idx for branch in range(cfg_factor)]
+            index = torch.tensor(indices, device=value.device, dtype=torch.long)
+            return value.index_select(0, index)
+        if isinstance(value, list) and len(value) == num_states * cfg_factor:
+            return [value[branch * num_states + state_idx] for branch in range(cfg_factor)]
+        if isinstance(value, tuple) and len(value) == 2 and all(isinstance(item, torch.Tensor) for item in value):
+            return (
+                self._split_batch_value(value[0], state_idx, num_states, cfg_factor),
+                self._split_batch_value(value[1], state_idx, num_states, cfg_factor),
+            )
+        if isinstance(value, TokenizerEncodeOutput):
+            return type(value)(
+                **{key: self._split_batch_value(item, state_idx, num_states, cfg_factor) for key, item in value.items()}
+            )
+        if isinstance(value, dict):
+            return {
+                key: self._split_batch_value(item, state_idx, num_states, cfg_factor) for key, item in value.items()
+            }
+        return copy.deepcopy(value)
+
+    def _merge_step_model_inputs(
+        self,
+        states: list["DiffusionRequestState"],
+    ) -> tuple[torch.Tensor, dict[str, Any], int]:
+        cfg_factor = int(states[0].extra["cfg_factor"])
+        step_index = states[0].step_index
+        for state in states:
+            if int(state.extra["cfg_factor"]) != cfg_factor:
+                raise ValueError("HunyuanImage3 step_execution cannot batch mixed CFG modes.")
+            if state.step_index != step_index:
+                raise ValueError(
+                    "HunyuanImage3 step_execution does not support mixing first-step and decode-step rows."
+                )
+
+        input_ids = self._merge_batch_value(
+            [state.extra["input_ids"] for state in states],
+            cfg_factor,
+            "input_ids",
+        )
+        keys: set[str] = set()
+        for state in states:
+            keys.update(state.extra["model_kwargs"].keys())
+        model_kwargs: dict[str, Any] = {}
+        for key in keys:
+            if key in {"generator", "batch_gen_image_info", "batch_cond_image_info", "eos_token_id", "max_new_tokens"}:
+                continue
+            model_kwargs[key] = self._merge_batch_value(
+                [state.extra["model_kwargs"].get(key) for state in states],
+                cfg_factor,
+                key,
+            )
+        if "attention_mask" in model_kwargs:
+            bsz, _, q_len, seq_len = model_kwargs["attention_mask"].shape
+            model_kwargs["query_lens"] = [q_len] * bsz
+            model_kwargs["seq_lens"] = [seq_len] * bsz
+        return input_ids, model_kwargs, cfg_factor
+
+    def _split_step_model_inputs(
+        self,
+        states: list["DiffusionRequestState"],
+        input_ids: torch.Tensor,
+        model_kwargs: dict[str, Any],
+        cfg_factor: int,
+    ) -> None:
+        num_states = len(states)
+        for state_idx, state in enumerate(states):
+            state.extra["input_ids"] = self._split_batch_value(input_ids, state_idx, num_states, cfg_factor)
+            split_kwargs = {
+                key: self._split_batch_value(value, state_idx, num_states, cfg_factor)
+                for key, value in model_kwargs.items()
+            }
+            split_kwargs["generator"] = state.extra["generator"]
+            split_kwargs["batch_gen_image_info"] = state.extra["batch_gen_image_info"]
+            split_kwargs["batch_cond_image_info"] = state.extra["batch_cond_image_info"]
+            state.extra["model_kwargs"] = split_kwargs
 
     @staticmethod
     def get_pos_emb(custom_pos_emb, position_ids):
@@ -1352,6 +1701,262 @@ class HunyuanImage3Pipeline(
             f"each with length: {next(iter(ar_kv_data.values()))['key'].shape}"
         )
         return {"ar_kv_data": ar_kv_data}
+
+    def prepare_encode(
+        self,
+        state: "DiffusionRequestState",
+        **kwargs: Any,
+    ) -> "DiffusionRequestState":
+        del kwargs
+        self._ensure_step_execution_supported(state)
+        pipe = self.pipeline
+        sampling = state.sampling
+        prompt, cot_text, system_prompt, batch_cond_image_info = self._extract_step_prompt_inputs(state)
+
+        height = sampling.height or 1024
+        width = sampling.width or 1024
+        image_size = (height, width)
+        num_inference_steps = sampling.num_inference_steps or 50
+        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 5.0
+        if guidance_scale <= 1.0:
+            logger.info("HunyuanImage3.0 runs without classifier-free guidance when guidance_scale <= 1.0.")
+
+        generator = sampling.generator
+        pipe._guidance_scale = guidance_scale
+        pipe._guidance_rescale = sampling.guidance_rescale
+
+        model_inputs = self.prepare_model_inputs(
+            prompt=prompt,
+            cot_text=cot_text,
+            system_prompt=system_prompt,
+            mode="gen_image",
+            generator=generator,
+            image_size=image_size,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            batch_cond_image_info=batch_cond_image_info,
+        )
+
+        model_inputs.update(self._extract_ar_kv_from_sampling(sampling))
+        batch_gen_image_info: list[ImageInfo] = model_inputs["batch_gen_image_info"]
+        image_info: ImageInfo = batch_gen_image_info[0]
+        num_image_tokens = (
+            image_info.image_token_length
+            + (1 if image_info.add_timestep_token else 0)
+            + (1 if image_info.add_guidance_token else 0)
+        )
+        model_inputs["num_image_tokens"] = num_image_tokens
+        cfg_factor = 1 + int(guidance_scale > 1.0)
+
+        timesteps, _ = retrieve_timesteps(
+            self.scheduler,
+            num_inference_steps,
+            self.device,
+            None,
+            None,
+        )
+        pipe._num_timesteps = len(timesteps)
+
+        latents = pipe.prepare_latents(
+            batch_size=1,
+            latent_channel=self.config.vae["latent_channels"],
+            image_size=[image_info.image_height, image_info.image_width],
+            dtype=torch.bfloat16,
+            device=self.device,
+            generator=generator,
+            latents=sampling.latents,
+        )
+
+        scheduler = copy.deepcopy(self.scheduler)
+        if hasattr(scheduler, "set_begin_index"):
+            scheduler.set_begin_index(0)
+
+        input_ids = model_inputs.pop("input_ids")
+        attention_mask = self._prepare_attention_mask_for_generation(
+            input_ids,
+            self.generation_config,
+            model_kwargs=model_inputs,
+        )
+        bsz, _, q_len, seq_len = attention_mask.shape
+        model_inputs["query_lens"] = [q_len] * bsz
+        model_inputs["seq_lens"] = [seq_len] * bsz
+        model_inputs["attention_mask"] = attention_mask.to(latents.device)
+        model_inputs["use_cache"] = False
+
+        input_ids, ar_kv_reuse_len = pipe._maybe_handle_ar_kv_reuse(
+            input_ids,
+            model_inputs,
+            batch_size=1,
+            cfg_parallel_ready=False,
+            cfg_rank=None,
+            device=self.device,
+        )
+        model_inputs["ar_kv_reuse_len"] = ar_kv_reuse_len
+        ar_kv_reuse = self._snapshot_injected_ar_kv(clear=True)
+
+        state.latents = latents
+        state.timesteps = timesteps
+        state.step_index = 0
+        state.scheduler = scheduler
+        state.extra = {
+            "model_kwargs": model_inputs,
+            "input_ids": input_ids,
+            "attention_mask": model_inputs["attention_mask"],
+            "timesteps": timesteps,
+            "scheduler": scheduler,
+            "generator": generator,
+            "batch_gen_image_info": batch_gen_image_info,
+            "batch_cond_image_info": batch_cond_image_info,
+            "cfg_factor": cfg_factor,
+            "guidance_scale": guidance_scale,
+            "ar_kv_reuse": ar_kv_reuse,
+            "output_image_size": image_size,
+            "cot_text_list": [
+                (p.get("extra", {}).get("ar_generated_text") if isinstance(p, dict) else None) or None
+                for p in (state.prompts or [])
+            ],
+        }
+        return state
+
+    def denoise_step(
+        self,
+        input_batch: "InputBatch",
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        del kwargs
+        if getattr(self, "interrupt", False):
+            return None
+
+        states = list(input_batch.states)
+        if not states:
+            raise ValueError("HunyuanImage3 denoise_step received an empty batch.")
+
+        input_ids, model_kwargs, cfg_factor = self._merge_step_model_inputs(states)
+        first_step = states[0].step_index == 0
+        step_index = states[0].step_index
+        pipe = self.pipeline
+        pipe._guidance_scale = float(states[0].extra["guidance_scale"])
+        set_forward_context_denoise_step_idx(step_index)
+
+        try:
+            if first_step:
+                self._restore_injected_ar_kv(states, cfg_factor)
+            else:
+                self._restore_prompt_kv_cache(states, cfg_factor)
+
+            if cfg_factor > 1:
+                latent_model_input = torch.cat([input_batch.latents] * cfg_factor)
+            else:
+                latent_model_input = input_batch.latents
+            timestep = input_batch.timesteps
+            if timestep.ndim == 0:
+                timestep = timestep.expand(input_batch.latents.shape[0])
+            t_expand = timestep.repeat(cfg_factor).to(latent_model_input.device)
+
+            model_inputs = self.prepare_inputs_for_generation(
+                input_ids,
+                images=latent_model_input,
+                timestep=t_expand,
+                **model_kwargs,
+            )
+            with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
+                model_output = self.forward_call(**model_inputs, first_step=first_step)
+                pred = model_output["diffusion_prediction"]
+            pred = pred.to(dtype=torch.float32)
+
+            if cfg_factor > 1:
+                pred_cond, pred_uncond = pred.chunk(2)
+                pred = pipe.cfg_operator(pred_cond, pred_uncond, pipe.guidance_scale, step=step_index)
+
+            if first_step:
+                self._capture_prompt_kv_cache(states, cfg_factor)
+
+            if step_index != states[0].total_steps - 1:
+                offset = model_kwargs.get("ar_kv_reuse_offset", 0)
+                model_kwargs = self._update_model_kwargs_for_generation(
+                    model_output,
+                    model_kwargs,
+                )
+                if input_ids.shape[1] != model_kwargs["position_ids"].shape[1]:
+                    index = model_kwargs["position_ids"] - offset
+                    input_ids = torch.gather(input_ids, 1, index=index)
+                attention_mask = model_kwargs["attention_mask"]
+                bsz, _, q_len, seq_len = attention_mask.shape
+                model_kwargs["query_lens"] = [q_len] * bsz
+                model_kwargs["seq_lens"] = [seq_len] * bsz
+                self._split_step_model_inputs(states, input_ids, model_kwargs, cfg_factor)
+
+            return pred
+        finally:
+            set_forward_context_denoise_step_idx(None)
+
+    def step_scheduler(
+        self,
+        state: "DiffusionRequestState",
+        noise_pred: torch.Tensor,
+        **kwargs: Any,
+    ) -> None:
+        del kwargs
+        if getattr(self, "interrupt", False):
+            return
+        if noise_pred is None:
+            return
+        timestep = state.current_timestep
+        scheduler = state.extra["scheduler"]
+        generator = state.extra["generator"]
+        step_kwargs = self.pipeline.prepare_extra_func_kwargs(scheduler.step, {"generator": generator})
+        state.latents = scheduler.step(
+            noise_pred,
+            timestep,
+            state.latents,
+            **step_kwargs,
+            return_dict=False,
+        )[0]
+        state.step_index += 1
+
+    def post_decode(
+        self,
+        state: "DiffusionRequestState",
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        output_type = kwargs.get("output_type", "pil")
+        latents = state.latents
+        generator = state.extra["generator"]
+        if output_type == "latent":
+            return DiffusionOutput(
+                output=latents,
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
+
+        if hasattr(self.vae.config, "scaling_factor") and self.vae.config.scaling_factor:
+            latents = latents / self.vae.config.scaling_factor
+        if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor:
+            latents = latents + self.vae.config.shift_factor
+        if hasattr(self.vae, "ffactor_temporal"):
+            latents = latents.unsqueeze(2)
+
+        with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=True):
+            image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
+
+        if hasattr(self.vae, "ffactor_temporal"):
+            assert image.shape[2] == 1, "image should have shape [B, C, T, H, W] and T should be 1"
+            image = image.squeeze(2)
+
+        image = self.pipeline.image_processor.postprocess(
+            image,
+            output_type=output_type,
+            do_denormalize=[True] * image.shape[0],
+        )
+
+        cot_text_list = state.extra["cot_text_list"]
+        custom_output = {}
+        if any(t is not None for t in cot_text_list):
+            custom_output["ar_generated_text"] = cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list
+        return DiffusionOutput(
+            output=image[0],
+            custom_output=custom_output,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
 
     def forward(
         self,
