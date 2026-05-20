@@ -3,6 +3,7 @@
 
 import inspect
 import logging
+import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -1472,6 +1473,9 @@ class HunyuanImage3ImageProcessor:
     ) -> Image.Image:
         tw, th = target_size
         if crop_type == "resize":
+            # `infer_align_image_size=True` follows HF's direct-resize path
+            # for condition images; the generated output is aligned back to
+            # the input aspect ratio in `postprocess_outputs`.
             return image.resize((tw, th), resample=Image.Resampling.LANCZOS)
         w, h = image.size
         tr = th / tw
@@ -1486,6 +1490,58 @@ class HunyuanImage3ImageProcessor:
         crop_top = int(round((resize_height - th) / 2.0))
         crop_left = int(round((resize_width - tw) / 2.0))
         return image.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
+
+    def postprocess_outputs(
+        self,
+        outputs: list[Image.Image],
+        batch_cond_image_info: list[list[JointImageInfo]] | None,
+        infer_align_image_size: bool = False,
+    ) -> list[Image.Image]:
+        """Match official infer_align_image_size output-size alignment.
+
+        DiT generates at a bucket size. Infer-align mode restores the input
+        image ratio only when a matching condition-image bucket carries a
+        meaningfully different original ratio; otherwise the bucket-sized
+        output is already the official target.
+        """
+        if not infer_align_image_size or not batch_cond_image_info:
+            return outputs
+
+        target_area = self.reso_group.base_size**2
+        for batch_index, (output_image, cond_images) in enumerate(zip(outputs, batch_cond_image_info)):
+            if not cond_images:
+                continue
+
+            output_ratio_index = self.reso_group.get_base_size_and_ratio_index(
+                width=output_image.width,
+                height=output_image.height,
+            )[1]
+
+            for cond_image in cond_images:
+                vae_info = cond_image.vae_image_info
+                ori_width = vae_info.ori_image_width
+                ori_height = vae_info.ori_image_height
+                if output_ratio_index != vae_info.ratio_index or ori_width is None or ori_height is None:
+                    continue
+
+                # HF keeps the DiT bucket size when the original input ratio
+                # is already close to the selected bucket. Only resize when
+                # infer-align has preserved a meaningfully different input
+                # ratio, and keep the area near `base_size ** 2` so the output
+                # stays on the official resolution scale.
+                ratio_diff = abs(ori_height / ori_width - self.reso_group[output_ratio_index].ratio)
+                if ratio_diff >= 0.01:
+                    scale = math.sqrt(target_area / (ori_width * ori_height))
+                    new_w = round(ori_width * scale)
+                    new_h = round(ori_height * scale)
+                    outputs[batch_index] = output_image.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
+
+                # Stop at the first matching condition. This preserves HF's
+                # multi-image rule: align to the first condition whose bucket
+                # matches the generated output and ignore later candidates.
+                break
+
+        return outputs
 
 
 class HunYuanMLP(nn.Module):

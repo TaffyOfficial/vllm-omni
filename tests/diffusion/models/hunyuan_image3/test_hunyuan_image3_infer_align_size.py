@@ -16,9 +16,6 @@ from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import
     ImageInfo,
     JointImageInfo,
 )
-from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
-    _postprocess_infer_aligned_outputs,
-)
 from vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 import (
     HunyuanImage3Processor,
 )
@@ -34,30 +31,27 @@ def _gradient_image(width: int = 8, height: int = 4) -> Image.Image:
     return Image.fromarray(arr, mode="RGB")
 
 
-def test_ar_processor_default_center_crop_matches_official_default():
+def test_image_processor_default_center_crop_differs_from_resize():
     src = _gradient_image()
-    processor = object.__new__(HunyuanImage3Processor)
 
-    ar_default = processor._resize_and_crop(src, (4, 4))
     official_default = HunyuanImage3ImageProcessor._resize_and_crop(src, (4, 4), crop_type="center")
     resize_path = HunyuanImage3ImageProcessor._resize_and_crop(src, (4, 4), crop_type="resize")
 
-    assert ar_default.size == (4, 4)
-    assert np.array_equal(np.asarray(ar_default), np.asarray(official_default))
-    assert not np.array_equal(np.asarray(ar_default), np.asarray(resize_path))
+    assert official_default.size == (4, 4)
+    assert resize_path.size == (4, 4)
+    assert not np.array_equal(np.asarray(official_default), np.asarray(resize_path))
 
 
-def test_ar_processor_infer_align_true_uses_resize():
+def test_image_processor_infer_align_resize_mode_is_direct_resize():
     src = _gradient_image()
-    processor = object.__new__(HunyuanImage3Processor)
 
-    ar_resize = processor._resize_and_crop(src, (4, 4), crop_type="resize")
     official_resize = HunyuanImage3ImageProcessor._resize_and_crop(src, (4, 4), crop_type="resize")
     center_crop = HunyuanImage3ImageProcessor._resize_and_crop(src, (4, 4), crop_type="center")
 
-    assert ar_resize.size == (4, 4)
-    assert np.array_equal(np.asarray(ar_resize), np.asarray(official_resize))
-    assert not np.array_equal(np.asarray(ar_resize), np.asarray(center_crop))
+    assert official_resize.size == (4, 4)
+    expected_resize = src.resize((4, 4), resample=Image.Resampling.LANCZOS)
+    assert np.array_equal(np.asarray(official_resize), np.asarray(expected_resize))
+    assert not np.array_equal(np.asarray(official_resize), np.asarray(center_crop))
 
 
 class _FixedTargetResolutionGroup:
@@ -136,7 +130,9 @@ class _FakeResolutionGroup:
 
 
 def _fake_processor():
-    return SimpleNamespace(reso_group=_FakeResolutionGroup())
+    processor = object.__new__(HunyuanImage3ImageProcessor)
+    processor.reso_group = _FakeResolutionGroup()
+    return processor
 
 
 def _joint_cond(
@@ -173,7 +169,7 @@ def test_postprocess_single_matching_bucket_resizes_to_input_ratio_area():
     output = Image.new("RGB", (1024, 1024), color="white")
     cond = _joint_cond(ratio_index=0, ori_width=1200, ori_height=800)
 
-    processed = _postprocess_infer_aligned_outputs([output], [[cond]], _fake_processor())
+    processed = _fake_processor().postprocess_outputs([output], [[cond]], infer_align_image_size=True)
 
     assert processed[0].size == (1254, 836)
 
@@ -183,10 +179,10 @@ def test_postprocess_empty_and_mismatched_buckets_keep_outputs_unchanged():
     mismatch_output = Image.new("RGB", (1024, 1024), color="white")
     cond = _joint_cond(ratio_index=1, ori_width=1200, ori_height=800)
 
-    processed = _postprocess_infer_aligned_outputs(
+    processed = _fake_processor().postprocess_outputs(
         [no_image_output, mismatch_output],
         [[], [cond]],
-        _fake_processor(),
+        infer_align_image_size=True,
     )
 
     assert processed[0].size == (1024, 1024)
@@ -198,10 +194,10 @@ def test_postprocess_multi_image_uses_first_matching_bucket_only():
     mismatched = _joint_cond(ratio_index=1, ori_width=1600, ori_height=900)
     matched = _joint_cond(ratio_index=0, ori_width=1600, ori_height=900)
 
-    processed = _postprocess_infer_aligned_outputs(
+    processed = _fake_processor().postprocess_outputs(
         [output],
         [[mismatched, matched]],
-        _fake_processor(),
+        infer_align_image_size=True,
     )
 
     assert processed[0].size == (1365, 768)
@@ -210,4 +206,4 @@ def test_postprocess_multi_image_uses_first_matching_bucket_only():
 def test_postprocess_returns_outputs_when_batch_has_no_cond_info():
     outputs = [Image.new("RGB", (1024, 1024), color="white")]
 
-    assert _postprocess_infer_aligned_outputs(outputs, None, _fake_processor()) is outputs
+    assert _fake_processor().postprocess_outputs(outputs, None, infer_align_image_size=True) is outputs

@@ -879,6 +879,10 @@ class HunyuanImage3Processor:
         else:
             raise TypeError(f"Unsupported image type: {type(image_input)}.")
 
+        from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+            HunyuanImage3ImageProcessor,
+        )
+
         # Each cond image keeps its own VAE bucket (mirrors official HF's
         # ragged behavior in `_encode_cond_image`). VAE pixel tensors have
         # different (H_i, W_i) per image, so they're flattened to 1-D and
@@ -916,7 +920,9 @@ class HunyuanImage3Processor:
             # boundary (see `_vae_encode`).
             image_width, image_height = self.reso_group.get_target_size(image.width, image.height)
             crop_type = "resize" if self.infer_align_image_size else "center"
-            resized_image = self._resize_and_crop(image, (image_width, image_height), crop_type=crop_type)
+            resized_image = HunyuanImage3ImageProcessor._resize_and_crop(
+                image, (image_width, image_height), crop_type=crop_type
+            )
             vae_pixel_values = self.vae_processor(resized_image).squeeze(0)
             token_height = image_height // (self.hf_config.vae_downsample_factor[0] * self.hf_config.patch_size)
             token_width = image_width // (self.hf_config.vae_downsample_factor[1] * self.hf_config.patch_size)
@@ -960,29 +966,6 @@ class HunyuanImage3Processor:
         logger.info(f"Successfully processed {len(images)} image(s). Final tensor shapes: {shapes_info}")
 
         return final_image_info
-
-    def _resize_and_crop(
-        self,
-        image: Image.Image,
-        target_size: tuple[int, int],
-        crop_type: str = "center",
-    ) -> Image.Image:
-        tw, th = target_size
-        if crop_type == "resize":
-            return image.resize((tw, th), resample=Image.Resampling.LANCZOS)
-        w, h = image.size
-        tr = th / tw
-        r = h / w
-        if r < tr:
-            resize_height = th
-            resize_width = int(round(th / h * w))
-        else:
-            resize_width = tw
-            resize_height = int(round(tw / w * h))
-        image = image.resize((resize_width, resize_height), resample=Image.Resampling.LANCZOS)
-        crop_top = int(round((resize_height - th) / 2.0))
-        crop_left = int(round((resize_width - tw) / 2.0))
-        return image.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
 
 
 class HunyuanImage3ProcessingInfo(BaseProcessingInfo):

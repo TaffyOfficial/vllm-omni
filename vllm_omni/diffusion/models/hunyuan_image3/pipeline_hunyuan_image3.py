@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
-import math
 from collections.abc import Iterable
 from typing import Any
 
@@ -186,70 +185,6 @@ def _joint_image_info_from_payload(payload: Any) -> JointImageInfo:
         vision_image_info=vision_image_info,
         vision_encoder_kwargs=vision_encoder_kwargs,
     )
-
-
-def _postprocess_infer_aligned_outputs(
-    outputs: list[PILImage.Image],
-    batch_cond_image_info: list[list[JointImageInfo]] | None,
-    image_processor: HunyuanImage3ImageProcessor,
-) -> list[PILImage.Image]:
-    """Match official infer_align_image_size output-size alignment.
-
-    The DiT output is generated at a bucket size. For infer-align mode, HF
-    postprocesses a matching single image back to the original input-image
-    ratio while preserving approximately ``base_size ** 2`` area. With
-    multiple condition images, use the first condition whose bucket matches
-    the generated output bucket; otherwise keep the bucket-sized output.
-    """
-    if not batch_cond_image_info:
-        return outputs
-
-    target_area = image_processor.reso_group.base_size**2
-    for batch_index, (output_image, cond_images) in enumerate(zip(outputs, batch_cond_image_info)):
-        if not cond_images:
-            continue
-        output_ratio_index = image_processor.reso_group.get_base_size_and_ratio_index(
-            width=output_image.width,
-            height=output_image.height,
-        )[1]
-        cond_ratio_indices: list[int] = []
-        cond_ori_widths: list[int | None] = []
-        cond_ori_heights: list[int | None] = []
-        for cond_image in cond_images:
-            vae_info = cond_image.vae_image_info
-            cond_ratio_indices.append(vae_info.ratio_index)
-            cond_ori_widths.append(vae_info.ori_image_width)
-            cond_ori_heights.append(vae_info.ori_image_height)
-
-        if len(cond_images) == 1:
-            ratio_index = cond_ratio_indices[0]
-            ori_width = cond_ori_widths[0]
-            ori_height = cond_ori_heights[0]
-            if (
-                output_ratio_index == ratio_index
-                and ori_width is not None
-                and ori_height is not None
-                and abs(ori_height / ori_width - image_processor.reso_group[output_ratio_index].ratio) >= 0.01
-            ):
-                scale = math.sqrt(target_area / (ori_width * ori_height))
-                new_w = round(ori_width * scale)
-                new_h = round(ori_height * scale)
-                outputs[batch_index] = output_image.resize((new_w, new_h), resample=PILImage.Resampling.LANCZOS)
-        else:
-            for ratio_index, ori_width, ori_height in zip(cond_ratio_indices, cond_ori_widths, cond_ori_heights):
-                if (
-                    output_ratio_index == ratio_index
-                    and ori_width is not None
-                    and ori_height is not None
-                    and abs(ori_height / ori_width - image_processor.reso_group[output_ratio_index].ratio) >= 0.01
-                ):
-                    scale = math.sqrt(target_area / (ori_width * ori_height))
-                    new_w = round(ori_width * scale)
-                    new_h = round(ori_height * scale)
-                    outputs[batch_index] = output_image.resize((new_w, new_h), resample=PILImage.Resampling.LANCZOS)
-                    break
-
-    return outputs
 
 
 def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
@@ -1546,12 +1481,11 @@ class HunyuanImage3Pipeline(
         model_inputs.update(ar_kv_kwargs)
 
         outputs = self._generate(**model_inputs, **kwargs)
-        if infer_align_image_size:
-            outputs = _postprocess_infer_aligned_outputs(
-                outputs,
-                batch_cond_image_info=batch_cond_image_info,
-                image_processor=self.image_processor,
-            )
+        outputs = self.image_processor.postprocess_outputs(
+            outputs,
+            batch_cond_image_info=batch_cond_image_info,
+            infer_align_image_size=infer_align_image_size,
+        )
         custom_output = {}
         if any(t is not None for t in cot_text_list):
             custom_output["ar_generated_text"] = cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list
