@@ -31,7 +31,16 @@ def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey 
         return None
 
     sampling = request.sampling_params
-    return SamplingParamsKey(**{name: getattr(sampling, name) for name in _KEY_FIELD_NAMES})
+    values = {name: getattr(sampling, name) for name in _KEY_FIELD_NAMES}
+    extra_args = getattr(sampling, "extra_args", {}) or {}
+    if bool(extra_args.get("enable_mixfusion", False)):
+        prompt = request.prompts[0] if request.prompts else None
+        if isinstance(prompt, dict) and prompt.get("additional_information"):
+            return None
+        values["height"] = None
+        values["width"] = None
+        values["resolution"] = None
+    return SamplingParamsKey(**values)
 
 
 class _BaseScheduler(SchedulerInterface):
