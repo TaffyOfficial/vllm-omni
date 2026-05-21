@@ -142,3 +142,23 @@ def test_hunyuan_image3_step_execution_pads_different_prompt_lengths():
     assert model_kwargs["tokenizer_output"].tokens.tolist() == [[0, 1, 2], [10, 11, 99]]
     assert model_kwargs["tokenizer_output"].text_mask.tolist() == [[1, 1, 1], [1, 1, 0]]
     assert model_kwargs["tokenizer_output"].real_pos.tolist() == [3, 2]
+
+
+def test_hunyuan_image3_step_scheduler_keeps_latents_float32():
+    class FakeScheduler:
+        def step(self, noise_pred, timestep, sample, **kwargs):
+            del noise_pred, timestep, kwargs
+            return (sample.to(dtype=torch.float64) + 1,)
+
+    pipeline = object.__new__(HunyuanImage3Pipeline)
+    pipeline._pipeline = SimpleNamespace(prepare_extra_func_kwargs=lambda func, kwargs: {})
+    state = _make_state()
+    state.latents = torch.zeros((1, 1, 2, 2), dtype=torch.float32)
+    state.timesteps = torch.tensor([1.0])
+    state.extra = {"scheduler": FakeScheduler(), "generator": None}
+
+    pipeline.step_scheduler(state, torch.ones_like(state.latents))
+
+    assert state.step_index == 1
+    assert state.latents.dtype == torch.float32
+    assert state.latents.tolist() == [[[[1.0, 1.0], [1.0, 1.0]]]]

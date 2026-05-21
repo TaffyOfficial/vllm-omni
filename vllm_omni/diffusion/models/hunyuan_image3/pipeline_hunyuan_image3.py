@@ -646,9 +646,7 @@ class HunyuanImage3Pipeline(
             target_shapes = [(chunk.shape[0], chunk.shape[1], max_q_len, max_seq_len) for chunk in chunks]
         else:
             if any(chunk.ndim not in (2, 3) for chunk in chunks):
-                raise ValueError(
-                    f"HunyuanImage3 field {field_name} has unsupported ragged tensor ranks: {shapes}."
-                )
+                raise ValueError(f"HunyuanImage3 field {field_name} has unsupported ragged tensor ranks: {shapes}.")
             comparable_shapes = {chunk.shape[:1] + chunk.shape[2:] for chunk in chunks}
             if len(comparable_shapes) != 1:
                 raise ValueError(f"HunyuanImage3 field {field_name} has incompatible non-sequence shapes: {shapes}.")
@@ -1766,6 +1764,10 @@ class HunyuanImage3Pipeline(
             generator=generator,
             latents=sampling.latents,
         )
+        # Scheduler steps return float32 latents. Normalize the initial
+        # request-local latents to the same dtype so staggered AR->DiT
+        # admissions can still be gathered into one step-wise batch.
+        latents = latents.to(device=self.device, dtype=torch.float32).contiguous()
 
         scheduler = copy.deepcopy(self.scheduler)
         if hasattr(scheduler, "set_begin_index"):
@@ -1911,7 +1913,7 @@ class HunyuanImage3Pipeline(
             state.latents,
             **step_kwargs,
             return_dict=False,
-        )[0]
+        )[0].to(dtype=torch.float32)
         state.step_index += 1
 
     def post_decode(

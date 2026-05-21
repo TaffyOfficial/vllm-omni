@@ -683,6 +683,29 @@ class TestStepScheduler:
         assert sched_output.num_running_reqs == 2
         assert sched_output.num_waiting_reqs == 0
 
+    def test_step_batch_lets_late_request_catch_up_before_batching(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_a = scheduler.add_request(_make_step_request("a", num_inference_steps=4))
+        first = scheduler.schedule()
+        assert _new_ids(first) == [req_a]
+        scheduler.update_from_output(first, _make_step_output(req_a, step_index=1))
+
+        req_b = scheduler.add_request(_make_step_request("b", num_inference_steps=4))
+        catch_up = scheduler.schedule()
+        assert _new_ids(catch_up) == [req_b]
+        assert _cached_ids(catch_up) == []
+        assert catch_up.num_running_reqs == 2
+        assert catch_up.num_waiting_reqs == 0
+        scheduler.update_from_output(catch_up, _make_step_output(req_b, step_index=1))
+
+        batched = scheduler.schedule()
+        assert _new_ids(batched) == []
+        assert _cached_ids(batched) == [req_a, req_b]
+        assert batched.num_running_reqs == 2
+        assert batched.num_waiting_reqs == 0
+
     def test_step_batch_rejects_different_num_inference_steps(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=2))

@@ -11,8 +11,10 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
+    CachedRequestData,
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
+    NewRequestData,
 )
 
 if TYPE_CHECKING:
@@ -63,7 +65,67 @@ class StepScheduler(_BaseScheduler):
         return sched_req_id
 
     def schedule(self) -> DiffusionSchedulerOutput:
-        return super().schedule()
+        scheduled_new_reqs: list[NewRequestData] = []
+        scheduled_cached_req_ids: list[str] = []
+        newly_admitted: set[str] = set()
+
+        while self._waiting and len(self._running) < self.max_num_running_reqs:
+            sched_req_id = self._waiting[0]
+            state = self._request_states.get(sched_req_id)
+            if state is None:
+                self._waiting.popleft()
+                continue
+            if not self._can_schedule_waiting(state):
+                break
+
+            waiting_progress = self._request_progress.get(sched_req_id)
+            running_steps = [
+                progress.current_step
+                for running_id in self._running
+                if (progress := self._request_progress.get(running_id)) is not None
+            ]
+            if waiting_progress is not None and running_steps and waiting_progress.current_step > min(running_steps):
+                break
+
+            self._waiting.popleft()
+            was_new_request = state.status == DiffusionRequestStatus.WAITING
+            if not self._running:
+                self._running_sampling_params_key = state.sampling_params_key
+            state.status = DiffusionRequestStatus.RUNNING
+            self._running.append(sched_req_id)
+            if was_new_request:
+                newly_admitted.add(sched_req_id)
+
+        if self._running:
+            current_step = min(
+                progress.current_step
+                for sched_req_id in self._running
+                if (progress := self._request_progress.get(sched_req_id)) is not None
+            )
+            for sched_req_id in self._running:
+                progress = self._request_progress.get(sched_req_id)
+                if progress is None or progress.current_step != current_step:
+                    continue
+                state = self._request_states.get(sched_req_id)
+                if state is None:
+                    continue
+                if sched_req_id in newly_admitted:
+                    scheduled_new_reqs.append(NewRequestData.from_state(state))
+                else:
+                    scheduled_cached_req_ids.append(sched_req_id)
+
+        scheduler_output = DiffusionSchedulerOutput(
+            step_id=self._step_id,
+            scheduled_new_reqs=scheduled_new_reqs,
+            scheduled_cached_reqs=CachedRequestData(sched_req_ids=scheduled_cached_req_ids),
+            finished_req_ids=set(self._finished_req_ids),
+            num_running_reqs=len(self._running),
+            num_waiting_reqs=len(self._waiting),
+        )
+
+        self._step_id += 1
+        self._finished_req_ids.clear()
+        return scheduler_output
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         scheduled_req_ids = sched_output.scheduled_req_ids
