@@ -45,7 +45,9 @@ class StepScheduler(_BaseScheduler):
         if total_steps <= 0:
             raise ValueError(f"Diffusion request {sched_req_id} must have positive total_steps, got {total_steps}")
 
-        current_step = request.sampling_params.step_index or 0
+        current_step = request.sampling_params.step_index
+        if current_step is None:
+            current_step = 0
         if current_step < 0 or current_step >= total_steps:
             raise ValueError(
                 f"Diffusion request {sched_req_id} has invalid initial step_index {current_step} "
