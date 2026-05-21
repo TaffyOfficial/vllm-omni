@@ -39,10 +39,11 @@ Current engine/runtime limitations:
   mode yet. HunyuanImage3 carries its AR KV reuse metadata through
   request-local step state for its DiT path.
 - HunyuanImage3 grouped batching follows the shared sampling-parameter grouping
-  contract. Per-request prompt encoding remains independent, and the DiT
-  step-wise merge right-pads variable prompt-token sequence fields within the
-  active batch. Custom timesteps/sigmas are rejected, and staggered AR-to-DiT
-  arrivals can still execute as separate DiT batches.
+  contract. Per-request prompt encoding and denoise schedules remain
+  independent, and the DiT step-wise merge right-pads variable prompt-token
+  sequence fields within the active batch. Custom timesteps/sigmas are
+  rejected, and staggered AR-to-DiT arrivals can still execute as separate DiT
+  batches.
 - Unsupported pipelines now fail early during model loading instead of failing on the first request.
 
 ## Execution Contract

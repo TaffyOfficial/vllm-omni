@@ -63,10 +63,10 @@ and a small `max_num_seqs`, such as `2` or `4`.
 - Continuous batching under `step_execution` is experimental and only batches
   compatible requests.
 - HunyuanImage3 step execution currently requires one prompt per request and
-  batches only same-resolution requests with matching denoise step counts and
-  guidance settings. Per-request prompt encoding remains independent, and the
-  DiT step-wise merge right-pads variable prompt-token sequence fields within
-  the active batch. Custom timesteps/sigmas are rejected, and staggered
+  batches only same-resolution requests with matching guidance settings.
+  Per-request prompt encoding and denoise schedules remain independent, and
+  the DiT step-wise merge right-pads variable prompt-token sequence fields
+  within the active batch. Custom timesteps/sigmas are rejected, and staggered
   AR-to-DiT arrivals may still run as separate DiT batches. Sequence
   parallelism, CFG parallelism, and multi-output-per-prompt are rejected in
   this path.

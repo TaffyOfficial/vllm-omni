@@ -739,10 +739,13 @@ class HunyuanImage3Pipeline(
         states: list["DiffusionRequestState"],
     ) -> tuple[torch.Tensor, dict[str, Any], int]:
         cfg_factor = int(states[0].extra["cfg_factor"])
+        guidance_scale = float(states[0].extra["guidance_scale"])
         step_index = states[0].step_index
         for state in states:
             if int(state.extra["cfg_factor"]) != cfg_factor:
                 raise ValueError("HunyuanImage3 step_execution cannot batch mixed CFG modes.")
+            if float(state.extra["guidance_scale"]) != guidance_scale:
+                raise ValueError("HunyuanImage3 step_execution cannot batch mixed guidance scales.")
             if state.step_index != step_index:
                 raise ValueError(
                     "HunyuanImage3 step_execution does not support mixing first-step and decode-step rows."
@@ -757,8 +760,16 @@ class HunyuanImage3Pipeline(
         for state in states:
             keys.update(state.extra["model_kwargs"].keys())
         model_kwargs: dict[str, Any] = {}
+        request_local_keys = {
+            "generator",
+            "batch_gen_image_info",
+            "batch_cond_image_info",
+            "eos_token_id",
+            "max_new_tokens",
+            "num_inference_steps",
+        }
         for key in keys:
-            if key in {"generator", "batch_gen_image_info", "batch_cond_image_info", "eos_token_id", "max_new_tokens"}:
+            if key in request_local_keys:
                 continue
             model_kwargs[key] = self._merge_batch_value(
                 [state.extra["model_kwargs"].get(key) for state in states],
@@ -1873,7 +1884,7 @@ class HunyuanImage3Pipeline(
             if first_step:
                 self._capture_prompt_kv_cache(states, cfg_factor)
 
-            if step_index != states[0].total_steps - 1:
+            if any(state.step_index < state.total_steps - 1 for state in states):
                 offset = model_kwargs.get("ar_kv_reuse_offset", 0)
                 model_kwargs = self._update_model_kwargs_for_generation(
                     model_output,

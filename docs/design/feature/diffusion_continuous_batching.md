@@ -74,10 +74,11 @@ share the same denoise tensor contract.
 
 There are two important details:
 
-- `num_inference_steps` is part of the key, so requests with different total
-  denoise step counts are kept in separate batches
-- requests also do not need to be at the same current denoise progress; active
-  requests can continue batching even when their current step indices diverge
+- `num_inference_steps` is not part of the key, so requests with different
+  total denoise step counts can still share a batch
+- active requests do not need to have the same total denoise step count; the
+  scheduler may keep different-progress requests running together, while each
+  denoise forward still executes the subset at the current minimum step
 - admission is still FIFO, so an incompatible request at the head of the
   waiting queue blocks later compatible requests
 
@@ -136,8 +137,9 @@ batch packing.
 - Multi-prompt requests are not batched.
 - `cache_backend`, KV transfer, and other request-mode extras are not wired
   into the batched step-wise path yet.
-- Future work can add richer heterogeneous batching policies, such as
-  bucketing or padded execution for different resolutions.
+- Future work can relax the current same-shape restriction with richer
+  heterogeneous batching policies such as bucketing or padded execution for
+  different resolutions.
 
 ## Related Files
 

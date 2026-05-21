@@ -82,6 +82,7 @@ def test_hunyuan_image3_step_execution_merges_tokenizer_output_and_skips_generat
                 ),
                 "eos_token_id": [1, 2, 3],
                 "max_new_tokens": 4,
+                "num_inference_steps": 2 + idx,
             },
         }
 
@@ -95,6 +96,7 @@ def test_hunyuan_image3_step_execution_merges_tokenizer_output_and_skips_generat
     assert model_kwargs["tokenizer_output"].real_pos.tolist() == [2, 2]
     assert "eos_token_id" not in model_kwargs
     assert "max_new_tokens" not in model_kwargs
+    assert "num_inference_steps" not in model_kwargs
 
 
 def test_hunyuan_image3_step_execution_pads_different_prompt_lengths():
@@ -142,6 +144,78 @@ def test_hunyuan_image3_step_execution_pads_different_prompt_lengths():
     assert model_kwargs["tokenizer_output"].tokens.tolist() == [[0, 1, 2], [10, 11, 99]]
     assert model_kwargs["tokenizer_output"].text_mask.tolist() == [[1, 1, 1], [1, 1, 0]]
     assert model_kwargs["tokenizer_output"].real_pos.tolist() == [3, 2]
+
+
+def test_hunyuan_image3_step_execution_rejects_mixed_guidance_scales():
+    pipeline = object.__new__(HunyuanImage3Pipeline)
+    states = [_make_state(), _make_state()]
+    for idx, state in enumerate(states):
+        state.step_index = 1
+        state.extra = {
+            "cfg_factor": 2,
+            "guidance_scale": 2.5 + idx,
+            "input_ids": torch.tensor([[0, 1], [0, 1]]),
+            "model_kwargs": {
+                "attention_mask": torch.ones((2, 1, 2, 2), dtype=torch.bool),
+                "position_ids": torch.tensor([[0, 1], [0, 1]]),
+            },
+        }
+
+    with pytest.raises(ValueError, match="mixed guidance scales"):
+        pipeline._merge_step_model_inputs(states)
+
+
+def test_hunyuan_image3_denoise_updates_model_kwargs_until_each_state_is_final(monkeypatch):
+    pipeline = object.__new__(HunyuanImage3Pipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline._pipeline = SimpleNamespace(_guidance_scale=1.0)
+    states = [_make_state(), _make_state()]
+    for state, total_steps in zip(states, [2, 4]):
+        state.step_index = 1
+        state.timesteps = torch.arange(total_steps)
+        state.latents = torch.zeros((1, 1, 2, 2), dtype=torch.float32)
+        state.extra = {
+            "cfg_factor": 1,
+            "guidance_scale": 1.0,
+            "input_ids": torch.tensor([[0, 1]]),
+            "model_kwargs": {
+                "attention_mask": torch.ones((1, 1, 2, 2), dtype=torch.bool),
+                "position_ids": torch.tensor([[0, 1]]),
+            },
+        }
+
+    split_calls = []
+    monkeypatch.setattr(pipeline, "_restore_prompt_kv_cache", lambda states, cfg_factor: None)
+    monkeypatch.setattr(
+        pipeline,
+        "prepare_inputs_for_generation",
+        lambda input_ids, images, timestep, **model_kwargs: {},
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "forward_call",
+        lambda **kwargs: {"diffusion_prediction": torch.ones((2, 1, 2, 2), dtype=torch.float32)},
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_update_model_kwargs_for_generation",
+        lambda model_output, model_kwargs: model_kwargs,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_split_step_model_inputs",
+        lambda states, input_ids, model_kwargs, cfg_factor: split_calls.append([state.req_id for state in states]),
+    )
+    input_batch = SimpleNamespace(
+        states=states,
+        latents=torch.zeros((2, 1, 2, 2), dtype=torch.float32),
+        timesteps=torch.tensor([1, 1]),
+    )
+
+    pred = pipeline.denoise_step(input_batch)
+
+    assert pred.shape == (2, 1, 2, 2)
+    assert split_calls == [["req", "req"]]
 
 
 def test_hunyuan_image3_step_scheduler_keeps_latents_float32():
