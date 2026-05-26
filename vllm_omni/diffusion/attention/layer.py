@@ -261,8 +261,33 @@ class Attention(nn.Module):
             )
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 
+        full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
+        if (
+            self.attn_backend.get_name() == "FLASH_ATTN"
+            and full_attn_spans is not None
+            and self._has_nonhomogeneous_full_attn_spans(full_attn_spans)
+        ):
+            if attn_metadata.attn_mask is None:
+                raise ValueError("Non-homogeneous full-attention spans require an explicit attention mask.")
+            # HunyuanImage3 can co-batch prompts whose image-token spans differ after
+            # right padding. PR vllm-project/vllm-omni#3857 also pins the DiT
+            # precision-validation path to SDPA, so preserve the per-row 4D mask
+            # instead of forcing FlashAttention's homogeneous piecewise spans.
+            logger.warning_once(
+                "FlashAttention piecewise mixed causal/full masks require identical full-attention spans "
+                "across the batch. Falling back to SDPA for non-homogeneous spans."
+            )
+            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+
         # Fallback to standard attention
         return self.attention.forward(query, key, value, attn_metadata)
+
+    @staticmethod
+    def _has_nonhomogeneous_full_attn_spans(full_attn_spans: list[list[tuple[int, int]]]) -> bool:
+        if len(full_attn_spans) <= 1:
+            return False
+        ref = full_attn_spans[0]
+        return any(spans != ref for spans in full_attn_spans[1:])
 
     def _run_ring_attention(self, query, key, value, attn_metadata):
         # Delegate to RingParallelAttention strategy if available
