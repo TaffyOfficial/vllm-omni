@@ -2281,7 +2281,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         layers = extra_body.get("layers")
         resolution = extra_body.get("resolution")
         bot_task = extra_body.get("bot_task")
-        sys_type = extra_body.get("sys_type")
+        use_system_prompt = extra_body.get("use_system_prompt") or extra_body.get("sys_type")
         custom_system_prompt = extra_body.get("system_prompt")
 
         engine_prompt_data: dict[str, Any] | None = None
@@ -2295,7 +2295,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         prompt_token_ids: list[int] | None = None
         system_prompt_type: str | None = None
-        if bot_task is not None or sys_type is not None or custom_system_prompt is not None:
+        build_kwargs: dict[str, Any] = {}
+
+        if bot_task is not None or use_system_prompt is not None or custom_system_prompt is not None:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
                 build_prompt,
                 build_prompt_tokens,
@@ -2303,16 +2305,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             build_kwargs: dict[str, Any] = {
                 "task": "it2i" if reference_images else "t2i",
-                "sys_type": sys_type,
+                "sys_type": use_system_prompt,
                 "custom_system_prompt": custom_system_prompt,
                 "num_images": len(reference_images) if reference_images else 1,
             }
+
             if bot_task is not None:
                 build_kwargs["bot_task"] = bot_task
             elif "bot_task" in extra_body:
                 # Explicit None from the caller is plain-mode; omitted lets
                 # each task fall back to its default trigger.
-                build_kwargs["bot_task"] = None
+                build_kwargs["bot_task"] = extra_body["bot_task"]
             if tokenizer is not None:
                 # Feed segment-tokenized prompt_token_ids so AR matches HF
                 # apply_chat_template byte-for-byte (engine BPE would merge
@@ -2512,7 +2515,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         output_format: str = "png",
         output_compression: int = 100,
         size: str = "auto",
-    ) -> tuple[list[Image.Image], dict[str, Any], float] | ErrorResponse | AsyncIterator[str]:
+    ) -> tuple[list[Image.Image], dict[str, Any], float, str | None] | ErrorResponse | AsyncIterator[str]:
         """Generate diffusion images and return raw images plus generation stats."""
         if request_id is None:
             request_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
@@ -2595,8 +2598,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         images = getattr(result.request_output, "images", [])
         stage_durations = result.stage_durations
         peak_memory_mb = result.peak_memory_mb
+        cot_output = None
 
-        return self._flatten_diffusion_images(images), stage_durations, peak_memory_mb
+        req_out = getattr(result, "request_output", None)
+        if req_out:
+            prompt_obj = getattr(req_out, "prompt", None)
+            if isinstance(prompt_obj, dict):
+                extra = prompt_obj.get("extra", {})
+                if isinstance(extra, dict):
+                    ar_text = extra.get("ar_generated_text")
+                    if isinstance(ar_text, str) and ar_text.strip():
+                        cot_output = ar_text
+
+        return self._flatten_diffusion_images(images), stage_durations, peak_memory_mb, cot_output
 
     async def _stream_diffusion_image_chunks(
         self,
