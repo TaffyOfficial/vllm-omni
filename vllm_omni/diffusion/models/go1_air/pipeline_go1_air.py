@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
     wrap_methods_by_paths,
@@ -39,8 +40,22 @@ def get_go1_air_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class Go1AirPipeline(nn.Module, DiffusionPipelineProfilerMixin):
+class Go1AirPipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
     """GO-1-Air pipeline wrapper for the diffusion-policy implementation."""
+
+    _dit_modules: ClassVar[list[str]] = ["policy.model.action_model"]
+    _encoder_modules: ClassVar[list[str]] = ["policy.model.vision_model", "policy.model.language_model"]
+    _vae_modules: ClassVar[list[str]] = []
+    _resident_modules: ClassVar[list[str]] = [
+        "policy.model.mlp1",
+        "policy.model.k_proj_layers",
+        "policy.model.v_proj_layers",
+        "policy.model.state_adaptor",
+        "policy.model.action_adaptor",
+        "policy.model.time_embedder",
+        "policy.model.freq_embedder",
+        "policy.model.final_layer",
+    ]
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
@@ -49,7 +64,7 @@ class Go1AirPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self.model_dir = od_config.model
         self.config = self._build_config(od_config)
         custom_args = od_config.custom_pipeline_args or {}
-        self.strict_load = bool(custom_args.get("strict_load", False))
+        self.strict_load = bool(custom_args.get("strict_load", True))
         self.processor_model_name = str(custom_args.get("processor_model_name", DEFAULT_INTERNVL_PROCESSOR))
         enable_warmup = custom_args.get("enable_warmup")
         self.enable_warmup = bool(enable_warmup) if isinstance(enable_warmup, bool) else False

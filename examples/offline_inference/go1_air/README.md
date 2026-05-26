@@ -17,6 +17,20 @@ bash run.sh
 
 The smoke succeeds when it prints `[smoke] OK action shape=(1, 30, 16)`.
 
+## Input schema
+
+`Go1AirPipeline` expects pre-built tensors in
+`sampling_params.extra_args["batch_inputs"]`:
+
+* `observation.state`: `torch.Tensor[B, 16]`
+* `observation.task`: one string for `B=1`, or a string list/tuple of length `B`
+* `observation.images.<camera>`: `torch.Tensor[B, history, 3, 448, 448]`
+* `observation.images.<camera>_mask`: optional scalar, `(B,)`, or `(B, history)` boolean tensor
+* `control_freq`: optional scalar or `(B,)` tensor, defaulting to 30 Hz
+
+`extra_args["noise"]` is optional for deterministic debugging and must match
+`[B, 30, 16]`.
+
 ## Upstream license note
 
 The GO-1-Air weights on HuggingFace (`agibot-world/GO-1-Air`) are released under

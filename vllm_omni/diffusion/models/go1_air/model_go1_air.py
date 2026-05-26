@@ -20,6 +20,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
 from torch import nn
 from vllm.logger import init_logger
 
@@ -565,18 +566,6 @@ def action_block_spec(config: Go1AirConfig) -> InternLM2BlockSpec:
     )
 
 
-def squared_cos_cap_v2_alpha_bar(num_train_timesteps: int, device: torch.device) -> torch.Tensor:
-    """Cumulative ``alpha_bar`` schedule used by diffusers' ``squaredcos_cap_v2``.
-
-    ``alpha_bar(t) = cos((t/T + s)/(1+s) · π/2)^2`` with ``s = 0.008``,
-    normalised so ``alpha_bar(0) = 1``.
-    """
-    s = 0.008
-    steps = torch.arange(num_train_timesteps + 1, device=device, dtype=torch.float64) / num_train_timesteps
-    f = torch.cos((steps + s) / (1.0 + s) * math.pi / 2.0).pow(2)
-    return (f / f[0]).to(torch.float32)
-
-
 class SinusoidalScalarEmbedding(nn.Module):
     """Sinusoidal embedding for a scalar input (timestep, frequency)."""
 
@@ -590,7 +579,7 @@ class SinusoidalScalarEmbedding(nn.Module):
         half = self.dim // 2
         freqs = torch.exp(-math.log(10_000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / half)
         args = t.float().unsqueeze(-1) * freqs.unsqueeze(0)
-        result = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        result = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         return result.to(t.dtype if t.dtype.is_floating_point else torch.float32)
 
 
@@ -621,12 +610,12 @@ class TimestepEmbedder(nn.Module):
 
 
 def make_state_action_adaptor(in_dim: int, hidden_dim: int, out_dim: int) -> nn.Sequential:
-    """3-layer MLP with parameter indices 0/2/4 (interleaved with SiLU)."""
+    """3-layer MLP with parameter indices 0/2/4 (interleaved with tanh GELU)."""
     return nn.Sequential(
         nn.Linear(in_dim, hidden_dim, bias=True),
-        nn.SiLU(),
+        nn.GELU(approximate="tanh"),
         nn.Linear(hidden_dim, hidden_dim, bias=True),
-        nn.SiLU(),
+        nn.GELU(approximate="tanh"),
         nn.Linear(hidden_dim, out_dim, bias=True),
     )
 
@@ -644,7 +633,7 @@ class FinalLayer(nn.Module):
         self.norm_final = InternLM2RMSNorm(hidden_size, eps=eps)
         self.ffn_final = nn.Sequential()
         self.ffn_final.add_module("fc1", nn.Linear(hidden_size, hidden_size, bias=True))
-        self.ffn_final.add_module("act", nn.SiLU())
+        self.ffn_final.add_module("act", nn.GELU(approximate="tanh"))
         self.ffn_final.add_module("fc2", nn.Linear(hidden_size, action_dim, bias=True))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -841,11 +830,13 @@ class Go1Air(nn.Module):
 
         self._action_spec = spec
         self._action_rotary_emb = InternLM2RotaryEmbedding(spec.resolved_head_dim(), spec)
-        self.register_buffer(
-            "alpha_bar",
-            squared_cos_cap_v2_alpha_bar(config.num_train_timesteps, torch.device("cpu")),
-            persistent=False,
+        self.noise_scheduler_sample = DPMSolverMultistepScheduler(
+            num_train_timesteps=config.num_train_timesteps,
+            beta_schedule=config.beta_schedule,
+            prediction_type=config.prediction_type,
         )
+        if config.compile_model:
+            self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
 
     # ----- runtime knobs --------------------------------------------------
 
@@ -929,7 +920,7 @@ class Go1Air(nn.Module):
         action_tokens = self.action_adaptor(actions)
         time_tok = self.time_embedder(timesteps).unsqueeze(1)
         freq_tok = self.freq_embedder(control_freq).unsqueeze(1)
-        return torch.cat([freq_tok, time_tok, state_token, action_tokens], dim=1)
+        return torch.cat([time_tok, freq_tok, state_token, action_tokens], dim=1)
 
     def predict_clean(
         self,
@@ -1011,13 +1002,9 @@ class Go1Air(nn.Module):
             raise ValueError(f"Go1Air noise shape must be {shape}, got {tuple(noise.shape)}.")
         x = noise.to(device=device, dtype=dtype)
 
-        alpha_bar = self.alpha_bar.to(device=device)
-        train_steps = self.config.num_train_timesteps
-        infer_steps = self.config.num_inference_steps
-        idx = torch.linspace(train_steps - 1, 0, infer_steps, device=device).round().long()
-
-        for i in range(infer_steps):
-            t = idx[i].expand(bsz)
+        self.noise_scheduler_sample.set_timesteps(self.config.num_inference_steps, device=device)
+        for timestep in self.noise_scheduler_sample.timesteps:
+            t = timestep.expand(bsz).to(device=device)
             x0_pred = self.predict_clean(
                 x,
                 state,
@@ -1026,14 +1013,7 @@ class Go1Air(nn.Module):
                 vlm_layer_kv,
                 vlm_attention_mask,
             ).to(dtype)
-            if i < infer_steps - 1:
-                t_next = idx[i + 1]
-                a_t = alpha_bar[t[0]].clamp(min=1e-8)
-                a_next = alpha_bar[t_next].clamp(min=1e-8)
-                eps_pred = (x - a_t.sqrt() * x0_pred) / (1.0 - a_t).clamp(min=1e-8).sqrt()
-                x = a_next.sqrt() * x0_pred + (1.0 - a_next).clamp(min=0.0).sqrt() * eps_pred
-            else:
-                x = x0_pred
+            x = self.noise_scheduler_sample.step(x0_pred, timestep, x).prev_sample.to(dtype)
 
         return x
 
@@ -1068,15 +1048,11 @@ class Go1AirPolicy(nn.Module):
         policy = cls(config, processor_model_name=processor_model_name)
         policy._load_weights(Path(model_dir), strict=strict)
         policy._maybe_load_tokenizer(Path(model_dir))
-        # Real-mode forward needs both weights and a tokenizer; if either is
-        # missing, drop back to stub so the pipeline still produces a valid
-        # output shape instead of raising on first call.
         if policy._has_weights and policy._tokenizer is None:
-            logger.warning(
+            raise RuntimeError(
                 "Go1AirPolicy: checkpoint weights loaded but tokenizer is missing; "
-                "falling back to stub mode for forward()."
+                "real-checkpoint inference cannot continue."
             )
-            policy._has_weights = False
         return policy
 
     def _load_weights(self, model_dir: Path, *, strict: bool) -> None:
@@ -1287,6 +1263,12 @@ class Go1AirPolicy(nn.Module):
             bsz_cam, history = cam_tensor.shape[:2]
             if bsz_cam != batch_size:
                 raise ValueError(f"Go1AirPolicy expects '{cam_key}' batch {batch_size}, got {bsz_cam}.")
+            expected_shape = (3, self.config.image_resolution[0], self.config.image_resolution[1])
+            if tuple(cam_tensor.shape[2:]) != expected_shape:
+                raise ValueError(
+                    f"Go1AirPolicy expects '{cam_key}' per-frame shape {expected_shape}, "
+                    f"got {tuple(cam_tensor.shape[2:])}."
+                )
             cam_tensor = cam_tensor.to(device=device, dtype=dtype)
             mask = batch_inputs.get(f"{cam_key}_mask")
             for row in range(bsz_cam):
@@ -1327,9 +1309,11 @@ class Go1AirPolicy(nn.Module):
             input_ids_rows.append(prefix + task_ids)
 
         max_len = max(len(row) for row in input_ids_rows)
+        row_lengths = [len(row) for row in input_ids_rows]
         padded = [row + [pad_id] * (max_len - len(row)) for row in input_ids_rows]
         input_ids = torch.tensor(padded, device=device, dtype=torch.long)
-        attention_mask = (input_ids != pad_id).to(device=device)
+        positions = torch.arange(max_len, device=device).unsqueeze(0)
+        attention_mask = positions < torch.tensor(row_lengths, device=device).unsqueeze(1)
 
         return pixel_values, attention_mask, input_ids
 
