@@ -73,6 +73,7 @@ def test_hunyuan_image3_step_execution_merges_tokenizer_output_and_skips_generat
         state.step_index = 0
         state.extra = {
             "cfg_factor": 1,
+            "guidance_scale": 1.0,
             "input_ids": torch.tensor([[idx, idx + 10]]),
             "model_kwargs": {
                 "position_ids": torch.tensor([[0, 1]]),
@@ -108,6 +109,7 @@ def test_hunyuan_image3_step_execution_pads_different_prompt_lengths():
         state.step_index = 0
         state.extra = {
             "cfg_factor": 1,
+            "guidance_scale": 1.0,
             "input_ids": torch.arange(seq_len).unsqueeze(0) + idx * 10,
             "model_kwargs": {
                 "attention_mask": torch.ones((1, 1, seq_len, seq_len), dtype=torch.bool),
@@ -146,6 +148,28 @@ def test_hunyuan_image3_step_execution_pads_different_prompt_lengths():
     assert model_kwargs["tokenizer_output"].real_pos.tolist() == [3, 2]
 
 
+def test_hunyuan_image3_step_execution_merges_none_input_ids_after_first_step():
+    pipeline = object.__new__(HunyuanImage3Pipeline)
+    states = [_make_state(), _make_state()]
+    for state in states:
+        state.step_index = 1
+        state.extra = {
+            "cfg_factor": 1,
+            "guidance_scale": 1.0,
+            "input_ids": None,
+            "model_kwargs": {
+                "attention_mask": torch.ones((1, 1, 2, 2), dtype=torch.bool),
+                "position_ids": torch.tensor([[0, 1]]),
+            },
+        }
+
+    input_ids, model_kwargs, cfg_factor = pipeline._merge_step_model_inputs(states)
+
+    assert input_ids is None
+    assert cfg_factor == 1
+    assert model_kwargs["position_ids"].tolist() == [[0, 1], [0, 1]]
+
+
 def test_hunyuan_image3_step_execution_rejects_mixed_guidance_scales():
     pipeline = object.__new__(HunyuanImage3Pipeline)
     states = [_make_state(), _make_state()]
@@ -167,7 +191,7 @@ def test_hunyuan_image3_step_execution_rejects_mixed_guidance_scales():
 
 def test_hunyuan_image3_denoise_updates_model_kwargs_until_each_state_is_final(monkeypatch):
     pipeline = object.__new__(HunyuanImage3Pipeline)
-    pipeline.device = torch.device("cpu")
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")), raising=False)
     pipeline._pipeline = SimpleNamespace(_guidance_scale=1.0)
     states = [_make_state(), _make_state()]
     for state, total_steps in zip(states, [2, 4]):
@@ -204,7 +228,9 @@ def test_hunyuan_image3_denoise_updates_model_kwargs_until_each_state_is_final(m
     monkeypatch.setattr(
         pipeline,
         "_split_step_model_inputs",
-        lambda states, input_ids, model_kwargs, cfg_factor: split_calls.append([state.req_id for state in states]),
+        lambda states, input_ids, model_kwargs, cfg_factor: split_calls.append(
+            ([state.req_id for state in states], input_ids)
+        ),
     )
     input_batch = SimpleNamespace(
         states=states,
@@ -215,7 +241,33 @@ def test_hunyuan_image3_denoise_updates_model_kwargs_until_each_state_is_final(m
     pred = pipeline.denoise_step(input_batch)
 
     assert pred.shape == (2, 1, 2, 2)
-    assert split_calls == [["req", "req"]]
+    assert split_calls == [(["req", "req"], None)]
+
+
+def test_hunyuan_image3_restore_prompt_kv_cache_pads_variable_full_cache_lengths():
+    pipeline = object.__new__(HunyuanImage3Pipeline)
+    cache_owner = SimpleNamespace(image_kv_cache_map=None)
+    pipeline.model = SimpleNamespace(
+        layers=[SimpleNamespace(layer_idx=0, self_attn=SimpleNamespace(image_attn=cache_owner))]
+    )
+    states = [_make_state(), _make_state()]
+    key_a = torch.ones((1, 3, 1, 2))
+    value_a = key_a + 10
+    key_b = torch.ones((1, 2, 1, 2)) * 2
+    value_b = key_b + 10
+    for state, key, value in zip(states, [key_a, key_b], [value_a, value_b]):
+        state.step_index = 1
+        state.extra = {"prompt_kv_cache": {0: [(key, value)]}}
+
+    pipeline._restore_prompt_kv_cache(states, cfg_factor=1)
+
+    merged_key, merged_value = cache_owner.image_kv_cache_map
+    assert merged_key.shape == (2, 3, 1, 2)
+    assert merged_value.shape == (2, 3, 1, 2)
+    assert torch.allclose(merged_key[0], key_a[0])
+    assert torch.allclose(merged_key[1, :2], key_b[0])
+    assert torch.allclose(merged_key[1, 2], torch.zeros((1, 2)))
+    assert torch.allclose(merged_value[1, 2], torch.zeros((1, 2)))
 
 
 def test_hunyuan_image3_step_scheduler_keeps_latents_float32():

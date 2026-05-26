@@ -117,16 +117,9 @@ def test_no_ar_kv(bs):
     """
     No AR KV injected. Tests the basic first_step cache → update reuse path.
 
-    Sequence layout per batch on first_step (q_len=12, IMAGE_TOKEN_LEN=8):
-        [prompt(3) | image(8) | eoi(1)]
-        image_size = IMAGE_TOKEN_LEN + 1 = 9
-        cached_prompt_len = seq_len - image_size = 12 - 9 = 3
-
-    After first_step:
-        image_kv_cache_map stores prompt tokens [0:3] for each batch (total 3*bs tokens flat).
-
-    Update step (q_len=IMAGE_TOKEN_LEN=8, seq_len = cached_prompt(3) + eoi(1) + image(8) = 12):
-        _reuse_prompt_kv produces [cached_prompt(3) | new_image(8) | zero_eoi(1)] per batch.
+    Non-SP caches the full first-step KV and scatters later-step KV back into
+    absolute position_ids. The image/timestep positions are not assumed to be a
+    suffix of the first-step sequence.
     """
     mgr = _make_cache_mgr()
     assert mgr.image_kv_cache_map is None
@@ -138,33 +131,29 @@ def test_no_ar_kv(bs):
     _call_mgr(mgr, bs, q_len=q_len, seq_len=q_len, key_flat=k_flat, value_flat=v_flat, first_step=True)
 
     cached_key, cached_value = mgr.image_kv_cache_map
-    # 3 prompt tokens cached per batch
-    assert cached_key.shape[0] == 3 * bs
-    for b in range(bs):
-        flat_offset = b * q_len
-        cache_offset = b * 3
-        assert torch.allclose(cached_key[cache_offset : cache_offset + 3], k_flat[flat_offset : flat_offset + 3])
-        assert torch.allclose(cached_value[cache_offset : cache_offset + 3], v_flat[flat_offset : flat_offset + 3])
+    assert cached_key.shape == (bs, q_len, NUM_KV_HEADS, HEAD_DIM)
+    assert torch.allclose(cached_key, k_flat.reshape(bs, q_len, NUM_KV_HEADS, HEAD_DIM))
+    assert torch.allclose(cached_value, v_flat.reshape(bs, q_len, NUM_KV_HEADS, HEAD_DIM))
 
     # --- update step ---
     img_q_len = IMAGE_TOKEN_LEN
-    update_seq_len = 3 + 1 + img_q_len  # cached_prompt(3) + eoi(1) + image(8) = 12
+    update_seq_len = q_len
     new_img_k, new_img_v = _make_known_kv(bs * img_q_len, base=50.0)
 
     key_input = new_img_k.reshape(bs, img_q_len, NUM_KV_HEADS, HEAD_DIM)
     val_input = new_img_v.reshape(bs, img_q_len, NUM_KV_HEADS, HEAD_DIM)
-    result_k, result_v = mgr._reuse_prompt_kv(key_input, val_input, update_seq_len, bs=bs)
+    position_ids = torch.tensor([[4, 5, 6, 7, 8, 9, 10, 2]] * bs)
+    result_k, result_v = mgr._reuse_prompt_kv(key_input, val_input, update_seq_len, bs=bs, position_ids=position_ids)
 
     assert result_k.shape == (bs, update_seq_len, NUM_KV_HEADS, HEAD_DIM)
     for b in range(bs):
-        cache_offset = b * 3
+        expected_k = cached_key[b].clone()
+        expected_v = cached_value[b].clone()
         img_offset = b * img_q_len
-        # Cached prompt preserved
-        assert torch.allclose(result_k[b, :3], cached_key[cache_offset : cache_offset + 3])
-        # New image tokens
-        assert torch.allclose(result_k[b, 3 : 3 + img_q_len], new_img_k[img_offset : img_offset + img_q_len])
-        # Zero eoi at the end
-        assert torch.allclose(result_k[b, -1], torch.zeros(NUM_KV_HEADS, HEAD_DIM))
+        expected_k.index_copy_(0, position_ids[b], new_img_k[img_offset : img_offset + img_q_len])
+        expected_v.index_copy_(0, position_ids[b], new_img_v[img_offset : img_offset + img_q_len])
+        assert torch.allclose(result_k[b], expected_k)
+        assert torch.allclose(result_v[b], expected_v)
 
 
 # ============================================================
@@ -216,40 +205,39 @@ def test_ar_kv_no_cfg(sp_size):
 
     cached_key, cached_value = mgr.image_kv_cache_map
     if sp_size == 1:
-        # cached = ar(5) + prompt(3) = 8
-        expected_cached_len = 8
+        expected_cached_len = seq_len
+        assert cached_key.shape == (1, seq_len, NUM_KV_HEADS, HEAD_DIM)
     else:
         # cached = seq_len - shard_image_size = 17 - 4 = 13
         expected_cached_len = seq_len - shard_image_size
 
-    assert cached_key.shape[0] == expected_cached_len
-    # AR KV always at the front
-    assert torch.allclose(cached_key[:ar_len], ar_k)
-    assert torch.allclose(cached_value[:ar_len], ar_v)
-    # Prompt tokens follow AR
-    prompt_cached = expected_cached_len - ar_len
-    assert torch.allclose(cached_key[ar_len : ar_len + prompt_cached], k_raw[:prompt_cached])
+    if sp_size > 1:
+        assert cached_key.shape[0] == expected_cached_len
+        assert torch.allclose(cached_key[:ar_len], ar_k)
+        assert torch.allclose(cached_value[:ar_len], ar_v)
+        prompt_cached = expected_cached_len - ar_len
+        assert torch.allclose(cached_key[ar_len : ar_len + prompt_cached], k_raw[:prompt_cached])
     # AR KV consumed
     assert mgr._injected_ar_kv is None
 
     # --- update step: call _reuse_prompt_kv directly ---
     if sp_size == 1:
         img_q_len = IMAGE_TOKEN_LEN
-        update_seq_len = expected_cached_len + 1 + img_q_len  # 8 + 1 + 8 = 17
+        update_seq_len = seq_len
         new_img_k, new_img_v = _make_known_kv(img_q_len, base=50.0)
 
         key_input = new_img_k.reshape(1, img_q_len, NUM_KV_HEADS, HEAD_DIM)
         val_input = new_img_v.reshape(1, img_q_len, NUM_KV_HEADS, HEAD_DIM)
-        result_k, result_v = mgr._reuse_prompt_kv(key_input, val_input, update_seq_len, bs=1)
+        position_ids = torch.tensor([[8, 9, 10, 11, 12, 13, 14, 16]])
+        result_k, result_v = mgr._reuse_prompt_kv(key_input, val_input, update_seq_len, bs=1, position_ids=position_ids)
 
         assert result_k.shape == (1, update_seq_len, NUM_KV_HEADS, HEAD_DIM)
-        # AR + prompt preserved
-        assert torch.allclose(result_k[0, :ar_len], ar_k)
-        assert torch.allclose(result_k[0, ar_len : ar_len + prompt_cached], k_raw[:prompt_cached])
-        # New image tokens
-        assert torch.allclose(result_k[0, expected_cached_len : expected_cached_len + img_q_len], new_img_k)
-        # Zero eoi
-        assert torch.allclose(result_k[0, -1], torch.zeros(NUM_KV_HEADS, HEAD_DIM))
+        expected_k = cached_key[0].clone()
+        expected_v = cached_value[0].clone()
+        expected_k.index_copy_(0, position_ids[0], new_img_k)
+        expected_v.index_copy_(0, position_ids[0], new_img_v)
+        assert torch.allclose(result_k[0], expected_k)
+        assert torch.allclose(result_v[0], expected_v)
     else:
         # SP path: _reuse_prompt_kv returns only cached prompt (no image concat)
         img_q_len = shard_image_size  # 4
@@ -358,48 +346,41 @@ def test_ar_kv_with_cfg(cfg_parallel, bs):
     _call_mgr(mgr, bs, q_len=q_len, seq_len=seq_len, key_flat=k_flat, value_flat=v_flat, first_step=True)
 
     cached_key, cached_value = mgr.image_kv_cache_map
-    cached_prompt_len_per_batch = seq_len - (IMAGE_TOKEN_LEN + 1)  # 22 - 9 = 13
-    assert cached_key.shape[0] == cached_prompt_len_per_batch * bs
+    assert cached_key.shape == (bs, seq_len, NUM_KV_HEADS, HEAD_DIM)
     assert mgr._injected_ar_kv is None
 
     if not cfg_parallel:
         # bs=2: batch 0 = pos, batch 1 = neg
         # Batch 0: pos_ar(10) + prompt(3)
-        assert torch.allclose(cached_key[:positive_reuse_len], pos_ar_k)
-        assert torch.allclose(cached_key[positive_reuse_len:13], k_flat[:3])
+        assert torch.allclose(cached_key[0, :positive_reuse_len], pos_ar_k)
+        assert torch.allclose(cached_key[0, positive_reuse_len:13], k_flat[:3])
         # Batch 1: neg_ar(10) + prompt(3)
-        assert torch.allclose(cached_key[13:23], neg_ar_k)
-        assert torch.allclose(cached_key[23:26], k_flat[q_len : q_len + 3])
+        assert torch.allclose(cached_key[1, :positive_reuse_len], neg_ar_k)
+        assert torch.allclose(cached_key[1, positive_reuse_len:13], k_flat[q_len : q_len + 3])
     else:
         # bs=1: only neg branch
-        assert torch.allclose(cached_key[:positive_reuse_len], neg_ar_k)
-        assert torch.allclose(cached_key[positive_reuse_len:13], k_flat[:3])
+        assert torch.allclose(cached_key[0, :positive_reuse_len], neg_ar_k)
+        assert torch.allclose(cached_key[0, positive_reuse_len:13], k_flat[:3])
 
     # --- update step ---
     img_q_len = IMAGE_TOKEN_LEN
-    update_seq_len = cached_prompt_len_per_batch + 1 + img_q_len  # 13 + 1 + 8 = 22
+    update_seq_len = seq_len
     new_img_k, new_img_v = _make_known_kv(bs * img_q_len, base=50.0)
 
     key_input = new_img_k.reshape(bs, img_q_len, NUM_KV_HEADS, HEAD_DIM)
     val_input = new_img_v.reshape(bs, img_q_len, NUM_KV_HEADS, HEAD_DIM)
-    result_k, result_v = mgr._reuse_prompt_kv(key_input, val_input, update_seq_len, bs=bs)
+    position_ids = torch.tensor([[13, 14, 15, 16, 17, 18, 19, 21]] * bs)
+    result_k, result_v = mgr._reuse_prompt_kv(key_input, val_input, update_seq_len, bs=bs, position_ids=position_ids)
 
     assert result_k.shape == (bs, update_seq_len, NUM_KV_HEADS, HEAD_DIM)
     for b in range(bs):
-        cache_offset = b * cached_prompt_len_per_batch
-        # Cached prompt preserved
-        assert torch.allclose(
-            result_k[b, :cached_prompt_len_per_batch],
-            cached_key[cache_offset : cache_offset + cached_prompt_len_per_batch],
-        )
-        # New image tokens
+        expected_k = cached_key[b].clone()
+        expected_v = cached_value[b].clone()
         img_offset = b * img_q_len
-        assert torch.allclose(
-            result_k[b, cached_prompt_len_per_batch : cached_prompt_len_per_batch + img_q_len],
-            new_img_k[img_offset : img_offset + img_q_len],
-        )
-        # Zero eoi
-        assert torch.allclose(result_k[b, -1], torch.zeros(NUM_KV_HEADS, HEAD_DIM))
+        expected_k.index_copy_(0, position_ids[b], new_img_k[img_offset : img_offset + img_q_len])
+        expected_v.index_copy_(0, position_ids[b], new_img_v[img_offset : img_offset + img_q_len])
+        assert torch.allclose(result_k[b], expected_k)
+        assert torch.allclose(result_v[b], expected_v)
 
 
 # ============================================================
@@ -431,10 +412,9 @@ def test_cross_request_isolation():
     _call_mgr(mgr, bs, q_len=seq_len, seq_len=seq_len, key_flat=k_flat, value_flat=v_flat, first_step=True)
 
     cached_key, cached_value = mgr.image_kv_cache_map
-    # cached_prompt_len = 12 - 9 = 3
-    assert cached_key.shape[0] == 3
+    assert cached_key.shape == (1, seq_len, NUM_KV_HEADS, HEAD_DIM)
     # Must be from current request, not stale
-    assert torch.allclose(cached_key[:3], k_flat[:3])
-    assert torch.allclose(cached_value[:3], v_flat[:3])
+    assert torch.allclose(cached_key[0], k_flat.reshape(1, seq_len, NUM_KV_HEADS, HEAD_DIM)[0])
+    assert torch.allclose(cached_value[0], v_flat.reshape(1, seq_len, NUM_KV_HEADS, HEAD_DIM)[0])
     # Stale values must not be present
     assert not torch.any(cached_key >= 999.0)

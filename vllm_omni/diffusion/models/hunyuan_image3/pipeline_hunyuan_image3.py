@@ -611,6 +611,24 @@ class HunyuanImage3Pipeline(
                     key, value = cache[branch]
                     keys.append(key)
                     values.append(value)
+            if keys and keys[0].dim() == 4:
+                max_seq_len = max(key.shape[1] for key in keys)
+                padded_keys: list[torch.Tensor] = []
+                padded_values: list[torch.Tensor] = []
+                for key, value in zip(keys, values):
+                    if key.shape[1] == max_seq_len:
+                        padded_keys.append(key)
+                        padded_values.append(value)
+                        continue
+                    target_shape = (key.shape[0], max_seq_len, *key.shape[2:])
+                    padded_key = key.new_zeros(target_shape)
+                    padded_value = value.new_zeros(target_shape)
+                    padded_key[:, : key.shape[1]] = key
+                    padded_value[:, : value.shape[1]] = value
+                    padded_keys.append(padded_key)
+                    padded_values.append(padded_value)
+                keys = padded_keys
+                values = padded_values
             layer.self_attn.image_attn.image_kv_cache_map = (torch.cat(keys, dim=0), torch.cat(values, dim=0))
 
     def _step_sequence_pad_value(self, field_name: str, tensor: torch.Tensor) -> int | float | bool | None:
@@ -737,7 +755,7 @@ class HunyuanImage3Pipeline(
     def _merge_step_model_inputs(
         self,
         states: list["DiffusionRequestState"],
-    ) -> tuple[torch.Tensor, dict[str, Any], int]:
+    ) -> tuple[torch.Tensor | None, dict[str, Any], int]:
         cfg_factor = int(states[0].extra["cfg_factor"])
         guidance_scale = float(states[0].extra["guidance_scale"])
         step_index = states[0].step_index
@@ -785,7 +803,7 @@ class HunyuanImage3Pipeline(
     def _split_step_model_inputs(
         self,
         states: list["DiffusionRequestState"],
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         model_kwargs: dict[str, Any],
         cfg_factor: int,
     ) -> None:
@@ -1359,7 +1377,7 @@ class HunyuanImage3Pipeline(
         if inputs_embeds is not None and past_key_values is None:
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
-            if input_ids.shape[1] != kwargs["position_ids"].shape[1]:  # in decode steps
+            if input_ids is not None and input_ids.shape[1] != kwargs["position_ids"].shape[1]:  # in decode steps
                 input_ids = torch.gather(input_ids, dim=1, index=kwargs["position_ids"])
             model_inputs = {"input_ids": input_ids}
 
@@ -1577,9 +1595,14 @@ class HunyuanImage3Pipeline(
         )
         custom_pos_emb = self.get_pos_emb(custom_pos_emb, position_ids)
 
-        inputs_embeds = self.model.embed_tokens(input_ids)
-
-        bsz, seq_len, n_embd = inputs_embeds.shape
+        if input_ids is not None:
+            inputs_embeds = self.model.embed_tokens(input_ids)
+            bsz, seq_len, n_embd = inputs_embeds.shape
+        else:
+            inputs_embeds = None
+            bsz = images.shape[0] if isinstance(images, torch.Tensor) else len(images)
+            seq_len = 0
+            n_embd = self.config.hidden_size
 
         # Instantiate placeholder tokens: <timestep>, <img> for the gen image
         if mode == "gen_text":
@@ -1590,6 +1613,7 @@ class HunyuanImage3Pipeline(
             token_h, token_w = None, None
         else:
             if first_step:
+                assert inputs_embeds is not None
                 inputs_embeds, token_h, token_w = self.instantiate_vae_image_tokens(
                     inputs_embeds, images, timestep, image_mask
                 )
@@ -1611,6 +1635,8 @@ class HunyuanImage3Pipeline(
             inputs_embeds = self.instantiate_vit_image_tokens(
                 inputs_embeds, cond_vit_images, cond_vit_image_mask, vit_kwargs
             )
+        assert inputs_embeds is not None
+        bsz, seq_len, n_embd = inputs_embeds.shape
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         from vllm.forward_context import set_forward_context
@@ -1649,7 +1675,7 @@ class HunyuanImage3Pipeline(
             diffusion_prediction = None
         else:
             logits = None
-            hidden_states = hidden_states.to(input_ids.device)
+            hidden_states = hidden_states.to(inputs_embeds.device)
             assert hidden_states.numel() == bsz * seq_len * n_embd, (
                 f"Shape mismatch: {hidden_states.shape} cannot reshape to ({bsz}, {seq_len}, {n_embd})"
             )
@@ -1885,14 +1911,11 @@ class HunyuanImage3Pipeline(
                 self._capture_prompt_kv_cache(states, cfg_factor)
 
             if any(state.step_index < state.total_steps - 1 for state in states):
-                offset = model_kwargs.get("ar_kv_reuse_offset", 0)
                 model_kwargs = self._update_model_kwargs_for_generation(
                     model_output,
                     model_kwargs,
                 )
-                if input_ids.shape[1] != model_kwargs["position_ids"].shape[1]:
-                    index = model_kwargs["position_ids"] - offset
-                    input_ids = torch.gather(input_ids, 1, index=index)
+                input_ids = None
                 attention_mask = model_kwargs["attention_mask"]
                 bsz, _, q_len, seq_len = attention_mask.shape
                 model_kwargs["query_lens"] = [q_len] * bsz

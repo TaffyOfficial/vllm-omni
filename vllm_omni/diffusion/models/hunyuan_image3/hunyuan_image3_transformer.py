@@ -939,7 +939,11 @@ class ImageKVCacheManager:
             key = torch.cat(new_keys, dim=0)
             value = torch.cat(new_values, dim=0)
 
-        image_size = shard_image_size if self.sp_size > 1 else (self.image_token_len + 1)
+        if self.sp_size <= 1:
+            self.image_kv_cache_map = (key.contiguous(), value.contiguous())
+            return key, value
+
+        image_size = shard_image_size
         cached_prompt_len = seq_len - image_size
 
         cached_key = key[:, :cached_prompt_len].reshape(-1, num_kv_heads, head_dim)
@@ -954,15 +958,27 @@ class ImageKVCacheManager:
         seq_len: int,
         bs: int,
         shard_image_size: int | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Reuse cached prompt KV in subsequent denoising steps.
 
-        Non-SP: returns [cached_prompt, new_image, zero_eoi] shaped [bs, seq_len, ...].
+        Non-SP: scatters current image KV into the full first-step cache by absolute position_ids.
         SP: returns cached prompt only shaped [bs, cached_prompt_len, ...] (used as joint_text).
         """
         cached_key, cached_value = self.image_kv_cache_map
         _, q_len, num_kv_heads, head_dim = key.shape
+        if cached_key.dim() == 4:
+            assert shard_image_size is None
+            assert position_ids is not None
+            assert position_ids.shape == (bs, q_len)
+            result_k = cached_key.clone()
+            result_v = cached_value.clone()
+            for b in range(bs):
+                result_k[b].index_copy_(0, position_ids[b], key[b])
+                result_v[b].index_copy_(0, position_ids[b], value[b])
+            return result_k.contiguous(), result_v.contiguous()
+
         cached_prompt_len = cached_key.shape[0] // bs
 
         if shard_image_size is not None:
@@ -1070,7 +1086,7 @@ class ImageKVCacheManager:
                 value = value[:, local_prompt_len:, :, :]
         else:
             if self.sp_size <= 1:
-                key, value = self._reuse_prompt_kv(key, value, seq_len, bs)
+                key, value = self._reuse_prompt_kv(key, value, seq_len, bs, position_ids=kwargs.get("position_ids"))
             else:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._reuse_prompt_kv(key, value, seq_len, bs, shard_image_size)
@@ -1814,6 +1830,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             custom_pos_emb=custom_pos_emb,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
