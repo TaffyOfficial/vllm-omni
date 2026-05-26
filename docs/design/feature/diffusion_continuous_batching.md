@@ -75,10 +75,9 @@ share the same denoise tensor contract.
 There are two important details:
 
 - `num_inference_steps` is not part of the key, so requests with different
-  total denoise step counts can still share a batch
-- active requests do not need to have the same total denoise step count; the
-  scheduler may keep different-progress requests running together, while each
-  denoise forward still executes the subset at the current minimum step
+  total step counts can still share a batch
+- requests also do not need to be at the same current denoise progress; active
+  requests can continue batching even when their current step indices diverge
 - admission is still FIFO, so an incompatible request at the head of the
   waiting queue blocks later compatible requests
 
