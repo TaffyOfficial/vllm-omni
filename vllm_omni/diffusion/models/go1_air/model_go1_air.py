@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GO-1-Air policy and top-level model.
+"""GO-1-Air policy, top-level model, and checkpoint-aligned submodules.
 
 The submodule layout mirrors the upstream safetensors index so a
 ``model.load_state_dict`` call lines up directly: ``vision_model.*``,
@@ -13,27 +13,756 @@ children of :class:`Go1Air`.
 from __future__ import annotations
 
 import json
+import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from vllm.logger import init_logger
 
-from .action_expert import (
-    ActionExpertBlock,
-    FinalLayer,
-    TimestepEmbedder,
-    action_block_spec,
-    make_state_action_adaptor,
-    squared_cos_cap_v2_alpha_bar,
-)
 from .config import OBS_IMAGES, OBS_STATE, OBS_TASK, Go1AirConfig
-from .internlm2_layers import InternLM2RMSNorm, InternLM2RotaryEmbedding
-from .language_internlm2_go1 import InternLM2GO1LanguageModel
-from .vision_internvit import InternVisionModel, InternViTSpec, pixel_shuffle
 
 logger = init_logger(__name__)
+
+# ----- InternLM2 shared blocks -----------------------------------------
+
+
+@dataclass
+class InternLM2BlockSpec:
+    """Hyperparameters for one InternLM2-style transformer stack."""
+
+    hidden_size: int
+    intermediate_size: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int | None = None
+    rms_norm_eps: float = 1e-5
+    rope_theta: float = 1_000_000.0
+    rope_scaling_factor: float = 2.0
+    rope_scaling_type: str = "dynamic"
+    max_position_embeddings: int = 32_768
+    attn_implementation: str = "eager"
+
+    def resolved_head_dim(self) -> int:
+        return self.head_dim if self.head_dim is not None else self.hidden_size // self.num_attention_heads
+
+    @property
+    def num_kv_groups(self) -> int:
+        # Number of query heads sharing one KV head.
+        return self.num_attention_heads // self.num_key_value_heads
+
+
+class InternLM2RMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        x = hidden_states.to(torch.float32)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        return (self.weight * x).to(input_dtype)
+
+
+def _build_inv_freq(head_dim: int, base: float, device: torch.device) -> torch.Tensor:
+    return 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
+
+
+class InternLM2RotaryEmbedding(nn.Module):
+    """RoPE with optional NTK-aware dynamic scaling.
+
+    Dynamic scaling adjusts the base when the sequence exceeds the trained
+    context window. For GO-1-Air's typical input length (vision + state +
+    action tokens, well under 32K) this short-circuits to the static path.
+    """
+
+    def __init__(self, head_dim: int, spec: InternLM2BlockSpec) -> None:
+        super().__init__()
+        self.head_dim = head_dim
+        self.base = float(spec.rope_theta)
+        self.scaling_factor = float(spec.rope_scaling_factor)
+        self.scaling_type = spec.rope_scaling_type
+        self.max_position_embeddings = int(spec.max_position_embeddings)
+        inv_freq = _build_inv_freq(head_dim, self.base, torch.device("cpu"))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    @torch.no_grad()
+    def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        device = position_ids.device
+        seq_max = int(position_ids.max().item()) + 1 if position_ids.numel() > 0 else 1
+        if self.scaling_type == "dynamic" and seq_max > self.max_position_embeddings:
+            scale = self.scaling_factor * seq_max / self.max_position_embeddings - (self.scaling_factor - 1.0)
+            new_base = self.base * (scale ** (self.head_dim / (self.head_dim - 2)))
+            inv_freq = _build_inv_freq(self.head_dim, new_base, device)
+        else:
+            inv_freq = self.inv_freq.to(device)
+
+        freqs = position_ids.float().unsqueeze(-1) * inv_freq.unsqueeze(0)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos(), emb.sin()
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+def apply_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    q_rot = (q * cos) + (_rotate_half(q) * sin)
+    k_rot = (k * cos) + (_rotate_half(k) * sin)
+    return q_rot.to(q.dtype), k_rot.to(k.dtype)
+
+
+def repeat_kv(x: torch.Tensor, repeats: int) -> torch.Tensor:
+    if repeats == 1:
+        return x
+    b, h, t, d = x.shape
+    return x.unsqueeze(2).expand(b, h, repeats, t, d).reshape(b, h * repeats, t, d)
+
+
+class InternLM2Attention(nn.Module):
+    """Self-attention with combined ``wqkv`` + grouped-query attention.
+
+    The combined projection lays out per kv-group as ``num_kv_groups`` query
+    heads followed by one K head and one V head, then flattens. We undo that
+    layout in :meth:`forward` to obtain Q/K/V tensors compatible with
+    standard scaled dot-product attention.
+    """
+
+    def __init__(self, spec: InternLM2BlockSpec) -> None:
+        super().__init__()
+        self.spec = spec
+        self.head_dim = spec.resolved_head_dim()
+        self.num_q_heads = spec.num_attention_heads
+        self.num_kv_heads = spec.num_key_value_heads
+        self.num_kv_groups = spec.num_kv_groups
+        per_group_heads = self.num_kv_groups + 2
+        self.wqkv = nn.Linear(
+            spec.hidden_size,
+            self.num_kv_heads * per_group_heads * self.head_dim,
+            bias=False,
+        )
+        self.wo = nn.Linear(self.num_q_heads * self.head_dim, spec.hidden_size, bias=False)
+
+    def split_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bsz, seqlen, _ = hidden_states.shape
+        per_group_heads = self.num_kv_groups + 2
+        qkv = self.wqkv(hidden_states).view(
+            bsz,
+            seqlen,
+            self.num_kv_heads,
+            per_group_heads,
+            self.head_dim,
+        )
+        # Q: first num_kv_groups slices per kv-group → fold groups into a single head axis.
+        q = qkv[..., : self.num_kv_groups, :].reshape(
+            bsz, seqlen, self.num_kv_heads * self.num_kv_groups, self.head_dim
+        )
+        k = qkv[..., -2, :]
+        v = qkv[..., -1, :]
+        # (B, H, T, D)
+        return (
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        rotary_emb: InternLM2RotaryEmbedding,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q, k, v = self.split_qkv(hidden_states)
+        cos, sin = rotary_emb(position_ids)
+        q, k = apply_rope(q, k, cos, sin)
+        attn_out = scaled_dot_product(
+            q,
+            k,
+            v,
+            num_kv_groups=self.num_kv_groups,
+            mask=attention_mask,
+            implementation=self.spec.attn_implementation,
+        )
+        bsz, _, seqlen, _ = q.shape
+        out = attn_out.transpose(1, 2).reshape(bsz, seqlen, -1)
+        return self.wo(out), k, v
+
+
+def scaled_dot_product(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    num_kv_groups: int,
+    mask: torch.Tensor | None,
+    implementation: str,
+) -> torch.Tensor:
+    k_full = repeat_kv(k, num_kv_groups)
+    v_full = repeat_kv(v, num_kv_groups)
+    if implementation == "sdpa":
+        return F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=mask, is_causal=mask is None)
+    scale = 1.0 / math.sqrt(q.shape[-1])
+    scores = torch.matmul(q, k_full.transpose(-2, -1)) * scale
+    if mask is not None:
+        scores = scores + mask
+    probs = scores.softmax(dim=-1).to(v_full.dtype)
+    return torch.matmul(probs, v_full)
+
+
+class InternLM2FeedForward(nn.Module):
+    """SwiGLU MLP with InternLM2 parameter naming (w1 gate, w3 up, w2 down)."""
+
+    def __init__(self, spec: InternLM2BlockSpec) -> None:
+        super().__init__()
+        self.w1 = nn.Linear(spec.hidden_size, spec.intermediate_size, bias=False)
+        self.w3 = nn.Linear(spec.hidden_size, spec.intermediate_size, bias=False)
+        self.w2 = nn.Linear(spec.intermediate_size, spec.hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class InternLM2Block(nn.Module):
+    """One pre-norm decoder block: attention → FFN, both residual."""
+
+    def __init__(self, spec: InternLM2BlockSpec) -> None:
+        super().__init__()
+        self.attention_norm = InternLM2RMSNorm(spec.hidden_size, eps=spec.rms_norm_eps)
+        self.attention = InternLM2Attention(spec)
+        self.ffn_norm = InternLM2RMSNorm(spec.hidden_size, eps=spec.rms_norm_eps)
+        self.feed_forward = InternLM2FeedForward(spec)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        rotary_emb: InternLM2RotaryEmbedding,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        attn_input = self.attention_norm(hidden_states)
+        attn_out, k, v = self.attention(attn_input, position_ids, rotary_emb, attention_mask)
+        hidden_states = hidden_states + attn_out
+        ffn_input = self.ffn_norm(hidden_states)
+        hidden_states = hidden_states + self.feed_forward(ffn_input)
+        return hidden_states, k, v
+
+
+# ----- InternViT vision encoder ----------------------------------------
+
+
+@dataclass
+class InternViTSpec:
+    image_size: int
+    patch_size: int
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    qkv_bias: bool
+    qk_normalization: bool
+    norm_type: str
+
+    @classmethod
+    def from_config(cls, config: Go1AirConfig) -> InternViTSpec:
+        return cls(
+            image_size=config.image_resolution[0],
+            patch_size=config.vision_patch_size,
+            hidden_size=config.vision_hidden_size,
+            intermediate_size=config.vision_intermediate_size,
+            num_hidden_layers=config.vision_num_hidden_layers,
+            num_attention_heads=config.vision_num_attention_heads,
+            qkv_bias=config.vision_qkv_bias,
+            qk_normalization=config.vision_qk_normalization,
+            norm_type=config.vision_norm_type,
+        )
+
+    @property
+    def num_patches(self) -> int:
+        side = self.image_size // self.patch_size
+        return side * side
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_attention_heads
+
+
+def _build_norm(spec: InternViTSpec) -> nn.Module:
+    if spec.norm_type == "layer_norm":
+        return nn.LayerNorm(spec.hidden_size, eps=1e-6)
+    if spec.norm_type == "rms_norm":
+        return nn.RMSNorm(spec.hidden_size, eps=1e-6)
+    raise ValueError(f"Unsupported InternViT norm type: {spec.norm_type}")
+
+
+class InternViTPatchEmbeddings(nn.Module):
+    def __init__(self, spec: InternViTSpec) -> None:
+        super().__init__()
+        self.spec = spec
+        self.class_embedding = nn.Parameter(torch.zeros(1, 1, spec.hidden_size))
+        self.patch_embedding = nn.Conv2d(
+            in_channels=3,
+            out_channels=spec.hidden_size,
+            kernel_size=spec.patch_size,
+            stride=spec.patch_size,
+        )
+        self.position_embedding = nn.Parameter(torch.zeros(1, spec.num_patches + 1, spec.hidden_size))
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        batch = pixel_values.shape[0]
+        patches = self.patch_embedding(pixel_values).flatten(2).transpose(1, 2)
+        cls = self.class_embedding.expand(batch, -1, -1)
+        tokens = torch.cat([cls, patches], dim=1)
+        return tokens + self.position_embedding[:, : tokens.shape[1]].to(tokens.dtype)
+
+
+class InternViTAttention(nn.Module):
+    def __init__(self, spec: InternViTSpec) -> None:
+        super().__init__()
+        self.spec = spec
+        self.num_heads = spec.num_attention_heads
+        self.head_dim = spec.head_dim
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.qkv = nn.Linear(spec.hidden_size, spec.hidden_size * 3, bias=spec.qkv_bias)
+        self.proj = nn.Linear(spec.hidden_size, spec.hidden_size, bias=True)
+        if spec.qk_normalization:
+            self.q_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
+            self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        bsz, seqlen, _ = hidden_states.shape
+        qkv = self.qkv(hidden_states).view(bsz, seqlen, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        if self.spec.qk_normalization:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        out = out.transpose(1, 2).reshape(bsz, seqlen, -1)
+        return self.proj(out)
+
+
+class InternViTMLP(nn.Module):
+    def __init__(self, spec: InternViTSpec) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(spec.hidden_size, spec.intermediate_size, bias=True)
+        self.fc2 = nn.Linear(spec.intermediate_size, spec.hidden_size, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(F.gelu(self.fc1(x)))
+
+
+class InternViTLayer(nn.Module):
+    def __init__(self, spec: InternViTSpec) -> None:
+        super().__init__()
+        self.norm1 = _build_norm(spec)
+        self.attn = InternViTAttention(spec)
+        self.norm2 = _build_norm(spec)
+        self.mlp = InternViTMLP(spec)
+        self.ls1 = nn.Parameter(torch.ones(spec.hidden_size))
+        self.ls2 = nn.Parameter(torch.ones(spec.hidden_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.ls1 * self.attn(self.norm1(x))
+        x = x + self.ls2 * self.mlp(self.norm2(x))
+        return x
+
+
+class InternViTEncoder(nn.Module):
+    def __init__(self, spec: InternViTSpec) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([InternViTLayer(spec) for _ in range(spec.num_hidden_layers)])
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        select_layer: int,
+    ) -> torch.Tensor:
+        # ``select_layer`` follows the InternVL convention: -1 means take the
+        # last layer's output; positive indices select an explicit layer.
+        if select_layer < 0:
+            select_layer = len(self.layers) + select_layer
+        for idx, layer in enumerate(self.layers):
+            hidden_states = layer(hidden_states)
+            if idx == select_layer:
+                break
+        return hidden_states
+
+
+class InternVisionModel(nn.Module):
+    """GO-1-Air vision tower; output keeps the ``[CLS]`` token (consumer drops it)."""
+
+    def __init__(self, spec: InternViTSpec) -> None:
+        super().__init__()
+        self.spec = spec
+        self.embeddings = InternViTPatchEmbeddings(spec)
+        self.encoder = InternViTEncoder(spec)
+
+    def forward(self, pixel_values: torch.Tensor, select_layer: int = -1) -> torch.Tensor:
+        tokens = self.embeddings(pixel_values)
+        return self.encoder(tokens, select_layer=select_layer)
+
+
+def pixel_shuffle(features: torch.Tensor, scale: float, version: str = "v2") -> torch.Tensor:
+    """Spatial-to-channel shuffle used to compress vision tokens into the LLM stream.
+
+    For ``scale=0.5`` this groups every 2x2 patch block into a single token
+    while quadrupling the channel dimension. Mirrors the InternVL ``ps_v2``
+    layout (the input tile order is rotated before reshape so adjacent
+    patches stay adjacent in memory).
+    """
+    if scale >= 1.0:
+        return features
+    bsz, num_tokens, channels = features.shape
+    side = int(math.isqrt(num_tokens))
+    if side * side != num_tokens:
+        raise ValueError(f"pixel_shuffle expects a square token grid; got {num_tokens}.")
+    new_side = int(side * scale)
+    block = int(round(1.0 / scale))
+    grid = features.view(bsz, side, side, channels)
+    if version == "v2":
+        grid = grid.permute(0, 2, 1, 3).contiguous()
+    grid = grid.view(bsz, side, new_side, channels * block)
+    grid = grid.permute(0, 2, 1, 3).contiguous()
+    grid = grid.view(bsz, new_side, new_side, channels * (block * block))
+    if version == "v2":
+        grid = grid.permute(0, 2, 1, 3).contiguous()
+    return grid.view(bsz, new_side * new_side, channels * (block * block))
+
+
+# ----- InternLM2-GO1 language stack ------------------------------------
+
+
+@dataclass
+class LanguageStackOutput:
+    last_hidden_state: torch.Tensor
+    layer_kv: list[tuple[torch.Tensor, torch.Tensor]]
+
+
+def language_block_spec(config: Go1AirConfig) -> InternLM2BlockSpec:
+    return InternLM2BlockSpec(
+        hidden_size=config.llm_hidden_size,
+        intermediate_size=config.llm_intermediate_size,
+        num_attention_heads=config.llm_num_attention_heads,
+        num_key_value_heads=config.llm_num_key_value_heads,
+        rms_norm_eps=config.llm_rms_norm_eps,
+        rope_theta=config.llm_rope_theta,
+        rope_scaling_factor=config.llm_rope_scaling_factor,
+        rope_scaling_type=config.llm_rope_scaling_type,
+        max_position_embeddings=config.llm_max_position_embeddings,
+        attn_implementation=config.attn_implementation,
+    )
+
+
+class InternLM2Trunk(nn.Module):
+    """The ``language_model.model.*`` subtree: embeddings + blocks + final norm."""
+
+    def __init__(self, config: Go1AirConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.spec = language_block_spec(config)
+        self.tok_embeddings = nn.Embedding(config.llm_vocab_size, config.llm_hidden_size)
+        self.layers = nn.ModuleList([InternLM2Block(self.spec) for _ in range(config.llm_num_hidden_layers)])
+        self.norm = InternLM2RMSNorm(config.llm_hidden_size, eps=config.llm_rms_norm_eps)
+        head_dim = self.spec.resolved_head_dim()
+        self.rotary_emb = InternLM2RotaryEmbedding(head_dim, self.spec)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+    ) -> LanguageStackOutput:
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("Provide exactly one of input_ids or inputs_embeds.")
+        hidden = inputs_embeds if inputs_embeds is not None else self.tok_embeddings(input_ids)
+        bsz, seqlen, _ = hidden.shape
+        position_ids = torch.arange(seqlen, device=hidden.device).expand(bsz, seqlen)
+
+        # Decoder-only InternLM2 needs causal masking; combine with padding
+        # mask (if provided) into a (B, 1, T, T) additive attention mask.
+        neg = torch.finfo(hidden.dtype).min
+        causal = torch.triu(
+            torch.full((seqlen, seqlen), neg, device=hidden.device, dtype=hidden.dtype),
+            diagonal=1,
+        )
+        attn_bias = causal.unsqueeze(0).unsqueeze(0).expand(bsz, 1, seqlen, seqlen).contiguous()
+        if attention_mask is not None and attention_mask.dim() == 2:
+            invalid = (attention_mask == 0).view(bsz, 1, 1, seqlen)
+            attn_bias = attn_bias.masked_fill(invalid, neg)
+
+        layer_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for block in self.layers:
+            hidden, k, v = block(hidden, position_ids, self.rotary_emb, attn_bias)
+            layer_kv.append((k, v))
+        hidden = self.norm(hidden)
+        return LanguageStackOutput(last_hidden_state=hidden, layer_kv=layer_kv)
+
+    def set_attention_implementation(self, implementation: str) -> None:
+        self.spec.attn_implementation = implementation
+        for block in self.layers:
+            block.attention.spec.attn_implementation = implementation
+
+
+class InternLM2GO1LanguageModel(nn.Module):
+    """The full ``language_model`` subtree: trunk + vocabulary head."""
+
+    def __init__(self, config: Go1AirConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.model = InternLM2Trunk(config)
+        self.output = nn.Linear(
+            config.llm_hidden_size,
+            config.llm_vocab_size,
+            bias=False,
+        )
+        if config.llm_tie_word_embeddings:
+            self.output.weight = self.model.tok_embeddings.weight
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+    ) -> LanguageStackOutput:
+        return self.model(input_ids=input_ids, inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+
+    def set_attention_implementation(self, implementation: str) -> None:
+        self.model.set_attention_implementation(implementation)
+
+
+# ----- GO-1-Air action expert ------------------------------------------
+
+
+def action_block_spec(config: Go1AirConfig) -> InternLM2BlockSpec:
+    return InternLM2BlockSpec(
+        hidden_size=config.act_hidden_size,
+        intermediate_size=config.act_intermediate_size,
+        num_attention_heads=config.act_num_attention_heads,
+        num_key_value_heads=config.act_num_key_value_heads,
+        head_dim=config.act_head_dim,
+        rms_norm_eps=config.act_rms_norm_eps,
+        rope_theta=config.act_rope_theta,
+        rope_scaling_factor=config.act_rope_scaling_factor,
+        rope_scaling_type=config.act_rope_scaling_type,
+        max_position_embeddings=config.act_max_position_embeddings,
+        attn_implementation=config.attn_implementation,
+    )
+
+
+def squared_cos_cap_v2_alpha_bar(num_train_timesteps: int, device: torch.device) -> torch.Tensor:
+    """Cumulative ``alpha_bar`` schedule used by diffusers' ``squaredcos_cap_v2``.
+
+    ``alpha_bar(t) = cos((t/T + s)/(1+s) · π/2)^2`` with ``s = 0.008``,
+    normalised so ``alpha_bar(0) = 1``.
+    """
+    s = 0.008
+    steps = torch.arange(num_train_timesteps + 1, device=device, dtype=torch.float64) / num_train_timesteps
+    f = torch.cos((steps + s) / (1.0 + s) * math.pi / 2.0).pow(2)
+    return (f / f[0]).to(torch.float32)
+
+
+class SinusoidalScalarEmbedding(nn.Module):
+    """Sinusoidal embedding for a scalar input (timestep, frequency)."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"Sinusoidal embedding dim must be even; got {dim}.")
+        self.dim = dim
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        half = self.dim // 2
+        freqs = torch.exp(-math.log(10_000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / half)
+        args = t.float().unsqueeze(-1) * freqs.unsqueeze(0)
+        result = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        return result.to(t.dtype if t.dtype.is_floating_point else torch.float32)
+
+
+class TimestepEmbedder(nn.Module):
+    """Sinusoidal -> 2-layer MLP with parameter names ``mlp.0`` and ``mlp.2``.
+
+    The sinusoidal embedding has a fixed 256-dim output; the MLP then lifts
+    it to ``hidden_size``. This matches the upstream checkpoint shape
+    ``mlp.0.weight = [hidden_size, 256]``.
+    """
+
+    SINUSOIDAL_DIM = 256
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.sinusoidal = SinusoidalScalarEmbedding(self.SINUSOIDAL_DIM)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.SINUSOIDAL_DIM, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        # Sinusoidal output is fp32 when ``t`` is integer; cast to match the
+        # MLP's parameter dtype so the Linear matmul doesn't reject the input.
+        out = self.sinusoidal(t)
+        return self.mlp(out.to(self.mlp[0].weight.dtype))
+
+
+def make_state_action_adaptor(in_dim: int, hidden_dim: int, out_dim: int) -> nn.Sequential:
+    """3-layer MLP with parameter indices 0/2/4 (interleaved with SiLU)."""
+    return nn.Sequential(
+        nn.Linear(in_dim, hidden_dim, bias=True),
+        nn.SiLU(),
+        nn.Linear(hidden_dim, hidden_dim, bias=True),
+        nn.SiLU(),
+        nn.Linear(hidden_dim, out_dim, bias=True),
+    )
+
+
+class FinalLayer(nn.Module):
+    """Output head: RMSNorm -> 2-layer MLP that maps to ``action_dim``.
+
+    The intermediate width equals ``hidden_size`` (not the action expert's
+    ``intermediate_size``), matching the upstream checkpoint shape
+    ``fc1.weight = [hidden_size, hidden_size]`` / ``fc2.weight = [action_dim, hidden_size]``.
+    """
+
+    def __init__(self, hidden_size: int, action_dim: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.norm_final = InternLM2RMSNorm(hidden_size, eps=eps)
+        self.ffn_final = nn.Sequential()
+        self.ffn_final.add_module("fc1", nn.Linear(hidden_size, hidden_size, bias=True))
+        self.ffn_final.add_module("act", nn.SiLU())
+        self.ffn_final.add_module("fc2", nn.Linear(hidden_size, action_dim, bias=True))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.ffn_final(self.norm_final(x))
+
+
+class ActionExpertAttention(nn.Module):
+    """Action-side self-attention that concatenates VLM K/V into the joint key/value."""
+
+    def __init__(self, spec: InternLM2BlockSpec) -> None:
+        super().__init__()
+        self.spec = spec
+        self.head_dim = spec.resolved_head_dim()
+        self.num_q_heads = spec.num_attention_heads
+        self.num_kv_heads = spec.num_key_value_heads
+        self.num_kv_groups = spec.num_kv_groups
+        per_group_heads = self.num_kv_groups + 2
+        self.wqkv = nn.Linear(
+            spec.hidden_size,
+            self.num_kv_heads * per_group_heads * self.head_dim,
+            bias=False,
+        )
+        self.wo = nn.Linear(self.num_q_heads * self.head_dim, spec.hidden_size, bias=False)
+
+    def split_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bsz, seqlen, _ = hidden_states.shape
+        per_group_heads = self.num_kv_groups + 2
+        qkv = self.wqkv(hidden_states).view(
+            bsz,
+            seqlen,
+            self.num_kv_heads,
+            per_group_heads,
+            self.head_dim,
+        )
+        q = qkv[..., : self.num_kv_groups, :].reshape(
+            bsz, seqlen, self.num_kv_heads * self.num_kv_groups, self.head_dim
+        )
+        k = qkv[..., -2, :]
+        v = qkv[..., -1, :]
+        return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        action_position_ids: torch.Tensor,
+        vlm_position_ids: torch.Tensor,
+        rotary_emb: InternLM2RotaryEmbedding,
+        vlm_k: torch.Tensor,
+        vlm_v: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        q, k_act, v_act = self.split_qkv(hidden_states)
+        cos_act, sin_act = rotary_emb(action_position_ids)
+        q, k_act = apply_rope(q, k_act, cos_act, sin_act)
+
+        # Re-stamp absolute VLM positions onto the projected VLM keys so action
+        # queries can use cross-modal positional information. Cos/sin from the
+        # rotary embedding are fp32; cast the result back to vlm_k's dtype so
+        # the joint K stays in the same precision as the action-side K.
+        orig_dtype = vlm_k.dtype
+        cos_vlm, sin_vlm = rotary_emb(vlm_position_ids)
+        cos_vlm = cos_vlm.unsqueeze(1)
+        sin_vlm = sin_vlm.unsqueeze(1)
+        half = vlm_k.shape[-1] // 2
+        rotated = torch.cat((-vlm_k[..., half:], vlm_k[..., :half]), dim=-1)
+        vlm_k = ((vlm_k * cos_vlm) + (rotated * sin_vlm)).to(orig_dtype)
+
+        joint_k = torch.cat([vlm_k, k_act], dim=2)
+        joint_v = torch.cat([vlm_v, v_act], dim=2)
+
+        attn_out = scaled_dot_product(
+            q,
+            joint_k,
+            joint_v,
+            num_kv_groups=self.num_kv_groups,
+            mask=attention_mask,
+            implementation=self.spec.attn_implementation,
+        )
+        bsz, _, seqlen, _ = q.shape
+        out = attn_out.transpose(1, 2).reshape(bsz, seqlen, -1)
+        return self.wo(out)
+
+
+class ActionExpertBlock(nn.Module):
+    """Action-side decoder block: cross-attention into joint VLM/action keys, then FFN."""
+
+    def __init__(self, spec: InternLM2BlockSpec) -> None:
+        super().__init__()
+        self.attention_norm = InternLM2RMSNorm(spec.hidden_size, eps=spec.rms_norm_eps)
+        self.attention = ActionExpertAttention(spec)
+        self.ffn_norm = InternLM2RMSNorm(spec.hidden_size, eps=spec.rms_norm_eps)
+        self.feed_forward = InternLM2FeedForward(spec)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        action_position_ids: torch.Tensor,
+        vlm_position_ids: torch.Tensor,
+        rotary_emb: InternLM2RotaryEmbedding,
+        vlm_k: torch.Tensor,
+        vlm_v: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        attn_out = self.attention(
+            self.attention_norm(hidden_states),
+            action_position_ids,
+            vlm_position_ids,
+            rotary_emb,
+            vlm_k,
+            vlm_v,
+            attention_mask,
+        )
+        hidden_states = hidden_states + attn_out
+        hidden_states = hidden_states + self.feed_forward(self.ffn_norm(hidden_states))
+        return hidden_states
+
+
+# ----- GO-1-Air top-level model and policy -----------------------------
 
 
 def _build_mlp1(vision_dim: int, scale: float, llm_hidden: int) -> nn.Sequential:
