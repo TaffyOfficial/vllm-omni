@@ -1007,6 +1007,8 @@ class Go1Air(nn.Module):
         shape = (bsz, self.config.chunk_size, self.config.max_action_dim)
         if noise is None:
             noise = torch.randn(shape, device=device, dtype=dtype)
+        elif noise.shape != shape:
+            raise ValueError(f"Go1Air noise shape must be {shape}, got {tuple(noise.shape)}.")
         x = noise.to(device=device, dtype=dtype)
 
         alpha_bar = self.alpha_bar.to(device=device)
@@ -1151,8 +1153,8 @@ class Go1AirPolicy(nn.Module):
         noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz = self._infer_batch_size(batch_inputs)
-        device = self._infer_device(batch_inputs)
-        dtype = getattr(torch, self.config.dtype) if isinstance(self.config.dtype, str) else self.config.dtype
+        device = self._model_device()
+        dtype = self._model_dtype()
 
         # Stub path: no weights loaded → return zero actions of the right shape.
         # Keeps pipeline plumbing exercisable end-to-end without a checkpoint.
@@ -1163,16 +1165,17 @@ class Go1AirPolicy(nn.Module):
                 dtype=noise.dtype if noise is not None else torch.float32,
             )
 
-        state = batch_inputs.get(OBS_STATE)
-        if not isinstance(state, torch.Tensor):
-            raise ValueError(f"Go1AirPolicy expects '{OBS_STATE}' as a tensor in batch_inputs.")
+        state = self._prepare_state(batch_inputs, batch_size=bsz, device=device, dtype=dtype)
 
-        pixel_values, vlm_attention_mask, input_ids = self._build_llm_inputs(batch_inputs, device=device, dtype=dtype)
+        pixel_values, vlm_attention_mask, input_ids = self._build_llm_inputs(
+            batch_inputs,
+            batch_size=bsz,
+            device=device,
+            dtype=dtype,
+        )
         _, layer_kv, _ = self.model.encode_prefix(input_ids, pixel_values, vlm_attention_mask)
 
-        control_freq = batch_inputs.get("control_freq")
-        if not isinstance(control_freq, torch.Tensor):
-            control_freq = torch.full((bsz,), 30.0, device=device, dtype=torch.float32)
+        control_freq = self._prepare_control_freq(batch_inputs, batch_size=bsz, device=device)
 
         return self.model.sample_actions(
             state=state,
@@ -1187,6 +1190,8 @@ class Go1AirPolicy(nn.Module):
     def _infer_batch_size(self, batch_inputs: dict[str, Any]) -> int:
         state = batch_inputs.get(OBS_STATE)
         if isinstance(state, torch.Tensor):
+            if state.ndim == 0:
+                raise ValueError(f"Go1AirPolicy expects '{OBS_STATE}' to include a batch dimension.")
             return int(state.shape[0])
         for key, value in batch_inputs.items():
             if key.startswith(f"{OBS_IMAGES}.") and not key.endswith("_mask"):
@@ -1194,16 +1199,58 @@ class Go1AirPolicy(nn.Module):
                     return int(value.shape[0])
         return 1
 
-    def _infer_device(self, batch_inputs: dict[str, Any]) -> torch.device:
-        for value in batch_inputs.values():
-            if isinstance(value, torch.Tensor):
-                return value.device
-        return torch.device(self.config.device)
+    def _model_device(self) -> torch.device:
+        return next(self.model.parameters()).device
+
+    def _model_dtype(self) -> torch.dtype:
+        return next(self.model.parameters()).dtype
+
+    def _prepare_state(
+        self,
+        batch_inputs: dict[str, Any],
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if OBS_STATE not in batch_inputs:
+            raise ValueError(f"Go1AirPolicy expects '{OBS_STATE}' in batch_inputs.")
+        state = batch_inputs[OBS_STATE]
+        if not isinstance(state, torch.Tensor):
+            raise TypeError(f"Go1AirPolicy expects '{OBS_STATE}' as a tensor, got {type(state)!r}.")
+        if state.ndim != 2 or state.shape != (batch_size, self.config.max_state_dim):
+            raise ValueError(
+                f"Go1AirPolicy expects '{OBS_STATE}' shape "
+                f"({batch_size}, {self.config.max_state_dim}), got {tuple(state.shape)}."
+            )
+        return state.to(device=device, dtype=dtype)
+
+    def _prepare_control_freq(
+        self,
+        batch_inputs: dict[str, Any],
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if "control_freq" not in batch_inputs:
+            return torch.full((batch_size,), 30.0, device=device, dtype=torch.float32)
+        control_freq = batch_inputs["control_freq"]
+        if not isinstance(control_freq, torch.Tensor):
+            raise TypeError(f"Go1AirPolicy expects 'control_freq' as a tensor, got {type(control_freq)!r}.")
+        control_freq = control_freq.to(device=device, dtype=torch.float32)
+        if control_freq.ndim == 0:
+            return control_freq.expand(batch_size)
+        if control_freq.shape != (batch_size,):
+            raise ValueError(
+                f"Go1AirPolicy expects 'control_freq' shape ({batch_size},), got {tuple(control_freq.shape)}."
+            )
+        return control_freq
 
     def _build_llm_inputs(
         self,
         batch_inputs: dict[str, Any],
         *,
+        batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
@@ -1229,20 +1276,24 @@ class Go1AirPolicy(nn.Module):
             for k, v in batch_inputs.items()
             if k.startswith(f"{OBS_IMAGES}.") and not k.endswith("_mask") and isinstance(v, torch.Tensor)
         )
-        bsz_from_images = batch_inputs[camera_keys[0]].shape[0] if camera_keys else 0
 
-        per_row_frames: list[list[torch.Tensor]] = [[] for _ in range(bsz_from_images)]
+        per_row_frames: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
         for cam_key in camera_keys:
-            cam_tensor = batch_inputs[cam_key].to(dtype)
+            cam_tensor = batch_inputs[cam_key]
+            if cam_tensor.ndim != 5:
+                raise ValueError(
+                    f"Go1AirPolicy expects '{cam_key}' shape (B, history, 3, H, W), got {tuple(cam_tensor.shape)}."
+                )
             bsz_cam, history = cam_tensor.shape[:2]
+            if bsz_cam != batch_size:
+                raise ValueError(f"Go1AirPolicy expects '{cam_key}' batch {batch_size}, got {bsz_cam}.")
+            cam_tensor = cam_tensor.to(device=device, dtype=dtype)
             mask = batch_inputs.get(f"{cam_key}_mask")
             for row in range(bsz_cam):
-                if isinstance(mask, torch.Tensor):
-                    row_valid = bool(mask[row].item()) if mask.ndim >= 1 else bool(mask.item())
-                else:
-                    row_valid = True
-                if row_valid:
-                    for h in range(history):
+                for h in range(history):
+                    if self._is_valid_image_frame(
+                        mask, cam_key=cam_key, row=row, history_idx=h, batch_size=batch_size, history=history
+                    ):
                         per_row_frames[row].append(cam_tensor[row, h])
 
         flat_frames: list[torch.Tensor] = []
@@ -1260,14 +1311,7 @@ class Go1AirPolicy(nn.Module):
         block = max(1, int(round(1.0 / self.config.downsample_ratio)))
         vision_tokens_per_image = (side_in_patches // block) ** 2
 
-        task_strings = batch_inputs.get(OBS_TASK) or [""]
-        if isinstance(task_strings, str):
-            task_strings = [task_strings]
-        bsz = max(len(task_strings), bsz_from_images, 1)
-        if len(task_strings) < bsz:
-            task_strings = list(task_strings) + [""] * (bsz - len(task_strings))
-        while len(images_per_row) < bsz:
-            images_per_row.append(0)
+        task_strings = self._get_task_strings(batch_inputs, batch_size=batch_size)
 
         img_context_id = int(self.config.img_context_token_id)
         pad_id = int(self.config.llm_pad_token_id)
@@ -1288,3 +1332,55 @@ class Go1AirPolicy(nn.Module):
         attention_mask = (input_ids != pad_id).to(device=device)
 
         return pixel_values, attention_mask, input_ids
+
+    def _is_valid_image_frame(
+        self,
+        mask: Any,
+        *,
+        cam_key: str,
+        row: int,
+        history_idx: int,
+        batch_size: int,
+        history: int,
+    ) -> bool:
+        if mask is None:
+            return True
+        if not isinstance(mask, torch.Tensor):
+            raise TypeError(f"Go1AirPolicy expects '{cam_key}_mask' as a tensor, got {type(mask)!r}.")
+        if mask.ndim == 0:
+            return bool(mask.item())
+        if mask.ndim == 1:
+            if mask.shape[0] != batch_size:
+                raise ValueError(
+                    f"Go1AirPolicy expects '{cam_key}_mask' shape ({batch_size},) "
+                    f"or ({batch_size}, {history}), got {tuple(mask.shape)}."
+                )
+            return bool(mask[row].item())
+        if mask.ndim == 2:
+            if mask.shape != (batch_size, history):
+                raise ValueError(
+                    f"Go1AirPolicy expects '{cam_key}_mask' shape ({batch_size}, {history}), got {tuple(mask.shape)}."
+                )
+            return bool(mask[row, history_idx].item())
+        raise ValueError(
+            f"Go1AirPolicy expects '{cam_key}_mask' as scalar, (B,), or (B, history), got {tuple(mask.shape)}."
+        )
+
+    def _get_task_strings(self, batch_inputs: dict[str, Any], *, batch_size: int) -> list[str]:
+        if OBS_TASK not in batch_inputs:
+            raise ValueError(f"Go1AirPolicy expects '{OBS_TASK}' in batch_inputs.")
+        task_payload = batch_inputs[OBS_TASK]
+        if isinstance(task_payload, str):
+            if batch_size != 1:
+                raise ValueError(f"Go1AirPolicy expects {batch_size} task strings, got a single string.")
+            return [task_payload]
+        if not isinstance(task_payload, (list, tuple)):
+            raise TypeError(f"Go1AirPolicy expects '{OBS_TASK}' as a string/list/tuple, got {type(task_payload)!r}.")
+        if len(task_payload) != batch_size:
+            raise ValueError(f"Go1AirPolicy expects {batch_size} task strings, got {len(task_payload)}.")
+        tasks: list[str] = []
+        for idx, item in enumerate(task_payload):
+            if not isinstance(item, str):
+                raise TypeError(f"Go1AirPolicy expects '{OBS_TASK}[{idx}]' as a string, got {type(item)!r}.")
+            tasks.append(item)
+        return tasks

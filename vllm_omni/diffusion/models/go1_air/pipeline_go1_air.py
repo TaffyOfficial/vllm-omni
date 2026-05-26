@@ -133,7 +133,6 @@ class Go1AirPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 "policy.model.sample_actions",
                 "policy.model.encode_vision",
                 "policy.model.encode_prefix",
-                "policy.model.denoise_step",
             ],
         )
 
@@ -232,7 +231,7 @@ class Go1AirPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         if len(req.prompts) > 1:
             logger.warning("Go1AirPipeline only supports a single prompt/request; taking the first sample.")
-        extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+        extra_args = req.sampling_params.extra_args
         batch_inputs = extra_args.get("batch_inputs")
         if batch_inputs is None:
             return DiffusionOutput(
