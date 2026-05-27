@@ -558,12 +558,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # convert cumulative to Final Only to ensure the output is correct.
                 sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
 
-                # When the caller supplies both height and width, forward them
-                # via extra_args so the HunyuanImage-3.0 AR sampler can pin
-                # <img_ratio_*> to the matching ResolutionGroup bucket (AR KV
-                # cache then encodes the user-requested aspect; the DiT decodes
-                # at the same resolution). AR ignores extra_args when these
-                # keys are absent, so other models pass through unaffected.
+                # Match offline behavior: only explicit complete height/width
+                # pins the HunyuanImage-3.0 AR <img_ratio_*> token. Auto or
+                # input-derived sizes are DiT fallbacks and leave AR's greedy
+                # bucket selection unchanged.
                 _force_ar_ratio = _image_gen_height is not None and _image_gen_width is not None
 
                 # Apply user-specified overrides to diffusion stage(s) for image generation

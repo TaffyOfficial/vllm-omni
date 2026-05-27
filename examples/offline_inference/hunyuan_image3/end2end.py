@@ -65,18 +65,30 @@ def parse_args():
         "--height",
         type=int,
         default=None,
-        help="Output image height. When unset, the AR auto-selects the bucket (1024 for text2img; input-image height for img2img).",
+        help=(
+            "Requested output height. When both --height and --width are set, "
+            "the AR ratio token is pinned from this size. When unset, AR keeps "
+            "greedy bucket selection and DiT uses its default/input-image fallback."
+        ),
     )
     parser.add_argument(
         "--width",
         type=int,
         default=None,
-        help="Output image width. When unset, the AR auto-selects the bucket (1024 for text2img; input-image width for img2img).",
+        help=(
+            "Requested output width. When both --height and --width are set, "
+            "the AR ratio token is pinned from this size. When unset, AR keeps "
+            "greedy bucket selection and DiT uses its default/input-image fallback."
+        ),
     )
     parser.add_argument(
         "--infer-align-image-size",
         action="store_true",
-        help="Match HF infer_align_image_size=True: resize condition images and align output size to input image ratio.",
+        help=(
+            "Match HF infer_align_image_size=True for img2img: resize condition "
+            "images instead of center-cropping, then postprocess eligible outputs "
+            "back to the input-image ratio at the model base-size area."
+        ),
     )
     parser.add_argument("--vae-use-tiling", action="store_true", help="Enable VAE tiling.")
     parser.add_argument(
@@ -245,12 +257,9 @@ def main():
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     ar_stop_token_ids = resolve_stop_token_ids(task=task, bot_task=bot_task, tokenizer=tokenizer)
-    # Honor user-supplied (--height, --width): DiT receives the concrete
-    # output size, while AR only needs the matching <img_ratio_*> token.
-    # Only pin that ratio token when BOTH dimensions are set; if either is
-    # None, leave AR's greedy auto-select alone (and DiT falls back to its
-    # own 1024 default / pre_process_func input-image-dims behavior for
-    # img2img).
+    # Match the online endpoints: only an explicit complete size pins the AR
+    # <img_ratio_*> token. If either dimension is omitted, AR keeps greedy
+    # bucket selection, while DiT falls back to its default/input-image size.
     user_h, user_w = args.height, args.width
     force_ratio_token_from_user_size = (
         args.modality in ("text2img", "img2img") and user_h is not None and user_w is not None

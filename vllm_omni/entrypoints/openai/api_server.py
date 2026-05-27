@@ -2067,8 +2067,9 @@ async def edit_images(
                 "seed": effective_seed,
                 "num_outputs_per_prompt": n,
             }
-            # size="auto" resolves width/height from input image; forwarding
-            # those would override AR-driven `<img_ratio_*>` token selection.
+            # Match the offline path: only explicit user size should pin the
+            # HunyuanImage3 AR `<img_ratio_*>` token. size="auto" resolves a
+            # DiT fallback from the input image, but AR keeps greedy selection.
             if not size_was_auto:
                 if width is not None:
                     extra_body["width"] = width

@@ -132,9 +132,10 @@ class ImageGenerationRequest(BaseModel):
     infer_align_image_size: bool | None = Field(
         default=None,
         description=(
-            "HunyuanImage3 img2img alignment flag. When true, condition images "
-            "are resized instead of center-cropped and outputs may be resized "
-            "back to the input image aspect ratio."
+            "HunyuanImage3 img2img alignment flag. When omitted, the request "
+            "uses the model default. When true, condition images are resized "
+            "instead of center-cropped and eligible outputs may be postprocessed "
+            "back to the input-image ratio at the model base-size area."
         ),
     )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
