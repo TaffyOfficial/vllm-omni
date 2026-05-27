@@ -5,12 +5,29 @@
         "server_type": "vllm-omni",
         "server_params": {
             "model": "tencent/HunyuanImage-3.0-Instruct",
+            "stage_overrides": {
+                "0": {
+                    "parallel_config": {
+                        "pipeline_parallel_size": 1,
+                        "data_parallel_size": 1,
+                        "tensor_parallel_size": 2,
+                        "enable_expert_parallel": true,
+                        "sequence_parallel_size": 1,
+                        "ulysses_degree": 1,
+                        "ring_degree": 1,
+                        "cfg_parallel_size": 2,
+                        "vae_patch_parallel_size": 1,
+                        "use_hsdp": false,
+                        "hsdp_shard_size": -1,
+                        "hsdp_replicate_size": 1
+                    }
+                }
+            },
             "serve_args": {
-                "tensor-parallel-size": 2,
-                "cfg-parallel-size": 2,
+                "deploy-config": "vllm_omni/deploy/hunyuan_image3_dit.yaml",
                 "quantization": "fp8",
                 "distributed-executor-backend": "mp",
-                "enforce-eager": true,
+                "trust-remote-code": true,
                 "enable-diffusion-pipeline-profiler": true
             }
         },
