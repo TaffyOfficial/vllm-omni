@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import Literal, NamedTuple
 
+import torch
+
 
 class Segment(NamedTuple):
     start: int
@@ -56,32 +58,17 @@ def build_segments(full_attn_spans, query_offset, query_len):
     return segs
 
 
-def _check_homogeneous(
-    full_attn_spans: list[list[tuple[int, int]]],
-) -> None:
-    """Assert all samples share identical spans."""
-    if len(full_attn_spans) > 1:
-        ref = full_attn_spans[0]
-        for i, s in enumerate(full_attn_spans[1:], 1):
-            if s != ref:
-                raise ValueError(
-                    f"piecewise_attn requires homogeneous batch: sample 0 spans {ref} != sample {i} spans {s}"
-                )
-
-
-def piecewise_attn(
+def _piecewise_attn_homogeneous(
     query,  # (B, Sq, H, D)
     key,
     value,
-    full_attn_spans: list[list[tuple[int, int]]],
+    spans: list[tuple[int, int]],
     softmax_scale: float,
     attn_func,
 ):
     B, Sq, H, D = query.shape
-    _check_homogeneous(full_attn_spans)
 
     query_offset = key.shape[1] - Sq
-    spans = full_attn_spans[0]
     out = query.new_zeros(B, Sq, H, D)
 
     for s, e, mode in build_segments(spans, query_offset, Sq):
@@ -95,4 +82,48 @@ def piecewise_attn(
             softmax_scale=softmax_scale,
         )
         out[:, q_s:q_e] = out_seg
+    return out
+
+
+def piecewise_attn(
+    query,  # (B, Sq, H, D)
+    key,
+    value,
+    full_attn_spans: list[list[tuple[int, int]]],
+    softmax_scale: float,
+    attn_func,
+):
+    B = query.shape[0]
+    if len(full_attn_spans) != B:
+        raise ValueError(
+            f"piecewise_attn expects one full_attn_spans entry per batch row, got {len(full_attn_spans)} for batch {B}"
+        )
+
+    normalized_spans = [tuple((int(start), int(end)) for start, end in spans) for spans in full_attn_spans]
+    span_groups: dict[tuple[tuple[int, int], ...], list[int]] = {}
+    for row_idx, spans in enumerate(normalized_spans):
+        span_groups.setdefault(spans, []).append(row_idx)
+
+    if len(span_groups) == 1:
+        return _piecewise_attn_homogeneous(
+            query,
+            key,
+            value,
+            list(normalized_spans[0]),
+            softmax_scale,
+            attn_func,
+        )
+
+    out = query.new_empty(query.shape)
+    for span_key, row_indices in span_groups.items():
+        index = query.new_tensor(row_indices, dtype=torch.long)
+        group_out = _piecewise_attn_homogeneous(
+            query.index_select(0, index),
+            key.index_select(0, index),
+            value.index_select(0, index),
+            list(span_key),
+            softmax_scale,
+            attn_func,
+        )
+        out.index_copy_(0, index, group_out)
     return out

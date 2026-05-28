@@ -7,7 +7,8 @@ bidirectional inside full-attn spans) matches running a single full SDPA call
 with the equivalent 2D attention mask.
 
 Covers:
-  * batch size = 1 and batch size > 1 (homogeneous CFG-like batch)
+  * batch size = 1 and batch size > 1
+  * homogeneous and heterogeneous per-sample full-attn spans
   * query length == key length   (full prefill)
   * query length <  key length   (decode-like tail slice)
   * various full-attn-span layouts (none / start / middle / end / multi)
@@ -41,16 +42,25 @@ def _sdpa_attn_func(q, k, v, causal, softmax_scale):
 
 
 def _full_reference(query, key, value, global_spans, q_start, q_end, softmax_scale):
+    per_sample_spans = [global_spans for _ in range(query.shape[0])]
+    return _full_reference_per_sample(query, key, value, per_sample_spans, q_start, q_end, softmax_scale)
+
+
+def _full_reference_per_sample(query, key, value, per_sample_spans, q_start, q_end, softmax_scale):
     """Build a full 2D mask with global spans and compute reference output."""
+    B = query.shape[0]
     Sk = key.shape[1]
-    mask = torch.tril(torch.ones(Sk, Sk, dtype=torch.bool, device=key.device))
-    for a, e in global_spans:
-        mask[a:e, :e] = True
-    mask_q = mask[q_start:q_end, :]
+    masks = torch.empty(B, q_end - q_start, Sk, dtype=torch.bool, device=key.device)
+    causal_mask = torch.tril(torch.ones(Sk, Sk, dtype=torch.bool, device=key.device))
+    for row_idx, global_spans in enumerate(per_sample_spans):
+        mask = causal_mask.clone()
+        for a, e in global_spans:
+            mask[a:e, :e] = True
+        masks[row_idx] = mask[q_start:q_end, :]
     q_ = query.transpose(1, 2)
     k_ = key.transpose(1, 2)
     v_ = value.transpose(1, 2)
-    out = F.scaled_dot_product_attention(q_, k_, v_, attn_mask=mask_q, scale=softmax_scale)
+    out = F.scaled_dot_product_attention(q_, k_, v_, attn_mask=masks[:, None, :, :], scale=softmax_scale)
     return out.transpose(1, 2).contiguous()
 
 
@@ -123,4 +133,43 @@ def test_piecewise_span_fully_before_qstart():
         attn_func=_sdpa_attn_func,
     )
     expected = _full_reference(query, key, value, global_spans, q_start, q_end, softmax_scale)
+    torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("q_range", Q_RANGE_CASES)
+def test_piecewise_groups_heterogeneous_spans(q_range):
+    torch.manual_seed(0)
+    B, H, D, Sk = 4, 2, 16, 64
+    q_start, q_end = q_range
+    Sq = q_end - q_start
+
+    key = torch.randn(B, Sk, H, D, device=DEVICE)
+    value = torch.randn(B, Sk, H, D, device=DEVICE)
+    query = torch.randn(B, Sq, H, D, device=DEVICE)
+
+    full_attn_spans = [
+        [(0, 10)],
+        [(10, 30), (54, 64)],
+        [(0, 10)],
+        [],
+    ]
+    softmax_scale = 1.0 / (D**0.5)
+
+    got = piecewise_attn(
+        query,
+        key,
+        value,
+        full_attn_spans=full_attn_spans,
+        softmax_scale=softmax_scale,
+        attn_func=_sdpa_attn_func,
+    )
+    expected = _full_reference_per_sample(
+        query,
+        key,
+        value,
+        full_attn_spans,
+        q_start,
+        q_end,
+        softmax_scale,
+    )
     torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
