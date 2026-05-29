@@ -5,6 +5,7 @@
         "server_type": "vllm-omni",
         "server_params": {
             "model": "tencent/HunyuanImage-3.0-Instruct",
+            "stage_config_name": "hunyuan_image3_dit.yaml",
             "stage_overrides": {
                 "0": {
                     "parallel_config": {
@@ -24,7 +25,6 @@
                 }
             },
             "serve_args": {
-                "deploy-config": "vllm_omni/deploy/hunyuan_image3_dit.yaml",
                 "quantization": "fp8",
                 "distributed-executor-backend": "mp",
                 "trust-remote-code": true,

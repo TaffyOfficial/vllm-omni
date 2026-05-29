@@ -53,7 +53,7 @@ if CONFIG_FILE_PATH is None:
 BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
 
 
-DEPLOY_CONFIGS_DIR = Path(__file__).parent.parent / "deploy"
+DEPLOY_CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent.parent.parent / "vllm_omni" / "deploy"
 test_params = create_unique_server_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR)
 server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS)
 
