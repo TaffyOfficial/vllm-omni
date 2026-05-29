@@ -68,7 +68,6 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.image import rgba_to_rgb
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalFieldConfig,
@@ -894,8 +893,10 @@ class HunyuanImage3Processor:
         for image in images:
             current_info = {}
 
-            if self.hf_config.vit["num_channels"] == 3 and image.mode == "RGBA":
-                image = rgba_to_rgb(image, (255, 255, 255))
+            # Match DiT-stage preprocessing by dropping alpha via PIL RGB conversion
+            # instead of compositing transparent pixels onto a white background.
+            if image.mode != "RGB":
+                image = image.convert("RGB")
 
             # VIT processing
             vit_pixel_values = self.vision_encoder_processor(image)
