@@ -351,7 +351,11 @@ class HunyuanImage3Pipeline(
         self.vae = DistributedAutoencoderKLHunyuan.from_config(self.hf_config.vae)
         self.vae.use_spatial_tiling = self.od_config.vae_use_tiling
         self._pipeline = None
-        self._tkwrapper = TokenizerWrapper(od_config.model)
+        self._tkwrapper = TokenizerWrapper(
+            od_config.model,
+            revision=od_config.revision,
+            trust_remote_code=od_config.trust_remote_code,
+        )
         self.image_processor = HunyuanImage3ImageProcessor(self.hf_config)
         self.vision_model = Siglip2VisionTransformer(self.hf_config.vit)
         # self.vision_model = vision_model.vision_model
