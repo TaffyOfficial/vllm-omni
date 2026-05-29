@@ -20,7 +20,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 def _make_state(*, prompts=None, num_outputs_per_prompt: int = 1) -> DiffusionRequestState:
     return DiffusionRequestState(
-        req_id="req",
+        request_id="req",
         prompts=["prompt"] if prompts is None else prompts,
         sampling=OmniDiffusionSamplingParams(num_outputs_per_prompt=num_outputs_per_prompt),
     )
@@ -229,7 +229,7 @@ def test_hunyuan_image3_denoise_updates_model_kwargs_until_each_state_is_final(m
         pipeline,
         "_split_step_model_inputs",
         lambda states, input_ids, model_kwargs, cfg_factor: split_calls.append(
-            ([state.req_id for state in states], input_ids)
+            ([state.request_id for state in states], input_ids)
         ),
     )
     input_batch = SimpleNamespace(
