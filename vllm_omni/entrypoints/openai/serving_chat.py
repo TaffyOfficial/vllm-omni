@@ -502,12 +502,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # Store height/width for applying to diffusion stage sampling params later
                 _image_gen_height = height
                 _image_gen_width = width
-                _image_gen_infer_align_image_size = True if infer_align_image_size else None
+                _image_gen_infer_align_image_size = infer_align_image_size
             except Exception as e:
                 logger.warning("Failed to build image-generation prompt for omni multistage: %s", e)
                 _image_gen_height = None
                 _image_gen_width = None
-                _image_gen_infer_align_image_size = None
+                _image_gen_infer_align_image_size = False
         elif request.modalities and ("text" in request.modalities) and is_single_stage_diffusion(self.engine_client):
             # Single-stage diffusion text output (img2text / text2text).
             # Build a diffusion-style prompt with modalities=["text"] so the
@@ -536,11 +536,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logger.warning("Failed to build text-output prompt for single-stage diffusion: %s", e)
             _image_gen_height = None
             _image_gen_width = None
-            _image_gen_infer_align_image_size = None
+            _image_gen_infer_align_image_size = False
         else:
             _image_gen_height = None
             _image_gen_width = None
-            _image_gen_infer_align_image_size = None
+            _image_gen_infer_align_image_size = False
 
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
@@ -568,7 +568,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if _image_gen_infer_align_image_size and hasattr(sp, "extra_args"):
                         if sp.extra_args is None:
                             sp.extra_args = {}
-                        sp.extra_args["infer_align_image_size"] = _image_gen_infer_align_image_size
+                        sp.extra_args["infer_align_image_size"] = True
                     if hasattr(sp, "height") and _image_gen_height is not None:
                         sp.height = _image_gen_height
                     if hasattr(sp, "width") and _image_gen_width is not None:

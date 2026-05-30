@@ -1182,7 +1182,7 @@ def test_parameter_validation():
     assert req.size is None  # Engine will use model defaults
     assert req.num_inference_steps is None  # Engine will use model defaults
     assert req.true_cfg_scale is None  # Engine will use model defaults
-    assert req.infer_align_image_size is None  # Only explicit values are forwarded
+    assert req.infer_align_image_size is None  # Omitted request keeps the model default.
 
     # Invalid num_inference_steps (out of range)
     with pytest.raises(ValueError):
