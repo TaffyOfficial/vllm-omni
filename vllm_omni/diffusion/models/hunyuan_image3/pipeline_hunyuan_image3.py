@@ -46,6 +46,7 @@ from .hunyuan_image3_transformer import (
     build_batch_2d_rope,
     real_batched_index_select,
 )
+from .image_processing import resize_and_crop
 from .system_prompt import get_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -204,7 +205,7 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
         target_width = int(target_width)
         target_height = int(target_height)
         crop_type = "resize" if infer_align_image_size else "center"
-        vae_input = image_processor._resize_and_crop(pil_image, (target_width, target_height), crop_type=crop_type)
+        vae_input = resize_and_crop(pil_image, (target_width, target_height), crop_type=crop_type)
         vae_tensor = image_processor.vae_processor(vae_input)
         base_size, ratio_idx = image_processor.reso_group.get_base_size_and_ratio_index(target_width, target_height)
         base_size = int(base_size)

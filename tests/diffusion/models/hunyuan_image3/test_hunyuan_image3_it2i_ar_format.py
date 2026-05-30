@@ -17,8 +17,7 @@ and what the model was actually trained on, this test asserts:
    by ``tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)``
    for the same `(system, user_prompt, image)` triple.
 2. The image-tensor produced by the diffusion-side image processor resize/crop
-   helper is byte-identical to the AR-side ``HunyuanImage3Processor._resize_and_crop``
-   output (i.e. AR and DiT preprocess the IT2I condition image identically).
+   helper is byte-identical to the shared resize/crop helper used by AR and DiT.
 
 Both checks need the official tokenizer/image-processor classes; we gate on
 ``HF_HOME`` cache availability so the suite stays runnable on machines

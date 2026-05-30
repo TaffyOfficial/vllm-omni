@@ -6,7 +6,6 @@ import typing
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Literal, TypeAlias
 
-import numpy as np
 import regex as re
 import torch
 from einops import rearrange
@@ -91,6 +90,12 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.diffusion.models.hunyuan_image3.image_processing import (
+    HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS,
+    Resolution,
+    ResolutionGroup,
+    resize_and_crop,
+)
 from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import AutoencoderKLConv3D
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjector, Siglip2VisionTransformer
 
@@ -707,132 +712,13 @@ class HunyuanImage3PixelInputs(TensorSchema):
 class HunyuanImage3Processor:
     """Image processor for Hunyuan Image 3.0 model."""
 
-    class Resolution:
-        def __init__(self, size, *args):
-            if isinstance(size, str):
-                if "x" in size:
-                    size = size.split("x")
-                    size = (int(size[0]), int(size[1]))
-                else:
-                    size = int(size)
-            if len(args) > 0:
-                size = (size, args[0])
-            if isinstance(size, int):
-                size = (size, size)
-
-            self.h = self.height = size[0]
-            self.w = self.width = size[1]
-            self.r = self.ratio = self.height / self.width
-
-        def __getitem__(self, idx):
-            if idx == 0:
-                return self.h
-            elif idx == 1:
-                return self.w
-            else:
-                raise IndexError(f"Index {idx} out of range")
-
-        def __str__(self):
-            return f"{self.h}x{self.w}"
-
-    class ResolutionGroup:
-        """Group of resolutions for image processing."""
-
-        def __init__(self, base_size=None, step=None, align=1, extra_resolutions=None):
-            self.align = align
-            self.base_size = base_size
-            assert base_size % align == 0, f"base_size {base_size} is not divisible by align {align}"
-            if base_size is not None and not isinstance(base_size, int):
-                raise ValueError(f"base_size must be None or int, but got {type(base_size)}")
-            if step is None:
-                step = base_size // 16
-            if step is not None and step > base_size // 2:
-                raise ValueError(f"step must be smaller than base_size // 2, but got {step} > {base_size // 2}")
-
-            self.step = step
-            self.data = self._calc_by_step()
-
-            if extra_resolutions is not None:
-                for er in extra_resolutions:
-                    if not any(r.ratio == er.ratio for r in self.data):
-                        self.data.append(er)
-
-            self.ratio = np.array([x.ratio for x in self.data])
-            self.attr = ["" for _ in range(len(self.data))]
-            self.prefix_space = 0
-
-        def __len__(self):
-            return len(self.data)
-
-        def __getitem__(self, idx):
-            return self.data[idx]
-
-        def _calc_by_step(self):
-            assert self.align <= self.step, f"align {self.align} must be smaller than step {self.step}"
-
-            min_height = self.base_size // 2
-            min_width = self.base_size // 2
-            max_height = self.base_size * 2
-            max_width = self.base_size * 2
-
-            resolutions = [HunyuanImage3Processor.Resolution(self.base_size, self.base_size)]
-
-            cur_height, cur_width = self.base_size, self.base_size
-            while True:
-                if cur_height >= max_height and cur_width <= min_width:
-                    break
-
-                cur_height = min(cur_height + self.step, max_height)
-                cur_width = max(cur_width - self.step, min_width)
-                resolutions.append(
-                    HunyuanImage3Processor.Resolution(
-                        cur_height // self.align * self.align, cur_width // self.align * self.align
-                    )
-                )
-
-            cur_height, cur_width = self.base_size, self.base_size
-            while True:
-                if cur_height <= min_height and cur_width >= max_width:
-                    break
-
-                cur_height = max(cur_height - self.step, min_height)
-                cur_width = min(cur_width + self.step, max_width)
-                resolutions.append(
-                    HunyuanImage3Processor.Resolution(
-                        cur_height // self.align * self.align, cur_width // self.align * self.align
-                    )
-                )
-
-            resolutions = sorted(resolutions, key=lambda x: x.ratio)
-
-            return resolutions
-
-        def get_target_size(self, width, height):
-            ratio = height / width
-            idx = np.argmin(np.abs(self.ratio - ratio))
-            reso = self.data[idx]
-            return reso.w, reso.h
-
-        def get_base_size_and_ratio_index(self, width, height):
-            ratio = height / width
-            idx = np.argmin(np.abs(self.ratio - ratio))
-            return self.base_size, idx
-
     def __init__(self, tokenizer, hf_config, **kwargs: object):
         self.tokenizer = tokenizer
         self.hf_config = hf_config
         self.infer_align_image_size = bool(kwargs.pop("infer_align_image_size", False))
-        # `HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS` mirrors the official
-        # `vae_reso_group` extras (image_processor.py:147-152). Build with
-        # this processor's inner Resolution class so `data` stays
-        # type-homogeneous.
-        from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
-            HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS,
-        )
-
-        self.reso_group = self.ResolutionGroup(
+        self.reso_group = ResolutionGroup(
             base_size=hf_config.image_base_size,
-            extra_resolutions=[HunyuanImage3Processor.Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
+            extra_resolutions=[Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
         )
         self.vision_encoder_processor = Siglip2ImageProcessorFast.from_dict(hf_config.vit_processor)
         self.vae_processor = transforms.Compose(
@@ -878,10 +764,6 @@ class HunyuanImage3Processor:
         else:
             raise TypeError(f"Unsupported image type: {type(image_input)}.")
 
-        from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
-            HunyuanImage3ImageProcessor,
-        )
-
         # Each cond image keeps its own VAE bucket (mirrors official HF's
         # ragged behavior in `_encode_cond_image`). VAE pixel tensors have
         # different (H_i, W_i) per image, so they're flattened to 1-D and
@@ -921,9 +803,7 @@ class HunyuanImage3Processor:
             # boundary (see `_vae_encode`).
             image_width, image_height = self.reso_group.get_target_size(image.width, image.height)
             crop_type = "resize" if self.infer_align_image_size else "center"
-            resized_image = HunyuanImage3ImageProcessor._resize_and_crop(
-                image, (image_width, image_height), crop_type=crop_type
-            )
+            resized_image = resize_and_crop(image, (image_width, image_height), crop_type=crop_type)
             vae_pixel_values = self.vae_processor(resized_image).squeeze(0)
             token_height = image_height // (self.hf_config.vae_downsample_factor[0] * self.hf_config.patch_size)
             token_width = image_width // (self.hf_config.vae_downsample_factor[1] * self.hf_config.patch_size)
@@ -1611,17 +1491,13 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # flip ``has_sampling_extra_args`` so the runtime forwards the
         # list — see ``vllm_omni/worker/gpu_model_runner.py``.
         self._cur_sampling_extra_args: list[dict] | None = None
-        self._reso_group: HunyuanImage3Processor.ResolutionGroup | None = None
+        self._reso_group: ResolutionGroup | None = None
         self._ratio_idx_to_token_id: list[int] = []
         if not self._is_comprehension:
             self.vllm_config.model_config.has_sampling_extra_args = True
-            from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
-                HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS,
-            )
-
-            self._reso_group = HunyuanImage3Processor.ResolutionGroup(
+            self._reso_group = ResolutionGroup(
                 base_size=image_base_size,
-                extra_resolutions=[HunyuanImage3Processor.Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
+                extra_resolutions=[Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
             )
             # idx -> AR ratio token id (ratio_0..32 and 33..36 sit in two
             # non-contiguous tokenizer ranges; convert per-name to handle both).
@@ -2170,7 +2046,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         When ``SamplingParams.extra_args["target_height"]`` and
         ``"target_width"`` are set (online/offline entry points stamp them
         from user-supplied size), resolve the matching bucket via the
-        shared ``HunyuanImage3Processor.ResolutionGroup`` and force that
+        shared ``ResolutionGroup`` and force that
         ratio token so the AR's KV cache matches the DiT's user-requested
         image_size.
         """
