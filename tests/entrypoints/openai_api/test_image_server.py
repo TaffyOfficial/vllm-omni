@@ -1231,7 +1231,23 @@ def test_parameters_passed_through(test_client, mock_async_diffusion):
     assert captured.seed == 42
 
 
-def test_image_generation_forwards_explicit_infer_align_image_size(test_client, mock_async_diffusion):
+def test_image_generation_forwards_true_infer_align_image_size(test_client, mock_async_diffusion):
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "test",
+            "infer_align_image_size": True,
+        },
+    )
+    assert response.status_code == 200
+
+    captured_prompt = mock_async_diffusion.captured_prompt
+    captured_params = mock_async_diffusion.captured_sampling_params_list[0]
+    assert captured_prompt["mm_processor_kwargs"]["infer_align_image_size"] is True
+    assert captured_params.extra_args["infer_align_image_size"] is True
+
+
+def test_image_generation_false_infer_align_image_size_matches_default(test_client, mock_async_diffusion):
     response = test_client.post(
         "/v1/images/generations",
         json={
@@ -1243,8 +1259,8 @@ def test_image_generation_forwards_explicit_infer_align_image_size(test_client, 
 
     captured_prompt = mock_async_diffusion.captured_prompt
     captured_params = mock_async_diffusion.captured_sampling_params_list[0]
-    assert captured_prompt["mm_processor_kwargs"]["infer_align_image_size"] is False
-    assert captured_params.extra_args["infer_align_image_size"] is False
+    assert "mm_processor_kwargs" not in captured_prompt
+    assert "infer_align_image_size" not in captured_params.extra_args
 
 
 def test_image_generation_omits_infer_align_image_size_by_default(test_client, mock_async_diffusion):
@@ -1879,7 +1895,27 @@ def test_image_edit_with_seed_zero_single_stage(test_client):
     )
 
 
-def test_image_edit_forwards_explicit_infer_align_image_size(async_omni_test_client):
+def test_image_edit_forwards_true_infer_align_image_size(async_omni_test_client):
+    img_bytes = make_test_image_bytes((16, 16))
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "edit this image",
+            "infer_align_image_size": "true",
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    engine = async_omni_test_client.app.state.engine_client
+    captured_prompt = engine.captured_prompt
+    captured_params = engine.captured_sampling_params_list[-1]
+    assert captured_prompt["mm_processor_kwargs"]["infer_align_image_size"] is True
+    assert captured_params.extra_args["infer_align_image_size"] is True
+
+
+def test_image_edit_false_infer_align_image_size_matches_default(async_omni_test_client):
     img_bytes = make_test_image_bytes((16, 16))
 
     response = async_omni_test_client.post(
@@ -1895,8 +1931,8 @@ def test_image_edit_forwards_explicit_infer_align_image_size(async_omni_test_cli
     engine = async_omni_test_client.app.state.engine_client
     captured_prompt = engine.captured_prompt
     captured_params = engine.captured_sampling_params_list[-1]
-    assert captured_prompt["mm_processor_kwargs"]["infer_align_image_size"] is False
-    assert captured_params.extra_args["infer_align_image_size"] is False
+    assert "infer_align_image_size" not in captured_prompt["mm_processor_kwargs"]
+    assert "infer_align_image_size" not in captured_params.extra_args
 
 
 def test_normalize_image():

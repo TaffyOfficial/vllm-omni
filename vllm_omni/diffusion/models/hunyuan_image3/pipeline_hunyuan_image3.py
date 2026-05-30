@@ -298,8 +298,6 @@ class HunyuanImage3Pipeline(
     SupportImageInput,
     DiffusionPipelineProfilerMixin,
 ):
-    EXTRA_BODY_PARAMS = frozenset({"infer_align_image_size"})
-
     support_image_input = True
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={

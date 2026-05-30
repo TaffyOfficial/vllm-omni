@@ -1660,7 +1660,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 extra_body["flow_shift"] = request.flow_shift
             if request.extra_params is not None:
                 extra_body["extra_params"] = request.extra_params
-            if request.infer_align_image_size is not None:
+            if request.infer_align_image_size:
                 extra_body["infer_align_image_size"] = request.infer_align_image_size
             if request.generator_device is not None:
                 extra_body["generator_device"] = request.generator_device
@@ -1706,7 +1706,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             extra_args["bot_task"] = request.bot_task
         if request.flow_shift is not None:
             extra_args["flow_shift"] = request.flow_shift
-        if request.infer_align_image_size is not None:
+        if request.infer_align_image_size:
             extra_args["infer_align_image_size"] = request.infer_align_image_size
         if extra_args:
             gen_params.extra_args = extra_args
@@ -1733,7 +1733,10 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             # Backward-compatible fallback for processors reading top-level fields.
             prompt["height"] = height
             prompt["width"] = width
-        if request.infer_align_image_size is not None:
+        # HunyuanImage3 uses this in both stages: AR condition-image
+        # preprocessing switches resize/crop, and DiT postprocess restores the
+        # input aspect ratio from extra_args.
+        if request.infer_align_image_size:
             prompt.setdefault("mm_processor_kwargs", {})["infer_align_image_size"] = request.infer_align_image_size
         app_state_args = getattr(raw_request.app.state, "args", None)
         _check_max_generated_image_size(app_state_args, width, height)
@@ -2004,12 +2007,15 @@ async def edit_images(
             # Backward-compatible fallback for processors reading top-level fields.
             prompt["height"] = height
             prompt["width"] = width
-        if infer_align_image_size is not None:
+        # HunyuanImage3 uses this in both stages: AR condition-image
+        # preprocessing switches resize/crop, and DiT postprocess restores the
+        # input aspect ratio from extra_args.
+        if infer_align_image_size:
             prompt.setdefault("mm_processor_kwargs", {})["infer_align_image_size"] = infer_align_image_size
 
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
-        if infer_align_image_size is not None:
+        if infer_align_image_size:
             gen_params.extra_args["infer_align_image_size"] = infer_align_image_size
 
         # 3.4 Add optional parameters ONLY if provided
@@ -2085,7 +2091,7 @@ async def edit_images(
                 extra_body["strength"] = strength
             if true_cfg_scale is not None:
                 extra_body["true_cfg_scale"] = true_cfg_scale
-            if infer_align_image_size is not None:
+            if infer_align_image_size:
                 extra_body["infer_align_image_size"] = infer_align_image_size
             if layers is not None:
                 extra_body["layers"] = layers
