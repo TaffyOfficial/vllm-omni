@@ -420,7 +420,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     extra_body = request.model_extra or {}
 
                 height, width = self._resolve_height_width_from_extra_body(extra_body)
-                infer_align_image_size = bool(extra_body.get("infer_align_image_size", False))
+                infer_align_image_size = self._extra_body_flag_enabled(extra_body, "infer_align_image_size")
 
                 num_inference_steps = extra_body.get("num_inference_steps")
                 if num_inference_steps is not None:
@@ -2543,7 +2543,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         lora_body = extra_body.get("lora")
         layers = extra_body.get("layers")
         resolution = extra_body.get("resolution")
-        infer_align_image_size = bool(extra_body.get("infer_align_image_size", False))
+        infer_align_image_size = self._extra_body_flag_enabled(extra_body, "infer_align_image_size")
         bot_task = extra_body.get("bot_task")
         use_system_prompt = extra_body.get("use_system_prompt") or extra_body.get("sys_type")
         custom_system_prompt = extra_body.get("system_prompt")
@@ -2752,7 +2752,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             num_outputs_per_prompt=num_outputs_per_prompt,
             seed=seed,
         )
-        if bool(extra_body.get("infer_align_image_size", False)):
+        if self._extra_body_flag_enabled(extra_body, "infer_align_image_size"):
             gen_params.extra_args["infer_align_image_size"] = True
         self._set_if_supported(
             gen_params,
@@ -3129,7 +3129,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 num_outputs_per_prompt=num_outputs_per_prompt,
                 seed=seed,
             )
-            if bool(extra_body.get("infer_align_image_size", False)):
+            if self._extra_body_flag_enabled(extra_body, "infer_align_image_size"):
                 gen_params.extra_args["infer_align_image_size"] = True
 
             # Only override defaults when the user explicitly provides values
@@ -3517,6 +3517,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logger.warning("Invalid size format: %s", extra_body.get("size"))
 
         return height, width
+
+    @staticmethod
+    def _extra_body_flag_enabled(extra_body: dict[str, Any], key: str) -> bool:
+        """Parse bool-like flags from raw OpenAI extra_body payloads."""
+        value = extra_body.get(key, False)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+        return bool(value)
 
     def _create_error_response(
         self,

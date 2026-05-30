@@ -93,6 +93,46 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine.default_sampling_params_list[2].lora_request is None
 
 
+@pytest.mark.parametrize(
+    ("flag_value", "expected_enabled"),
+    [
+        ("true", True),
+        ("false", False),
+        (True, True),
+        (False, False),
+    ],
+)
+def test_build_multistage_generation_inputs_parses_infer_align_flag(serving_chat, flag_value, expected_enabled):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.0),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+
+    engine_prompt, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="draw a robot",
+        extra_body={"infer_align_image_size": flag_value},
+        reference_images=[],
+        gen_params=OmniDiffusionSamplingParams(),
+    )
+
+    if expected_enabled:
+        assert engine_prompt["mm_processor_kwargs"]["infer_align_image_size"] is True
+        assert sampling_params_list[1].extra_args["infer_align_image_size"] is True
+    else:
+        assert "infer_align_image_size" not in engine_prompt["mm_processor_kwargs"]
+        assert "infer_align_image_size" not in sampling_params_list[1].extra_args
+
+
 def test_build_multistage_generation_inputs_multi_image_emits_n_img_placeholders(serving_chat):
     """N reference images with bot_task set must emit N <img> placeholders.
 
