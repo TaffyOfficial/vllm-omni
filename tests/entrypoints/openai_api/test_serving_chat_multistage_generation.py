@@ -133,6 +133,46 @@ def test_build_multistage_generation_inputs_parses_infer_align_flag(serving_chat
         assert "infer_align_image_size" not in sampling_params_list[1].extra_args
 
 
+@pytest.mark.parametrize(
+    ("flag_value", "expected_enabled"),
+    [
+        ("true", True),
+        ("false", False),
+        (True, True),
+        (False, False),
+    ],
+)
+def test_merge_extra_args_body_normalizes_infer_align_flag(serving_chat, flag_value, expected_enabled):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    extra_args = {"infer_align_image_size": True, "existing": "kept"}
+    OmniOpenAIServingChat._merge_extra_args_body(
+        extra_args,
+        {
+            "infer_align_image_size": flag_value,
+            "custom": "value",
+        },
+    )
+
+    assert extra_args["custom"] == "value"
+    assert extra_args["existing"] == "kept"
+    if expected_enabled:
+        assert extra_args["infer_align_image_size"] is True
+    else:
+        # A false-like value from the generic escape hatch must not override a
+        # normalized top-level true value with a truthy string such as "false".
+        assert extra_args["infer_align_image_size"] is True
+
+
+def test_merge_extra_args_body_omits_false_infer_align_when_unset(serving_chat):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    extra_args = {}
+    OmniOpenAIServingChat._merge_extra_args_body(extra_args, {"infer_align_image_size": "false"})
+
+    assert "infer_align_image_size" not in extra_args
+
+
 def test_build_multistage_generation_inputs_multi_image_emits_n_img_placeholders(serving_chat):
     """N reference images with bot_task set must emit N <img> placeholders.
 

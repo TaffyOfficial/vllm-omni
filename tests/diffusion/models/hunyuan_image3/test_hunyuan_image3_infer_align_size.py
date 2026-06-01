@@ -16,6 +16,9 @@ from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import
     ImageInfo,
     JointImageInfo,
 )
+from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
+    _extra_arg_flag_enabled,
+)
 from vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 import (
     HunyuanImage3Processor,
 )
@@ -52,6 +55,19 @@ def test_image_processor_infer_align_resize_mode_is_direct_resize():
     expected_resize = src.resize((4, 4), resample=Image.Resampling.LANCZOS)
     assert np.array_equal(np.asarray(official_resize), np.asarray(expected_resize))
     assert not np.array_equal(np.asarray(official_resize), np.asarray(center_crop))
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("true", True),
+        ("false", False),
+        (True, True),
+        (False, False),
+    ],
+)
+def test_pipeline_extra_arg_flag_parser_handles_string_false(value, expected):
+    assert _extra_arg_flag_enabled({"infer_align_image_size": value}, "infer_align_image_size") is expected
 
 
 class _FixedTargetResolutionGroup:

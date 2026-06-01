@@ -439,7 +439,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     try:
                         img_bytes = base64.b64decode(reference_images[0])
                         img = Image.open(BytesIO(img_bytes))
-                        engine_prompt_image = {"img2img": img}
+                        engine_prompt_image = {"image": img}
                     except Exception:
                         engine_prompt_image = None
 
@@ -2552,7 +2552,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         modalities = ["image"]
         if reference_images:
             if len(reference_images) == 1:
-                engine_prompt_data = {"img2img": reference_images[0]}
+                engine_prompt_data = {"image": reference_images[0]}
                 modalities = ["img2img"]
             else:
                 engine_prompt_data = {"image": reference_images}
@@ -3156,13 +3156,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if resolution is not None:
                 gen_params.resolution = resolution
 
-            # Pipeline-agnostic escape hatch (mirrors ``extra_params`` on the /v1/videos
-            # endpoint in ``serving_video.py``): a single reserved ``extra_args`` dict in
-            # ``extra_body`` flows straight into ``gen_params.extra_args``, with no keys
-            # hardcoded here.
-            extra_args_body = extra_body.get("extra_args")
-            if isinstance(extra_args_body, dict):
-                gen_params.extra_args.update(extra_args_body)
+            # Pipeline-agnostic escape hatch (mirrors ``extra_params`` on the
+            # /v1/videos endpoint in ``serving_video.py``). Known bool-like
+            # flags are normalized before merging so string form values such
+            # as "false" do not become truthy later in pipeline code.
+            self._merge_extra_args_body(gen_params.extra_args, extra_body.get("extra_args"))
 
             # Parse per-request LoRA.
             if lora_body and isinstance(lora_body, dict):
@@ -3521,12 +3519,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     @staticmethod
     def _extra_body_flag_enabled(extra_body: dict[str, Any], key: str) -> bool:
         """Parse bool-like flags from raw OpenAI extra_body payloads."""
-        value = extra_body.get(key, False)
+        return OmniOpenAIServingChat._flag_value_enabled(extra_body.get(key, False))
+
+    @staticmethod
+    def _flag_value_enabled(value: Any) -> bool:
         if isinstance(value, bool):
             return value
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
         return bool(value)
+
+    @staticmethod
+    def _merge_extra_args_body(extra_args: dict[str, Any], extra_args_body: Any) -> None:
+        if not isinstance(extra_args_body, dict):
+            return
+        sanitized_extra_args = dict(extra_args_body)
+        infer_align_image_size = sanitized_extra_args.pop("infer_align_image_size", None)
+        extra_args.update(sanitized_extra_args)
+        if infer_align_image_size is not None and OmniOpenAIServingChat._flag_value_enabled(infer_align_image_size):
+            extra_args["infer_align_image_size"] = True
 
     def _create_error_response(
         self,

@@ -709,13 +709,21 @@ class HunyuanImage3PixelInputs(TensorSchema):
     pixel_values: dict[str, torch.Tensor]
 
 
+def _flag_value_enabled(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+    return bool(value)
+
+
 class HunyuanImage3Processor:
     """Image processor for Hunyuan Image 3.0 model."""
 
     def __init__(self, tokenizer, hf_config, **kwargs: object):
         self.tokenizer = tokenizer
         self.hf_config = hf_config
-        self.infer_align_image_size = bool(kwargs.pop("infer_align_image_size", False))
+        self.infer_align_image_size = _flag_value_enabled(kwargs.pop("infer_align_image_size", False))
         self.reso_group = ResolutionGroup(
             base_size=hf_config.image_base_size,
             extra_resolutions=[Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
