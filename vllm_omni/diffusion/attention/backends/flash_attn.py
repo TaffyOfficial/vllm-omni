@@ -197,6 +197,7 @@ class FlashAttentionImpl(AttentionImpl):
                 full_attn_spans,
                 self.softmax_scale,
                 attn_func,
+                attn_mask=attention_mask,
             )
 
         if attention_mask is not None and torch.any(~attention_mask):
@@ -231,9 +232,11 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
         """XPU flash attention implementation."""
-        from vllm_omni.diffusion.attention.backends.utils.fa import (
-            HAS_FLASH_ATTN,
-        )
+        full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
+        if full_attn_spans is not None:
+            raise ValueError("XPU FlashAttention does not support piecewise full_attn_spans yet.")
+
+        from vllm_omni.diffusion.attention.backends.utils.fa import HAS_FLASH_ATTN
 
         if not HAS_FLASH_ATTN:
             raise ImportError(

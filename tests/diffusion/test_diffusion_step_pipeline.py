@@ -39,7 +39,8 @@ from vllm_omni.diffusion.sched.interface import (
 )
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.worker.input_batch import InputBatch
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState, RunnerOutput
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -298,6 +299,17 @@ def _make_batch_scheduler_output(reqs, *, step_id=0, finished_req_ids=None):
     )
 
 
+def _make_input_batch_state(request_id: str, latent_value: float) -> DiffusionRequestState:
+    state = DiffusionRequestState(
+        request_id=request_id,
+        sampling=SimpleNamespace(),
+        prompts=None,
+    )
+    state.latents = torch.tensor([[latent_value]])
+    state.timesteps = torch.tensor([1.0])
+    return state
+
+
 def _make_cached_scheduler_output(request_id="req-1", step_id=1, finished_req_ids=None):
     return DiffusionSchedulerOutput(
         step_id=step_id,
@@ -372,6 +384,38 @@ def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master
 # ---------------------------------------------------------------------------
 # Runner / Worker
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.cpu
+def test_input_batch_cached_repack_refreshes_state_references_without_prompt_embeds():
+    first_state = _make_input_batch_state("req-1", 1.0)
+    batch = InputBatch.make_batch([first_state])
+    assert batch.prompt_embeds is None
+
+    replacement_state = _make_input_batch_state("req-1", 2.0)
+    repacked = InputBatch.make_batch([replacement_state], cached_batch=batch)
+
+    assert repacked is batch
+    assert repacked.states[0] is replacement_state
+    assert repacked.prompt_embeds is None
+    torch.testing.assert_close(repacked.latents, replacement_state.latents)
+
+
+@pytest.mark.cpu
+def test_input_batch_cached_repack_keeps_static_prompt_fields_for_same_composition():
+    first_state = _make_input_batch_state("req-1", 1.0)
+    first_state.prompt_embeds = torch.ones(1, 2, 3)
+    first_state.prompt_embeds_mask = torch.ones(1, 2, dtype=torch.bool)
+    batch = InputBatch.make_batch([first_state])
+
+    replacement_state = _make_input_batch_state("req-1", 2.0)
+    replacement_state.prompt_embeds = torch.full((1, 2, 3), 2.0)
+    replacement_state.prompt_embeds_mask = torch.ones(1, 2, dtype=torch.bool)
+    repacked = InputBatch.make_batch([replacement_state], cached_batch=batch)
+
+    assert repacked.states[0] is replacement_state
+    torch.testing.assert_close(repacked.latents, replacement_state.latents)
+    torch.testing.assert_close(repacked.prompt_embeds, torch.ones(1, 2, 3))
 
 
 @pytest.mark.cpu
