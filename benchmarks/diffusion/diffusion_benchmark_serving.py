@@ -946,6 +946,48 @@ async def _run_warmups(
     return list(zip(warmup_requests, warmup_outputs))
 
 
+STREAM_AR_STAGE_GEN_MS_KEYS = ("stage_0_gen_ms", "stage_1_gen_ms")
+
+
+def _percentile_stats(values: list[float]) -> dict[str, float | int]:
+    return {
+        "mean": float(np.mean(values)),
+        "median": float(np.median(values)),
+        "p95": float(np.percentile(values, 95)),
+        "p99": float(np.percentile(values, 99)),
+        "count": len(values),
+    }
+
+
+def _merge_stage_gen_ms_metrics(
+    metrics: dict,
+    stage_duration_lists: dict[str, list[float]],
+    keys: tuple[str, ...] = STREAM_AR_STAGE_GEN_MS_KEYS,
+) -> None:
+    for key in keys:
+        values = stage_duration_lists.get(key, [])
+        if not values:
+            continue
+        stats = _percentile_stats(values)
+        metrics[f"{key}_mean"] = stats["mean"]
+        metrics[f"{key}_median"] = stats["median"]
+        metrics[f"{key}_p95"] = stats["p95"]
+        metrics[f"{key}_p99"] = stats["p99"]
+        metrics[f"{key}_count"] = stats["count"]
+
+
+def _print_stage_gen_ms_block(metrics: dict, key: str) -> bool:
+    if metrics.get(f"{key}_count", 0) <= 0:
+        return False
+    print(f"{'-' * 50}")
+    print(f"{key}:")
+    print("{:<40} {:<15.3f}".format("  Mean:", metrics[f"{key}_mean"]))
+    print("{:<40} {:<15.3f}".format("  Median:", metrics[f"{key}_median"]))
+    print("{:<40} {:<15.3f}".format("  P95:", metrics[f"{key}_p95"]))
+    print("{:<40} {:<15.3f}".format("  P99:", metrics[f"{key}_p99"]))
+    return True
+
+
 def calculate_metrics(
     outputs: list[RequestFuncOutput],
     total_duration: float,
@@ -967,7 +1009,13 @@ def calculate_metrics(
             stage_duration_lists.setdefault(stage, []).append(duration)
     stage_durations_mean = {s: float(np.mean(v)) for s, v in stage_duration_lists.items()}
     stage_durations_p50 = {s: float(np.percentile(v, 50)) for s, v in stage_duration_lists.items()}
+    stage_durations_p95 = {s: float(np.percentile(v, 95)) for s, v in stage_duration_lists.items()}
     stage_durations_p99 = {s: float(np.percentile(v, 99)) for s, v in stage_duration_lists.items()}
+    ttfc_values = [o.ttfc for o in success_outputs if o.ttfc > 0]
+    tpot_values = [o.tpot for o in success_outputs if o.tpot > 0]
+    ar_generation_tokens = [
+        float(o.ar_num_generation_tokens) for o in success_outputs if o.ar_num_generation_tokens > 0
+    ]
 
     metrics = {
         "duration": total_duration,
@@ -984,8 +1032,26 @@ def calculate_metrics(
         "peak_memory_mb_median": np.median(peak_memories) if peak_memories else 0,
         "stage_durations_mean": stage_durations_mean,
         "stage_durations_p50": stage_durations_p50,
+        "stage_durations_p95": stage_durations_p95,
         "stage_durations_p99": stage_durations_p99,
+        "ttfc_mean": float(np.mean(ttfc_values)) if ttfc_values else 0.0,
+        "ttfc_median": float(np.median(ttfc_values)) if ttfc_values else 0.0,
+        "ttfc_p95": float(np.percentile(ttfc_values, 95)) if ttfc_values else 0.0,
+        "ttfc_p99": float(np.percentile(ttfc_values, 99)) if ttfc_values else 0.0,
+        "ttfc_count": len(ttfc_values),
+        "tpot_mean": float(np.mean(tpot_values)) if tpot_values else 0.0,
+        "tpot_median": float(np.median(tpot_values)) if tpot_values else 0.0,
+        "tpot_p95": float(np.percentile(tpot_values, 95)) if tpot_values else 0.0,
+        "tpot_p99": float(np.percentile(tpot_values, 99)) if tpot_values else 0.0,
+        "tpot_count": len(tpot_values),
+        "tpot_mean_ms": float(np.mean(tpot_values)) * 1000.0 if tpot_values else 0.0,
+        "tpot_median_ms": float(np.median(tpot_values)) * 1000.0 if tpot_values else 0.0,
+        "tpot_p95_ms": float(np.percentile(tpot_values, 95)) * 1000.0 if tpot_values else 0.0,
+        "tpot_p99_ms": float(np.percentile(tpot_values, 99)) * 1000.0 if tpot_values else 0.0,
+        "ar_num_generation_tokens_mean": float(np.mean(ar_generation_tokens)) if ar_generation_tokens else 0.0,
+        "ar_num_generation_tokens_count": len(ar_generation_tokens),
     }
+    _merge_stage_gen_ms_metrics(metrics, stage_duration_lists)
 
     if slo_enabled:
         slo_defined_total = 0
@@ -1075,6 +1141,8 @@ async def benchmark(args):
             f"Example usage: --task {args.task} --endpoint {valid_endpoints[0]}"
         )
         raise ValueError("Endpoint validation failed. See log above for valid options.")
+    if args.stream_ar is None:
+        args.stream_ar = args.endpoint == "/v1/images/edits"
 
     # Setup API URL and request function based on endpoint.
     request_func, api_url = backends_function_mapping[task_type][args.endpoint]
@@ -1098,6 +1166,7 @@ async def benchmark(args):
     if args.endpoint == "/v1/images/edits":
         for req in requests_list:
             req.default_bot_task = args.bot_task
+            req.stream_ar = args.stream_ar
 
     # Limit concurrency
     if args.max_concurrency is not None:
@@ -1152,6 +1221,7 @@ async def benchmark(args):
     metrics["task"] = args.task
     if args.endpoint == "/v1/images/edits":
         metrics["bot_task"] = args.bot_task
+        metrics["stream_ar"] = args.stream_ar
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
 
@@ -1160,6 +1230,8 @@ async def benchmark(args):
     print("{:<40} {:<15}".format("Model:", args.model))
     print("{:<40} {:<15}".format("Dataset:", args.dataset))
     print("{:<40} {:<15}".format("Task:", args.task))
+    if args.endpoint == "/v1/images/edits":
+        print("{:<40} {:<15}".format("Stream AR (TTFC/TPOT):", str(args.stream_ar)))
 
     # Section 2: Execution & Traffic
     print(f"{'-' * 50}")
@@ -1194,7 +1266,41 @@ async def benchmark(args):
         print("{:<40} {:<15.2f}".format("Peak Memory Mean (MB):", metrics["peak_memory_mb_mean"]))
         print("{:<40} {:<15.2f}".format("Peak Memory Median (MB):", metrics["peak_memory_mb_median"]))
 
-    if metrics["stage_durations_mean"]:
+    if metrics.get("stream_ar") and metrics.get("ttfc_count", 0) > 0:
+        print(f"{'-' * 50}")
+        print("AR TTFC (s):")
+        print("{:<40} {:<15.4f}".format("  Mean:", metrics["ttfc_mean"]))
+        print("{:<40} {:<15.4f}".format("  Median:", metrics["ttfc_median"]))
+        print("{:<40} {:<15.4f}".format("  P95:", metrics["ttfc_p95"]))
+        print("{:<40} {:<15.4f}".format("  P99:", metrics["ttfc_p99"]))
+    elif metrics.get("stream_ar") and metrics.get("completed_requests", 0) > 0:
+        print(f"{'-' * 50}")
+        print("AR TTFC: unavailable (no ar_delta chunks; check stream=true / multi-stage pipeline)")
+
+    if metrics.get("stream_ar") and metrics.get("tpot_count", 0) > 0:
+        print(f"{'-' * 50}")
+        print("AR TPOT (ms):")
+        print("{:<40} {:<15.3f}".format("  Mean:", metrics["tpot_mean_ms"]))
+        print("{:<40} {:<15.3f}".format("  Median:", metrics["tpot_median_ms"]))
+        print("{:<40} {:<15.3f}".format("  P95:", metrics["tpot_p95_ms"]))
+        print("{:<40} {:<15.3f}".format("  P99:", metrics["tpot_p99_ms"]))
+    elif metrics.get("stream_ar") and metrics.get("completed_requests", 0) > 0:
+        print(f"{'-' * 50}")
+        print("AR TPOT: unavailable (no timing on final image chunk)")
+
+    if metrics.get("stream_ar") and metrics.get("ar_num_generation_tokens_count", 0) > 0:
+        print(f"{'-' * 50}")
+        print("{:<40} {:<15.1f}".format("AR generation tokens mean:", metrics["ar_num_generation_tokens_mean"]))
+
+    if metrics.get("stream_ar"):
+        printed_stage_metrics = False
+        for stage_key in STREAM_AR_STAGE_GEN_MS_KEYS:
+            if _print_stage_gen_ms_block(metrics, stage_key):
+                printed_stage_metrics = True
+        if not printed_stage_metrics and metrics.get("completed_requests", 0) > 0:
+            print(f"{'-' * 50}")
+            print("Stage gen (ms): unavailable (no stage_durations on final image chunk; need multi-stage pipeline)")
+    elif metrics["stage_durations_mean"]:
         print(f"{'-' * 50}")
         print("Stage Durations Mean (s):")
         for stage, val in metrics["stage_durations_mean"].items():
@@ -1357,6 +1463,15 @@ if __name__ == "__main__":
         type=str,
         default="think",
         help=("bot_task form field for --endpoint /v1/images/edits (think, recaption, think_recaption, vanilla)."),
+    )
+    parser.add_argument(
+        "--stream-ar",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "For /v1/images/edits: set stream=true to measure AR TTFC and AR TPOT. "
+            "Default: enabled for /v1/images/edits, disabled otherwise."
+        ),
     )
 
     args = parser.parse_args()
