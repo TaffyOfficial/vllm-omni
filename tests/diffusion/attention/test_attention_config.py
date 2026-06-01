@@ -257,6 +257,39 @@ class TestAttentionFallbacks:
         assert output is query
         assert calls == ["sdpa"]
 
+    def test_homogeneous_full_attn_spans_with_padding_use_sdpa_fallback(self):
+        attention = object.__new__(Attention)
+        attention.backend_pref = "FLASH_ATTN"
+        attention.attn_backend = SimpleNamespace(get_name=lambda: "FLASH_ATTN")
+
+        calls = []
+
+        class FakeBackend:
+            def __init__(self, name):
+                self.name = name
+
+            def forward(self, query, key, value, attn_metadata):
+                del key, value
+                calls.append(self.name)
+                return query
+
+        attention.attention = FakeBackend("flash")
+        attention.sdpa_fallback = FakeBackend("sdpa")
+
+        attn_metadata = AttentionMetadata(
+            attn_mask=torch.ones((2, 1, 4, 4), dtype=torch.bool),
+            full_attn_spans=[[(1, 3)], [(1, 3)]],
+            extra={"requires_sdpa_for_full_attn_spans": True},
+        )
+        query = torch.empty((2, 4, 1, 8), dtype=torch.bfloat16)
+        key = torch.empty_like(query)
+        value = torch.empty_like(query)
+
+        output = attention._run_local_attention(query, key, value, attn_metadata)
+
+        assert output is query
+        assert calls == ["sdpa"]
+
     def test_homogeneous_full_attn_spans_keep_configured_backend(self):
         attention = object.__new__(Attention)
         attention.backend_pref = "FLASH_ATTN"

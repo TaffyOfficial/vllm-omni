@@ -575,23 +575,32 @@ class HunyuanImage3Pipeline(
         bsz = len(states) * cfg_factor
         for state in states:
             state.extra["prompt_kv_cache"] = {}
+            state.extra["prompt_kv_cache_lens"] = {}
         for layer in self.model.layers:
             cache_mgr = layer.self_attn.image_attn
             cache = cache_mgr.image_kv_cache_map
             if cache is None:
                 continue
+            cache_lens = cache_mgr.image_kv_cache_lens
+            if cache_lens is None:
+                raise ValueError("HunyuanImage3 prompt KV cache lens are missing for an active cache.")
             key, value = cache
             if key.shape[0] % bsz != 0:
                 raise ValueError("HunyuanImage3 prompt KV cache shape is not divisible by the active batch.")
             rows_per_branch = key.shape[0] // bsz
+            if cache_lens.shape[0] != key.shape[0]:
+                raise ValueError("HunyuanImage3 prompt KV cache lens do not match the active cache rows.")
             for state_idx, state in enumerate(states):
                 row_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+                row_cache_lens: list[torch.Tensor] = []
                 for branch in range(cfg_factor):
                     row_idx = branch * len(states) + state_idx
                     start = row_idx * rows_per_branch
                     stop = start + rows_per_branch
                     row_cache.append((key[start:stop].clone(), value[start:stop].clone()))
+                    row_cache_lens.append(cache_lens[start:stop].clone())
                 state.extra["prompt_kv_cache"][layer.layer_idx] = row_cache
+                state.extra["prompt_kv_cache_lens"][layer.layer_idx] = row_cache_lens
 
     def _restore_prompt_kv_cache(
         self,
@@ -603,14 +612,22 @@ class HunyuanImage3Pipeline(
         for layer in self.model.layers:
             keys: list[torch.Tensor] = []
             values: list[torch.Tensor] = []
+            lens: list[torch.Tensor] = []
             for branch in range(cfg_factor):
                 for state in states:
                     cache = state.extra["prompt_kv_cache"].get(layer.layer_idx)
                     if cache is None or len(cache) != cfg_factor:
                         raise ValueError("HunyuanImage3 prompt KV cache is missing for an active step request.")
+                    cache_lens = state.extra.get("prompt_kv_cache_lens", {}).get(layer.layer_idx)
+                    if cache_lens is None or len(cache_lens) != cfg_factor:
+                        raise ValueError("HunyuanImage3 prompt KV cache lens are missing for an active step request.")
                     key, value = cache[branch]
+                    branch_lens = cache_lens[branch]
+                    if branch_lens.shape[0] != key.shape[0]:
+                        raise ValueError("HunyuanImage3 prompt KV cache lens do not match cached rows.")
                     keys.append(key)
                     values.append(value)
+                    lens.append(branch_lens)
             if keys and keys[0].dim() == 4:
                 max_seq_len = max(key.shape[1] for key in keys)
                 padded_keys: list[torch.Tensor] = []
@@ -630,6 +647,7 @@ class HunyuanImage3Pipeline(
                 keys = padded_keys
                 values = padded_values
             layer.self_attn.image_attn.image_kv_cache_map = (torch.cat(keys, dim=0), torch.cat(values, dim=0))
+            layer.self_attn.image_attn.image_kv_cache_lens = torch.cat(lens, dim=0)
 
     def _step_sequence_pad_value(self, field_name: str, tensor: torch.Tensor) -> int | float | bool | None:
         if field_name == "input_ids" or field_name.endswith(".tokens"):
@@ -785,6 +803,7 @@ class HunyuanImage3Pipeline(
             "eos_token_id",
             "max_new_tokens",
             "num_inference_steps",
+            "requires_sdpa_for_full_attn_spans",
         }
         for key in keys:
             if key in request_local_keys:
@@ -798,6 +817,27 @@ class HunyuanImage3Pipeline(
             bsz, _, q_len, seq_len = model_kwargs["attention_mask"].shape
             model_kwargs["query_lens"] = [q_len] * bsz
             model_kwargs["seq_lens"] = [seq_len] * bsz
+            if model_kwargs.get("full_attn_spans") is not None:
+                requires_sdpa_flags: list[bool] = []
+                for branch in range(cfg_factor):
+                    for state in states:
+                        state_kwargs = state.extra["model_kwargs"]
+                        source_mask = state_kwargs["attention_mask"]
+                        source_needs_padding = tuple(source_mask.shape[2:]) != (q_len, seq_len)
+                        previous_flag = state_kwargs.get("requires_sdpa_for_full_attn_spans", False)
+                        if isinstance(previous_flag, torch.Tensor):
+                            previous_flag = bool(previous_flag.flatten()[branch].item())
+                        elif isinstance(previous_flag, (list, tuple)):
+                            previous_flag = bool(previous_flag[branch])
+                        else:
+                            previous_flag = bool(previous_flag)
+                        requires_sdpa_flags.append(source_needs_padding or previous_flag)
+                if any(requires_sdpa_flags):
+                    model_kwargs["requires_sdpa_for_full_attn_spans"] = torch.tensor(
+                        requires_sdpa_flags,
+                        dtype=torch.bool,
+                        device=model_kwargs["attention_mask"].device,
+                    )
         return input_ids, model_kwargs, cfg_factor
 
     def _split_step_model_inputs(
@@ -1405,6 +1445,7 @@ class HunyuanImage3Pipeline(
                 "num_image_tokens": kwargs.get("num_image_tokens"),
                 "ar_kv_reuse_len": kwargs.get("ar_kv_reuse_len", 0),
                 "full_attn_spans": kwargs.get("full_attn_spans"),
+                "requires_sdpa_for_full_attn_spans": kwargs.get("requires_sdpa_for_full_attn_spans"),
             }
         )
         return model_inputs
@@ -1425,6 +1466,10 @@ class HunyuanImage3Pipeline(
         }
         if "full_attn_spans" in model_kwargs:
             updated_model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"]
+        if "requires_sdpa_for_full_attn_spans" in model_kwargs:
+            updated_model_kwargs["requires_sdpa_for_full_attn_spans"] = model_kwargs[
+                "requires_sdpa_for_full_attn_spans"
+            ]
 
         # update past_key_values keeping its naming used in model code
         for possible_cache_name in ALL_CACHE_NAMES:
@@ -1572,6 +1617,7 @@ class HunyuanImage3Pipeline(
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
+        requires_sdpa_for_full_attn_spans: torch.Tensor | list[bool] | bool | None = None,
     ) -> tuple | CausalMMOutputWithPast:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # Sanity Check of Inputs
@@ -1677,6 +1723,7 @@ class HunyuanImage3Pipeline(
                 uncond_cfg_prefill=uncond_cfg_prefill,
                 ar_kv_reuse_len=ar_kv_reuse_len,
                 full_attn_spans=full_attn_spans,
+                requires_sdpa_for_full_attn_spans=requires_sdpa_for_full_attn_spans,
             )
         hidden_states = outputs[0]
 

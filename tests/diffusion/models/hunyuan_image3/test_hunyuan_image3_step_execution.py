@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,9 @@ import torch
 
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer import (
     TokenizerEncodeOutput,
+)
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+    HunyuanImage3Model,
 )
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     HunyuanImage3Pipeline,
@@ -115,6 +119,7 @@ def test_hunyuan_image3_step_execution_pads_different_prompt_lengths():
                 "attention_mask": torch.ones((1, 1, seq_len, seq_len), dtype=torch.bool),
                 "position_ids": torch.arange(seq_len).unsqueeze(0),
                 "image_mask": torch.ones((1, seq_len), dtype=torch.bool),
+                "full_attn_spans": [[(0, 2)]],
                 "custom_pos_emb": (
                     torch.ones((1, seq_len, 2)) * (idx + 1),
                     torch.ones((1, seq_len, 2)) * (idx + 3),
@@ -137,6 +142,8 @@ def test_hunyuan_image3_step_execution_pads_different_prompt_lengths():
         [True, True, False],
         [False, False, False],
     ]
+    assert model_kwargs["full_attn_spans"] == [[(0, 2)], [(0, 2)]]
+    assert model_kwargs["requires_sdpa_for_full_attn_spans"].tolist() == [False, True]
     assert model_kwargs["position_ids"].tolist() == [[0, 1, 2], [0, 1, 0]]
     assert model_kwargs["image_mask"].tolist() == [[True, True, True], [True, True, False]]
     assert model_kwargs["query_lens"] == [3, 3]
@@ -146,6 +153,50 @@ def test_hunyuan_image3_step_execution_pads_different_prompt_lengths():
     assert model_kwargs["tokenizer_output"].tokens.tolist() == [[0, 1, 2], [10, 11, 99]]
     assert model_kwargs["tokenizer_output"].text_mask.tolist() == [[1, 1, 1], [1, 1, 0]]
     assert model_kwargs["tokenizer_output"].real_pos.tolist() == [3, 2]
+
+
+def test_hunyuan_image3_full_attn_sdpa_flag_survives_prepare_and_update():
+    pipeline = object.__new__(HunyuanImage3Pipeline)
+    flag = torch.tensor([False, True])
+    full_attn_spans = [[(0, 2)], [(0, 2)]]
+    attention_mask = torch.ones((2, 1, 3, 3), dtype=torch.bool)
+    position_ids = torch.arange(3).repeat(2, 1)
+
+    model_inputs = pipeline.prepare_inputs_for_generation(
+        torch.arange(6).reshape(2, 3),
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        custom_pos_emb=(torch.ones((2, 3, 2)), torch.ones((2, 3, 2))),
+        mode="gen_image",
+        num_image_tokens=2,
+        full_attn_spans=full_attn_spans,
+        requires_sdpa_for_full_attn_spans=flag,
+    )
+
+    assert model_inputs["full_attn_spans"] == full_attn_spans
+    assert torch.equal(model_inputs["requires_sdpa_for_full_attn_spans"], flag)
+
+    updated_model_kwargs = pipeline._update_model_kwargs_for_generation(
+        {},
+        {
+            "mode": "gen_image",
+            "custom_pos_emb": model_inputs["custom_pos_emb"],
+            "num_image_tokens": 2,
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
+            "gen_timestep_scatter_index": torch.zeros((2, 1), dtype=torch.long),
+            "full_attn_spans": full_attn_spans,
+            "requires_sdpa_for_full_attn_spans": flag,
+        },
+    )
+
+    assert updated_model_kwargs["full_attn_spans"] == full_attn_spans
+    assert torch.equal(updated_model_kwargs["requires_sdpa_for_full_attn_spans"], flag)
+
+
+def test_hunyuan_image3_full_attn_sdpa_flag_is_forward_contract():
+    assert "requires_sdpa_for_full_attn_spans" in inspect.signature(HunyuanImage3Pipeline.forward_call).parameters
+    assert "requires_sdpa_for_full_attn_spans" in inspect.signature(HunyuanImage3Model.forward).parameters
 
 
 def test_hunyuan_image3_step_execution_merges_none_input_ids_after_first_step():
@@ -246,7 +297,7 @@ def test_hunyuan_image3_denoise_updates_model_kwargs_until_each_state_is_final(m
 
 def test_hunyuan_image3_restore_prompt_kv_cache_pads_variable_full_cache_lengths():
     pipeline = object.__new__(HunyuanImage3Pipeline)
-    cache_owner = SimpleNamespace(image_kv_cache_map=None)
+    cache_owner = SimpleNamespace(image_kv_cache_map=None, image_kv_cache_lens=torch.tensor([99, 99]))
     pipeline.model = SimpleNamespace(
         layers=[SimpleNamespace(layer_idx=0, self_attn=SimpleNamespace(image_attn=cache_owner))]
     )
@@ -257,7 +308,10 @@ def test_hunyuan_image3_restore_prompt_kv_cache_pads_variable_full_cache_lengths
     value_b = key_b + 10
     for state, key, value in zip(states, [key_a, key_b], [value_a, value_b]):
         state.step_index = 1
-        state.extra = {"prompt_kv_cache": {0: [(key, value)]}}
+        state.extra = {
+            "prompt_kv_cache": {0: [(key, value)]},
+            "prompt_kv_cache_lens": {0: [torch.tensor([key.shape[1]])]},
+        }
 
     pipeline._restore_prompt_kv_cache(states, cfg_factor=1)
 
@@ -268,6 +322,37 @@ def test_hunyuan_image3_restore_prompt_kv_cache_pads_variable_full_cache_lengths
     assert torch.allclose(merged_key[1, :2], key_b[0])
     assert torch.allclose(merged_key[1, 2], torch.zeros((1, 2)))
     assert torch.allclose(merged_value[1, 2], torch.zeros((1, 2)))
+    assert cache_owner.image_kv_cache_lens.tolist() == [3, 2]
+
+
+def test_hunyuan_image3_prompt_kv_cache_restore_uses_current_state_order_and_lens():
+    pipeline = object.__new__(HunyuanImage3Pipeline)
+    cache_owner = SimpleNamespace(
+        image_kv_cache_map=(torch.arange(12, dtype=torch.float32).reshape(2, 3, 1, 2), torch.ones((2, 3, 1, 2))),
+        image_kv_cache_lens=torch.tensor([3, 2]),
+    )
+    pipeline.model = SimpleNamespace(
+        layers=[SimpleNamespace(layer_idx=0, self_attn=SimpleNamespace(image_attn=cache_owner))]
+    )
+    state_a = _make_state()
+    state_b = _make_state()
+    for state in (state_a, state_b):
+        state.step_index = 0
+        state.extra = {}
+
+    pipeline._capture_prompt_kv_cache([state_a, state_b], cfg_factor=1)
+    cache_owner.image_kv_cache_map = (torch.full((1, 1, 1, 2), -1.0), torch.full((1, 1, 1, 2), -1.0))
+    cache_owner.image_kv_cache_lens = torch.tensor([99])
+    state_a.step_index = 1
+    state_b.step_index = 1
+
+    pipeline._restore_prompt_kv_cache([state_b, state_a], cfg_factor=1)
+
+    restored_key, restored_value = cache_owner.image_kv_cache_map
+    assert torch.equal(restored_key[0], torch.arange(6, 12, dtype=torch.float32).reshape(3, 1, 2))
+    assert torch.equal(restored_key[1], torch.arange(6, dtype=torch.float32).reshape(3, 1, 2))
+    assert torch.equal(restored_value, torch.ones((2, 3, 1, 2)))
+    assert cache_owner.image_kv_cache_lens.tolist() == [2, 3]
 
 
 def test_hunyuan_image3_step_scheduler_keeps_latents_float32():

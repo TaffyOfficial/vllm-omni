@@ -262,20 +262,24 @@ class Attention(nn.Module):
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
+        attn_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        requires_sdpa_for_full_attn_spans = bool(
+            attn_metadata is not None and attn_metadata.extra.get("requires_sdpa_for_full_attn_spans", False)
+        )
         if (
             self.attn_backend.get_name() == "FLASH_ATTN"
             and full_attn_spans is not None
-            and self._has_nonhomogeneous_full_attn_spans(full_attn_spans)
+            and (self._has_nonhomogeneous_full_attn_spans(full_attn_spans) or requires_sdpa_for_full_attn_spans)
         ):
-            if attn_metadata.attn_mask is None:
-                raise ValueError("Non-homogeneous full-attention spans require an explicit attention mask.")
+            if attn_mask is None:
+                raise ValueError("Full-attention spans that require SDPA need an explicit attention mask.")
             # HunyuanImage3 can co-batch prompts whose image-token spans differ after
             # right padding. PR vllm-project/vllm-omni#3857 also pins the DiT
             # precision-validation path to SDPA, so preserve the per-row 4D mask
-            # instead of forcing FlashAttention's homogeneous piecewise spans.
+            # whenever piecewise FlashAttention cannot represent it exactly.
             logger.warning_once(
-                "FlashAttention piecewise mixed causal/full masks require identical full-attention spans "
-                "across the batch. Falling back to SDPA for non-homogeneous spans."
+                "FlashAttention piecewise mixed causal/full masks cannot represent non-homogeneous spans "
+                "or row-specific padding. Falling back to SDPA."
             )
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 

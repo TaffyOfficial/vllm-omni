@@ -1111,11 +1111,19 @@ class ImageKVCacheManager:
         attention_mask = attention_mask.contiguous()
 
         full_attn_spans = kwargs.get("full_attn_spans", None)
+        requires_sdpa_for_full_attn_spans = kwargs.get("requires_sdpa_for_full_attn_spans", False)
+        if isinstance(requires_sdpa_for_full_attn_spans, torch.Tensor):
+            requires_sdpa_for_full_attn_spans = bool(torch.any(requires_sdpa_for_full_attn_spans).item())
+        elif isinstance(requires_sdpa_for_full_attn_spans, (list, tuple)):
+            requires_sdpa_for_full_attn_spans = any(bool(flag) for flag in requires_sdpa_for_full_attn_spans)
+        else:
+            requires_sdpa_for_full_attn_spans = bool(requires_sdpa_for_full_attn_spans)
 
         if self.sp_size <= 1:
             attn_metadata = AttentionMetadata(
                 attn_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
+                extra={"requires_sdpa_for_full_attn_spans": requires_sdpa_for_full_attn_spans},
             )
         else:
             attn_metadata = AttentionMetadata(
@@ -1125,6 +1133,7 @@ class ImageKVCacheManager:
                 joint_strategy="front",
                 attn_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
+                extra={"requires_sdpa_for_full_attn_spans": requires_sdpa_for_full_attn_spans},
             )
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
@@ -2322,6 +2331,7 @@ class HunyuanImage3Model(nn.Module):
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
+        requires_sdpa_for_full_attn_spans: torch.Tensor | list[bool] | bool | None = None,
     ) -> tuple | BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -2428,6 +2438,7 @@ class HunyuanImage3Model(nn.Module):
                 shard_padding_size=shard_padding_size,
                 uncond_cfg_prefill=uncond_cfg_prefill,
                 full_attn_spans=full_attn_spans,
+                requires_sdpa_for_full_attn_spans=requires_sdpa_for_full_attn_spans,
             )
 
             hidden_states = layer_outputs[0]
@@ -2663,6 +2674,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             "cond_vae_image_mask",
             "cond_vit_image_mask",
             "cond_timestep_scatter_index",
+            "requires_sdpa_for_full_attn_spans",
         ]
         for key in tensor_keys:
             if key in model_kwargs and model_kwargs[key] is not None:
@@ -2806,6 +2818,9 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             full_attn_spans=model_kwargs["full_attn_spans"][batch_slice]
             if model_kwargs.get("full_attn_spans")
             else None,
+            requires_sdpa_for_full_attn_spans=model_kwargs["requires_sdpa_for_full_attn_spans"][batch_slice]
+            if isinstance(model_kwargs.get("requires_sdpa_for_full_attn_spans"), torch.Tensor)
+            else model_kwargs.get("requires_sdpa_for_full_attn_spans"),
         )
 
     # ==========================================================
