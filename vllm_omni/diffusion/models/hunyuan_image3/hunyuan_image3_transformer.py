@@ -1023,7 +1023,7 @@ class ImageKVCacheManager:
         q_len: int,
         chunk_size: int,
     ) -> tuple[int, int]:
-        query_start = key_span[0] - max(seq_len - q_len, 0)
+        query_start = max(key_span[0] - max(seq_len - q_len, 0), 0)
         query_stop = query_start + chunk_size
         if query_start < 0 or query_stop > q_len:
             raise ValueError(
