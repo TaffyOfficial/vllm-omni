@@ -198,6 +198,10 @@ class ImageEditImageChunk(BaseModel):
     size: str = Field(..., description="The generated image size")
     created: int = Field(..., description="Unix timestamp of when the stream was created")
     model: str = Field(..., description="Model used for the image edit request")
+    metrics: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional AR timing and per-stage duration metrics for streaming image edits.",
+    )
 
 
 class ImageEditStreamError(BaseModel):

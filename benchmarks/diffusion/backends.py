@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import mimetypes
 import os
 import time
@@ -30,6 +31,7 @@ class RequestFuncInput:
     image_paths: list[str] | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     default_bot_task: str | None = DEFAULT_EDITS_BOT_TASK
+    stream_ar: bool = False
 
 
 @dataclass
@@ -42,6 +44,10 @@ class RequestFuncOutput:
     stage_durations: dict[str, float] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
     slo_achieved: bool | None = None
+    ttfc: float = 0.0
+    tpot: float = 0.0
+    ar_delta_count: int = 0
+    ar_num_generation_tokens: int = 0
 
 
 def _guess_mime_type(path: str) -> str:
@@ -56,21 +62,10 @@ def _encode_image_as_data_url(path: str) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
-async def async_request_image_edits(
-    input: RequestFuncInput,
-    session: aiohttp.ClientSession,
-    pbar: tqdm | None = None,
-    enable_diffusion_pipeline_profiler: bool = False,
-) -> RequestFuncOutput:
-    """POST /v1/images/edits (multipart)."""
-    del enable_diffusion_pipeline_profiler
-    output = RequestFuncOutput()
-    output.start_time = time.perf_counter()
-
+def _build_image_edits_form(input: RequestFuncInput) -> tuple[aiohttp.FormData, str]:
     extra_body = dict(input.extra_body)
     width = input.width or extra_body.get("width") or 1024
     height = input.height or extra_body.get("height") or 1024
-    edits_url = input.api_url
 
     form = aiohttp.FormData()
     form.add_field("model", input.model)
@@ -105,7 +100,90 @@ async def async_request_image_edits(
     if bot_task is not None:
         form.add_field("bot_task", str(bot_task))
 
+    return form, input.api_url
+
+
+async def _consume_image_edit_sse(
+    response: aiohttp.ClientResponse,
+    output: RequestFuncOutput,
+    start_time: float,
+) -> None:
+    """Parse image-edit SSE chunks and collect AR timing metrics."""
+    buffer = b""
+    got_image = False
+
+    async for chunk in response.content.iter_any():
+        buffer += chunk
+        while b"\n" in buffer:
+            line_bytes, buffer = buffer.split(b"\n", 1)
+            line = line_bytes.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data: "):
+                continue
+            data = line[len("data: ") :]
+            if data == "[DONE]":
+                continue
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("object") == "error":
+                err = payload.get("error") or {}
+                output.error = str(err.get("message", payload))
+                output.success = False
+                return
+
+            chunk_type = payload.get("type")
+            if chunk_type == "ar_delta":
+                output.ar_delta_count += 1
+                if output.ttfc <= 0.0:
+                    output.ttfc = time.perf_counter() - start_time
+                continue
+            if chunk_type != "image":
+                continue
+
+            got_image = True
+            output.response_body = payload
+            metrics_block = payload.get("metrics")
+            if isinstance(metrics_block, dict):
+                if metrics_block.get("ar_tpot_s") is not None:
+                    output.tpot = float(metrics_block["ar_tpot_s"])
+                if metrics_block.get("ar_num_generation_tokens") is not None:
+                    output.ar_num_generation_tokens = int(metrics_block["ar_num_generation_tokens"])
+                stage_durations = metrics_block.get("stage_durations")
+                if isinstance(stage_durations, dict):
+                    output.stage_durations = {str(k): float(v) for k, v in stage_durations.items() if v is not None}
+            top_level_stage_durations = payload.get("stage_durations")
+            if isinstance(top_level_stage_durations, dict) and not output.stage_durations:
+                output.stage_durations = {
+                    str(k): float(v) for k, v in top_level_stage_durations.items() if v is not None
+                }
+
+    if got_image and not output.error:
+        output.success = True
+    elif not output.error:
+        output.error = "Streaming image edit completed without final image chunk"
+        output.success = False
+
+
+async def async_request_image_edits(
+    input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+    enable_diffusion_pipeline_profiler: bool = False,
+) -> RequestFuncOutput:
+    """POST /v1/images/edits (multipart)."""
+    del enable_diffusion_pipeline_profiler
+    output = RequestFuncOutput()
+    output.start_time = time.perf_counter()
+    start_time = output.start_time
+
     assert input.image_paths is not None
+    form, edits_url = _build_image_edits_form(input)
+    if input.stream_ar:
+        form.add_field("stream", "true")
+
     for img_path in input.image_paths:
         if not os.path.exists(img_path):
             output.error = f"Image file not found: {img_path}"
@@ -124,13 +202,20 @@ async def async_request_image_edits(
 
     try:
         async with session.post(edits_url, data=form) as response:
-            if response.status == 200:
+            if response.status != 200:
+                output.error = f"HTTP {response.status}: {await response.text()}"
+                output.success = False
+            elif input.stream_ar:
+                content_type = response.headers.get("Content-Type", "")
+                if "text/event-stream" not in content_type:
+                    output.error = f"Expected text/event-stream for stream=true, got {content_type!r}"
+                    output.success = False
+                else:
+                    await _consume_image_edit_sse(response, output, start_time)
+            else:
                 resp_json = await response.json()
                 output.response_body = resp_json
                 output.success = True
-            else:
-                output.error = f"HTTP {response.status}: {await response.text()}"
-                output.success = False
     except Exception as e:
         output.error = str(e)
         output.success = False
