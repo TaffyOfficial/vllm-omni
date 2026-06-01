@@ -16,7 +16,7 @@ from transformers.generation.configuration_utils import GenerationConfig
 from transformers.generation.utils import ALL_CACHE_NAMES, GenerationMixin
 from transformers.utils.generic import ModelOutput
 from vllm.config.vllm import get_current_vllm_config
-from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, WeightsMapper
 from vllm.transformers_utils.config import get_config
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -710,8 +710,7 @@ class HunyuanImage3Pipeline(
             return cos, sin
         if cos.shape[0] != 1:
             raise ValueError(
-                "RoPE batch size mismatch: "
-                f"got {cos.shape[0]} RoPE rows for {target_batch_size} token rows."
+                f"RoPE batch size mismatch: got {cos.shape[0]} RoPE rows for {target_batch_size} token rows."
             )
         repeat_shape = [target_batch_size] + [1] * (cos.ndim - 1)
         return cos.repeat(*repeat_shape), sin.repeat(*repeat_shape)
@@ -1225,6 +1224,20 @@ class HunyuanImage3Pipeline(
 
         return {bucket_key: torch.cat(masks, dim=0) for bucket_key, masks in buckets.items()}
 
+    def _mixfusion_requires_attention_mask_buckets(self) -> bool:
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            return layer.self_attn.image_attn._mixfusion_requires_attention_mask()
+        raise ValueError("Cannot determine MixFusion attention backend from pipeline-parallel missing layers.")
+
+    @staticmethod
+    def _mixfusion_can_skip_attention_mask_values(model_kwargs: dict[str, Any]) -> bool:
+        return (
+            model_kwargs.get("mixfusion_sequence_plan") is not None
+            and model_kwargs.get("mixfusion_attention_masks") is None
+        )
+
     def prepare_inputs_for_generation(
         self,
         input_ids,
@@ -1326,15 +1339,20 @@ class HunyuanImage3Pipeline(
                 updated_model_kwargs["position_ids"] = torch.cat([timestep_position_ids, position_ids], dim=1)
 
                 # attention mask
-                mask_list = []
-                for attention_mask_i, position_ids_i in zip(
-                    model_kwargs["attention_mask"], updated_model_kwargs["position_ids"]
-                ):
-                    mask_list.append(
-                        torch.index_select(attention_mask_i, dim=1, index=position_ids_i.reshape(-1) - offset)
-                    )
-                attention_mask = torch.stack(mask_list, dim=0)
-                updated_model_kwargs["attention_mask"] = attention_mask
+                if self._mixfusion_can_skip_attention_mask_values(model_kwargs):
+                    updated_model_kwargs["attention_mask"] = model_kwargs["attention_mask"][
+                        :, :, : updated_model_kwargs["position_ids"].shape[1], :
+                    ]
+                else:
+                    mask_list = []
+                    for attention_mask_i, position_ids_i in zip(
+                        model_kwargs["attention_mask"], updated_model_kwargs["position_ids"]
+                    ):
+                        mask_list.append(
+                            torch.index_select(attention_mask_i, dim=1, index=position_ids_i.reshape(-1) - offset)
+                        )
+                    attention_mask = torch.stack(mask_list, dim=0)
+                    updated_model_kwargs["attention_mask"] = attention_mask
                 updated_model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"]
 
         else:
@@ -1656,6 +1674,14 @@ class HunyuanImage3Pipeline(
             repeated.extend([items[layout.index]] * layout.chunk_count)
         return repeated
 
+    @staticmethod
+    def _repeat_optional_by_mixfusion_layout(items, layouts):
+        if items is None:
+            return None
+        if isinstance(items, list):
+            return HunyuanImage3Pipeline._repeat_by_mixfusion_layout(items, layouts)
+        return [items] * sum(layout.chunk_count for layout in layouts)
+
     def _build_mixfusion_chunk_image_infos(
         self,
         plan: MixFusionSequencePlan,
@@ -1772,10 +1798,8 @@ class HunyuanImage3Pipeline(
         if len(batch_image_sizes) > 1 and len(set(token_shapes)) > 1:
             mixfusion_plan = build_mixfusion_sequence_plan(token_shapes)
             model_prompt = self._repeat_by_mixfusion_layout(prompt, mixfusion_plan.layouts)
-            if isinstance(cot_text, list):
-                model_cot_text = self._repeat_by_mixfusion_layout(cot_text, mixfusion_plan.layouts)
-            if isinstance(system_prompt, list):
-                model_system_prompt = self._repeat_by_mixfusion_layout(system_prompt, mixfusion_plan.layouts)
+            model_cot_text = self._repeat_optional_by_mixfusion_layout(cot_text, mixfusion_plan.layouts)
+            model_system_prompt = self._repeat_optional_by_mixfusion_layout(system_prompt, mixfusion_plan.layouts)
             if batch_cond_image_info is not None:
                 model_batch_cond_image_info = self._repeat_by_mixfusion_layout(
                     batch_cond_image_info, mixfusion_plan.layouts
