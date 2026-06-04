@@ -473,8 +473,15 @@ def test_build_multistage_generation_inputs_custom_system_prompt(serving_chat):
     )
 
 
-def test_build_multistage_generation_inputs_sets_ar_stop_token_ids_with_explicit_size(serving_chat):
-    """When height+width are provided with bot_task, the AR (llm) stage
+@pytest.mark.parametrize(
+    "extra_body",
+    [
+        pytest.param({"bot_task": "think"}, id="explicit-bot-task"),
+        pytest.param({}, id="omitted-bot-task"),
+    ],
+)
+def test_build_multistage_generation_inputs_sets_ar_stop_token_ids_with_explicit_size(serving_chat, extra_body):
+    """When height+width are provided, the AR (llm) stage
     receives the explicit image_size contract and stops on the cot terminator.
 
     Without this, AR would keep waiting for a ratio token even though the
@@ -508,15 +515,21 @@ def test_build_multistage_generation_inputs_sets_ar_stop_token_ids_with_explicit
     )
     images = [Image.new("RGB", (32, 32), color="red")]
 
-    _, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
+    engine_prompt, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
         serving_chat,
         engine=engine,
         prompt="draw a cat",
-        extra_body={"bot_task": "think"},
+        extra_body=extra_body,
         reference_images=images,
         gen_params=OmniDiffusionSamplingParams(height=768, width=1024),
         tokenizer=FakeTokenizer(),
     )
+
+    if "bot_task" in extra_body:
+        assert "prompt_token_ids" in engine_prompt
+    else:
+        assert "prompt_token_ids" not in engine_prompt
+        assert engine_prompt["prompt"] == "draw a cat"
 
     # AR stage (index 0) must have stop_token_ids set.
     ar_params = sampling_params_list[0]

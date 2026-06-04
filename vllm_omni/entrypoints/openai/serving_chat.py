@@ -2545,6 +2545,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         layers = extra_body.get("layers")
         resolution = extra_body.get("resolution")
         infer_align_image_size = self._extra_body_flag_enabled(extra_body, "infer_align_image_size")
+        bot_task_supplied = "bot_task" in extra_body
         bot_task = extra_body.get("bot_task")
         use_system_prompt = extra_body.get("use_system_prompt") or extra_body.get("sys_type")
         custom_system_prompt = extra_body.get("system_prompt")
@@ -2563,11 +2564,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         build_kwargs: dict[str, Any] = {}
         ar_stop_token_ids: list[int] | None = None
 
-        if bot_task is not None or use_system_prompt is not None or custom_system_prompt is not None:
+        should_build_hunyuan_prompt = (
+            bot_task is not None or use_system_prompt is not None or custom_system_prompt is not None
+        )
+        should_resolve_ar_stop_token_ids = should_build_hunyuan_prompt or (height is not None and width is not None)
+
+        if should_build_hunyuan_prompt:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
                 build_prompt,
                 build_prompt_tokens,
-                resolve_stop_token_ids,
             )
 
             ar_task = "it2i" if reference_images else "t2i"
@@ -2580,7 +2585,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             if bot_task is not None:
                 build_kwargs["bot_task"] = bot_task
-            elif "bot_task" in extra_body:
+            elif bot_task_supplied:
                 # Explicit None from the caller is plain-mode; omitted lets
                 # each task fall back to its default trigger.
                 build_kwargs["bot_task"] = extra_body["bot_task"]
@@ -2597,13 +2602,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 engine_prompt_data = {"image": reference_images[0]}
                 modalities = ["image"]
 
+        if should_resolve_ar_stop_token_ids:
+            from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import resolve_stop_token_ids
+
+            ar_task = "it2i" if reference_images else "t2i"
             ar_image_size = f"{width}x{height}" if height is not None and width is not None else None
-            ar_stop_token_ids = resolve_stop_token_ids(
-                task=ar_task,
-                bot_task=bot_task,
-                tokenizer=tokenizer,
-                image_size=ar_image_size,
-            )
+            stop_kwargs: dict[str, Any] = {
+                "task": ar_task,
+                "tokenizer": tokenizer,
+                "image_size": ar_image_size,
+            }
+            if bot_task_supplied:
+                stop_kwargs["bot_task"] = extra_body["bot_task"]
+            ar_stop_token_ids = resolve_stop_token_ids(**stop_kwargs)
 
         engine_prompt: OmniTextPrompt = {"prompt": prompt}
         if prompt_token_ids is not None:
