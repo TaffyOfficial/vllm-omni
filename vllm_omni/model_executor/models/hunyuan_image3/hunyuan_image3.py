@@ -94,6 +94,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.image_processing import (
     HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS,
     Resolution,
     ResolutionGroup,
+    flag_value_enabled,
     resize_and_crop,
 )
 from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import AutoencoderKLConv3D
@@ -709,21 +710,13 @@ class HunyuanImage3PixelInputs(TensorSchema):
     pixel_values: dict[str, torch.Tensor]
 
 
-def _flag_value_enabled(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
-    return bool(value)
-
-
 class HunyuanImage3Processor:
     """Image processor for Hunyuan Image 3.0 model."""
 
     def __init__(self, tokenizer, hf_config, **kwargs: object):
         self.tokenizer = tokenizer
         self.hf_config = hf_config
-        self.infer_align_image_size = _flag_value_enabled(kwargs.pop("infer_align_image_size", False))
+        self.infer_align_image_size = flag_value_enabled(kwargs.pop("infer_align_image_size", False))
         self.reso_group = ResolutionGroup(
             base_size=hf_config.image_base_size,
             extra_resolutions=[Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
@@ -1494,7 +1487,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         # Per-step cache of per-request SamplingParams.extra_args entries,
         # set by ``forward()`` and consumed by the sampler so it can read
-        # ``target_height`` / ``target_width`` (set by online/offline
+        # ``target_h`` / ``target_w`` (set by online/offline
         # entry points from user-supplied size). For generation mode we
         # flip ``has_sampling_extra_args`` so the runtime forwards the
         # list — see ``vllm_omni/worker/gpu_model_runner.py``.
@@ -1934,7 +1927,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
     ) -> torch.Tensor | IntermediateTensors:
         model_input_ids = None if inputs_embeds is not None else input_ids
         # Stash per-request extra_args so ``sample()`` can read
-        # ``target_height`` / ``target_width`` later in the same step.
+        # ``target_h`` / ``target_w`` later in the same step.
         # None when the runtime didn't forward sampling_extra_args (e.g.
         # comprehension mode).
         self._cur_sampling_extra_args = kwargs.get("sampling_extra_args")
@@ -2051,8 +2044,8 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         """Port of official _ConditionalSliceVocabLogitsProcessor.__call__.
 
         After the size token, only allow ratio tokens and pick greedily.
-        When ``SamplingParams.extra_args["target_height"]`` and
-        ``"target_width"`` are set (online/offline entry points stamp them
+        When ``SamplingParams.extra_args["target_h"]`` and
+        ``"target_w"`` are set (online/offline entry points stamp them
         from user-supplied size), resolve the matching bucket via the
         shared ``ResolutionGroup`` and force that
         ratio token so the AR's KV cache matches the DiT's user-requested
@@ -2083,12 +2076,16 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         if not extra_args_list or req_idx >= len(extra_args_list):
             return None
         ea = extra_args_list[req_idx] or {}
-        target_h = ea.get("target_height")
-        target_w = ea.get("target_width")
-        if target_h is None or target_w is None or target_h <= 0 or target_w <= 0 or self._reso_group is None:
+        target_h = ea.get("target_h")
+        target_w = ea.get("target_w")
+        if target_h is None or target_w is None or self._reso_group is None:
+            return None
+        target_h = int(target_h)
+        target_w = int(target_w)
+        if target_h <= 0 or target_w <= 0:
             return None
         # ResolutionGroup.get_base_size_and_ratio_index takes (width, height).
-        _, idx = self._reso_group.get_base_size_and_ratio_index(int(target_w), int(target_h))
+        _, idx = self._reso_group.get_base_size_and_ratio_index(target_w, target_h)
         if idx >= len(self._ratio_idx_to_token_id):
             return None
         return int(self._ratio_idx_to_token_id[idx])

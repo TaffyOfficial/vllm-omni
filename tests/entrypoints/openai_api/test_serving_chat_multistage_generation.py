@@ -447,8 +447,8 @@ def test_build_multistage_generation_inputs_custom_system_prompt(serving_chat):
 
 def test_build_multistage_generation_inputs_sets_ar_stop_token_ids_with_explicit_size(serving_chat):
     """When height+width are provided with bot_task, the AR (llm) stage
-    must receive stop_token_ids from resolve_stop_token_ids so AR stops
-    at the correct terminator instead of generating until max_tokens.
+    must still stop on ratio tokens so the sampler can force the requested
+    bucket instead of stopping before `<img_ratio_*>`.
 
     Without this, AR would generate past the cot boundary and produce
     garbage that the DiT bridge cannot parse.
@@ -480,8 +480,6 @@ def test_build_multistage_generation_inputs_sets_ar_stop_token_ids_with_explicit
     )
     images = [Image.new("RGB", (32, 32), color="red")]
 
-    # With height+width and bot_task=think, ar_image_size="1024x768" ->
-    # need_ratio=False -> stop_token_ids=[end_of_think, end_of_recaption]
     _, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
         serving_chat,
         engine=engine,
@@ -498,10 +496,36 @@ def test_build_multistage_generation_inputs_sets_ar_stop_token_ids_with_explicit
         "AR stage must have stop_token_ids set when height+width and bot_task are provided"
     )
     assert len(ar_params.stop_token_ids) > 0, "stop_token_ids must be non-empty"
+    assert ar_params.extra_args == {"target_h": 768, "target_w": 1024}
 
     # Diffusion stage (index 1) must NOT have stop_token_ids set.
     diff_params = sampling_params_list[1]
     assert getattr(diff_params, "stop_token_ids", None) is None, "Diffusion stage must not have stop_token_ids set"
+
+
+def test_build_multistage_generation_inputs_rejects_partial_size(serving_chat):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.0),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="height and width must both be specified"):
+        OmniOpenAIServingChat._build_multistage_generation_inputs(
+            serving_chat,
+            engine=engine,
+            prompt="draw a cat",
+            extra_body={},
+            reference_images=[],
+            gen_params=OmniDiffusionSamplingParams(height=768),
+        )
 
 
 def test_build_multistage_generation_inputs_no_stop_token_ids_without_size(serving_chat):

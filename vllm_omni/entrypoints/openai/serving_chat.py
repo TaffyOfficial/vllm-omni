@@ -420,6 +420,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     extra_body = request.model_extra or {}
 
                 height, width = self._resolve_height_width_from_extra_body(extra_body)
+                try:
+                    height, width = self._normalize_height_width_pair(height, width)
+                except ValueError as exc:
+                    return self.create_error_response(str(exc))
                 infer_align_image_size = self._extra_body_flag_enabled(extra_body, "infer_align_image_size")
 
                 num_inference_steps = extra_body.get("num_inference_steps")
@@ -557,10 +561,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # convert cumulative to Final Only to ensure the output is correct.
                 sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
 
-                # Match offline behavior: only explicit complete height/width
-                # pins the HunyuanImage-3.0 AR <img_ratio_*> token. Auto or
-                # input-derived sizes are DiT fallbacks and leave AR's greedy
-                # bucket selection unchanged.
+                # Match offline behavior: only an explicit complete size pins
+                # the HunyuanImage-3.0 AR <img_ratio_*> token. Auto or
+                # input-derived sizes leave AR's greedy bucket selection.
                 _force_ar_ratio = _image_gen_height is not None and _image_gen_width is not None
 
                 # Apply user-specified overrides to diffusion stage(s) for image generation
@@ -589,8 +592,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         # (e.g. the AR stage with vanilla vLLM SamplingParams).
                         if sp.extra_args is None:
                             sp.extra_args = {}
-                        sp.extra_args["target_height"] = _image_gen_height
-                        sp.extra_args["target_width"] = _image_gen_width
+                        sp.extra_args["target_h"] = _image_gen_height
+                        sp.extra_args["target_w"] = _image_gen_width
 
                 self._log_inputs(
                     request_id,
@@ -942,6 +945,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # budgeting (t2i vs i2i).
         extra_body = getattr(request, "extra_body", {}) or {}
         height, width = self._resolve_height_width_from_extra_body(extra_body)
+        height, width = self._normalize_height_width_pair(height, width)
 
         if height is not None and width is not None:
             # Keep target size in stage-0 sampling params so runner/model can
@@ -949,8 +953,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             extra_args = dict(getattr(params, "extra_args", {}) or {})
             extra_args["target_h"] = int(height)
             extra_args["target_w"] = int(width)
-            extra_args["target_height"] = int(height)
-            extra_args["target_width"] = int(width)
             params.extra_args = extra_args
 
         return params
@@ -2529,8 +2531,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         stage_configs = getattr(engine, "stage_configs", None) or []
         default_params_list = get_default_sampling_params_list(engine)
 
-        height = gen_params.height
-        width = gen_params.width
+        height, width = self._normalize_height_width_pair(gen_params.height, gen_params.width)
         seed = gen_params.seed
         generator_device = gen_params.generator_device
         num_outputs_per_prompt = gen_params.num_outputs_per_prompt
@@ -2595,17 +2596,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 engine_prompt_data = {"image": reference_images[0]}
                 modalities = ["image"]
 
-            ar_task = "it2i" if reference_images else "t2i"
-            # ar_image_size: None -> need_ratio=True (AR predicts ratio);
-            # explicit size -> need_ratio=False (AR stops at terminator).
-            ar_image_size: str | None = None
-            if height is not None and width is not None:
-                ar_image_size = f"{width}x{height}"
             ar_stop_token_ids = resolve_stop_token_ids(
-                task=ar_task,
+                task="it2i" if reference_images else "t2i",
                 bot_task=bot_task,
                 tokenizer=tokenizer,
-                image_size=ar_image_size,
             )
 
         engine_prompt: OmniTextPrompt = {"prompt": prompt}
@@ -2685,8 +2679,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     default_stage_params.extra_args = extra_args
                 extra_args["target_h"] = int(height)
                 extra_args["target_w"] = int(width)
-                extra_args["target_height"] = int(height)
-                extra_args["target_width"] = int(width)
 
             if stage_type == "diffusion":
                 self._set_if_supported(
@@ -3517,17 +3509,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return height, width
 
     @staticmethod
+    def _normalize_height_width_pair(height: Any, width: Any) -> tuple[int | None, int | None]:
+        if (height is None) != (width is None):
+            raise ValueError("height and width must both be specified or both omitted.")
+        if height is None:
+            return None, None
+        return int(height), int(width)
+
+    @staticmethod
     def _extra_body_flag_enabled(extra_body: dict[str, Any], key: str) -> bool:
         """Parse bool-like flags from raw OpenAI extra_body payloads."""
         return OmniOpenAIServingChat._flag_value_enabled(extra_body.get(key, False))
 
     @staticmethod
     def _flag_value_enabled(value: Any) -> bool:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
-        return bool(value)
+        from vllm_omni.diffusion.models.hunyuan_image3.image_processing import (
+            flag_value_enabled,
+        )
+
+        return flag_value_enabled(value)
 
     @staticmethod
     def _merge_extra_args_body(extra_args: dict[str, Any], extra_args_body: Any) -> None:

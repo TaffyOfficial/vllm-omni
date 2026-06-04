@@ -185,7 +185,7 @@ class TestRatioRestriction:
 
     def test_target_size_forces_matching_ratio_token(self):
         model = FakeSamplerModel(is_comprehension=False)
-        model._cur_sampling_extra_args = [{"target_height": 768, "target_width": 1280}]
+        model._cur_sampling_extra_args = [{"target_h": "768", "target_w": "1280"}]
         vocab_size = 300
         logits = torch.zeros(1, vocab_size)
         logits[0, RATIO_START + 1] = 15.0
@@ -196,27 +196,6 @@ class TestRatioRestriction:
 
         assert logits[0, RATIO_START + 4].item() == 0
         assert logits[0, RATIO_START + 1].item() == min_score
-
-
-class TestHunyuanImage3PackedRoutingCompat:
-    """Test AR custom routing hook compatibility across vLLM call signatures."""
-
-    def test_unpack_packed_topk_accepts_legacy_four_arg_call(self):
-        from vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 import (
-            _hunyuan_image3_unpack_packed_topk,
-        )
-
-        gating_output = torch.tensor([[0.25, 0.75, 1.0, 0.0]], dtype=torch.float32)
-
-        topk_weights, topk_indices = _hunyuan_image3_unpack_packed_topk(
-            torch.empty(1, 1),
-            gating_output,
-            2,
-            False,
-        )
-
-        assert torch.equal(topk_weights, torch.tensor([[0.25, 0.75]], dtype=torch.float32))
-        assert torch.equal(topk_indices, torch.tensor([[1, 0]], dtype=torch.int32))
 
 
 class TestForceEosAfterRatio:

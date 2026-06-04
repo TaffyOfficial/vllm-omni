@@ -47,6 +47,14 @@ HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS: tuple[str, ...] = (
 )
 
 
+def flag_value_enabled(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+    return bool(value)
+
+
 class ResolutionGroup:
     def __init__(self, base_size=None, step=None, align=1, extra_resolutions=None):
         self.align = align
@@ -149,6 +157,8 @@ def resize_and_crop(
         # `infer_align_image_size=True` follows HF's direct-resize path for
         # condition images. Output alignment is handled after DiT decoding.
         return image.resize((tw, th), resample=Image.Resampling.LANCZOS)
+    if crop_type != "center":
+        raise ValueError(f"Unsupported crop_type {crop_type!r}; expected 'center' or 'resize'.")
     w, h = image.size
     tr = th / tw
     r = h / w

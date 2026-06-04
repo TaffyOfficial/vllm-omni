@@ -46,7 +46,7 @@ from .hunyuan_image3_transformer import (
     build_batch_2d_rope,
     real_batched_index_select,
 )
-from .image_processing import resize_and_crop
+from .image_processing import flag_value_enabled, resize_and_crop
 from .system_prompt import get_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -57,15 +57,6 @@ BatchRaggedTensor = torch.Tensor | list[torch.Tensor]
 
 def default(val, d):
     return val if val is not None else d
-
-
-def _extra_arg_flag_enabled(extra_args: dict[str, Any], key: str) -> bool:
-    value = extra_args.get(key, False)
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
-    return bool(value)
 
 
 def to_device(data, device):
@@ -265,7 +256,7 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
 
     def pre_process_func(request: OmniDiffusionRequest):
         extra_args = getattr(getattr(request, "sampling_params", None), "extra_args", {}) or {}
-        infer_align_image_size = _extra_arg_flag_enabled(extra_args, "infer_align_image_size")
+        infer_align_image_size = flag_value_enabled(extra_args.get("infer_align_image_size", False))
         for i, prompt in enumerate(request.prompts):
             if isinstance(prompt, str):
                 prompt = OmniTextPrompt(prompt=prompt)
@@ -1449,7 +1440,7 @@ class HunyuanImage3Pipeline(
         generator = req.sampling_params.generator or generator
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
-        infer_align_image_size = _extra_arg_flag_enabled(extra_args, "infer_align_image_size")
+        infer_align_image_size = flag_value_enabled(extra_args.get("infer_align_image_size", False))
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale

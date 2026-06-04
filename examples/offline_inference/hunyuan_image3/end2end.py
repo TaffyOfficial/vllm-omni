@@ -256,6 +256,9 @@ def main():
 
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+    if (args.height is None) != (args.width is None):
+        raise ValueError("--height and --width must both be specified or both omitted.")
+
     ar_stop_token_ids = resolve_stop_token_ids(task=task, bot_task=bot_task, tokenizer=tokenizer)
     # Match the online endpoints: only an explicit complete size pins the AR
     # <img_ratio_*> token. If either dimension is omitted, AR keeps greedy
@@ -272,9 +275,8 @@ def main():
             if args.seed is not None:
                 sp.seed = args.seed
             if args.modality in ("text2img", "img2img"):
-                if user_h is not None:
+                if force_ratio_token_from_user_size:
                     sp.height = user_h
-                if user_w is not None:
                     sp.width = user_w
                 sp.extra_args["infer_align_image_size"] = args.infer_align_image_size
         elif hasattr(sp, "stop_token_ids"):
@@ -282,8 +284,8 @@ def main():
             sp.extra_args = sp.extra_args or {}
             sp.extra_args["infer_align_image_size"] = args.infer_align_image_size
             if force_ratio_token_from_user_size:
-                sp.extra_args["target_height"] = user_h
-                sp.extra_args["target_width"] = user_w
+                sp.extra_args["target_h"] = user_h
+                sp.extra_args["target_w"] = user_w
 
     print(f"\n{'=' * 60}")
     print("HunyuanImage-3.0 Generation Configuration:")
