@@ -576,10 +576,12 @@ def test_generate_diffusion_images_returns_structured_error_for_partial_size(ser
         pass
 
     engine = object.__new__(FakeAsyncOmni)
-    engine.stage_configs = [
-        SimpleNamespace(stage_type="llm", is_comprehension=True),
-        SimpleNamespace(stage_type="diffusion", is_comprehension=False),
-    ]
+    engine.engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+    )
     engine.default_sampling_params_list = [
         SamplingParams(temperature=0.0),
         OmniDiffusionSamplingParams(),
