@@ -443,7 +443,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     try:
                         img_bytes = base64.b64decode(reference_images[0])
                         img = Image.open(BytesIO(img_bytes))
-                        engine_prompt_image = {"image": img}
+                        engine_prompt_image = {"img2img": img}
                     except Exception:
                         engine_prompt_image = None
 
@@ -471,7 +471,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # detect image-generation requests and apply their own prompt
                 # rewrites (e.g. query-token expansion, placeholder injection).
                 mm_processor_kwargs["modalities"] = ["img2img"] if is_img2img else ["image"]
-                if infer_align_image_size:
+                if infer_align_image_size and is_img2img:
                     mm_processor_kwargs["infer_align_image_size"] = True
                 tprompt["mm_processor_kwargs"] = mm_processor_kwargs
                 if engine_prompt_image is not None:
@@ -2553,7 +2553,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         modalities = ["image"]
         if reference_images:
             if len(reference_images) == 1:
-                engine_prompt_data = {"image": reference_images[0]}
+                engine_prompt_data = {"img2img": reference_images[0]}
                 modalities = ["img2img"]
             else:
                 engine_prompt_data = {"image": reference_images}
@@ -2570,8 +2570,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 resolve_stop_token_ids,
             )
 
+            ar_task = "it2i" if reference_images else "t2i"
             build_kwargs: dict[str, Any] = {
-                "task": "it2i" if reference_images else "t2i",
+                "task": ar_task,
                 "sys_type": use_system_prompt,
                 "custom_system_prompt": custom_system_prompt,
                 "num_images": len(reference_images) if reference_images else 1,
@@ -2596,10 +2597,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 engine_prompt_data = {"image": reference_images[0]}
                 modalities = ["image"]
 
+            ar_image_size = f"{width}x{height}" if height is not None and width is not None else None
             ar_stop_token_ids = resolve_stop_token_ids(
-                task="it2i" if reference_images else "t2i",
+                task=ar_task,
                 bot_task=bot_task,
                 tokenizer=tokenizer,
+                image_size=ar_image_size,
             )
 
         engine_prompt: OmniTextPrompt = {"prompt": prompt}
@@ -2622,7 +2625,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             mm_processor_kwargs["target_w"] = width
         if seed is not None and engine_prompt_data is not None:
             mm_processor_kwargs["vae_generator_seed"] = int(seed)
-        if infer_align_image_size and engine_prompt_data is not None:
+        if infer_align_image_size and reference_images:
             mm_processor_kwargs["infer_align_image_size"] = True
         if mm_processor_kwargs:
             engine_prompt["mm_processor_kwargs"] = mm_processor_kwargs
@@ -2845,14 +2848,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         tokenizer = await get_tok()
                     except Exception as exc:
                         logger.warning("get_tokenizer failed; falling back to string prompt path: %s", exc)
-                engine_prompt, sampling_params_list = self._build_multistage_generation_inputs(
-                    engine=diffusion_engine,
-                    prompt=prompt,
-                    extra_body=extra_body,
-                    reference_images=pil_images,
-                    gen_params=gen_params,
-                    tokenizer=tokenizer,
-                )
+                try:
+                    engine_prompt, sampling_params_list = self._build_multistage_generation_inputs(
+                        engine=diffusion_engine,
+                        prompt=prompt,
+                        extra_body=extra_body,
+                        reference_images=pil_images,
+                        gen_params=gen_params,
+                        tokenizer=tokenizer,
+                    )
+                except ValueError as exc:
+                    return self._create_error_response(str(exc), status_code=400)
             else:
                 engine_prompt = gen_prompt
                 sampling_params_list = [gen_params]
@@ -3523,11 +3529,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
     @staticmethod
     def _flag_value_enabled(value: Any) -> bool:
-        from vllm_omni.diffusion.models.hunyuan_image3.image_processing import (
-            flag_value_enabled,
-        )
-
-        return flag_value_enabled(value)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+        return bool(value)
 
     @staticmethod
     def _merge_extra_args_body(extra_args: dict[str, Any], extra_args_body: Any) -> None:

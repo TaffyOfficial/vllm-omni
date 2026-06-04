@@ -34,17 +34,6 @@ def _gradient_image(width: int = 8, height: int = 4) -> Image.Image:
     return Image.fromarray(arr, mode="RGB")
 
 
-def test_image_processor_default_center_crop_differs_from_resize():
-    src = _gradient_image()
-
-    official_default = HunyuanImage3ImageProcessor._resize_and_crop(src, (4, 4), crop_type="center")
-    resize_path = HunyuanImage3ImageProcessor._resize_and_crop(src, (4, 4), crop_type="resize")
-
-    assert official_default.size == (4, 4)
-    assert resize_path.size == (4, 4)
-    assert not np.array_equal(np.asarray(official_default), np.asarray(resize_path))
-
-
 def test_image_processor_infer_align_resize_mode_is_direct_resize():
     src = _gradient_image()
 

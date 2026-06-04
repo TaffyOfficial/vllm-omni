@@ -259,11 +259,24 @@ def main():
     if (args.height is None) != (args.width is None):
         raise ValueError("--height and --width must both be specified or both omitted.")
 
-    ar_stop_token_ids = resolve_stop_token_ids(task=task, bot_task=bot_task, tokenizer=tokenizer)
+    user_h, user_w = args.height, args.width
+    user_specified_size = user_h is not None and user_w is not None
+    if args.modality in ("img2text", "text2text"):
+        ar_image_size = "auto"
+    elif user_specified_size:
+        ar_image_size = f"{user_w}x{user_h}"
+    else:
+        ar_image_size = None
+
+    ar_stop_token_ids = resolve_stop_token_ids(
+        task=task,
+        bot_task=bot_task,
+        tokenizer=tokenizer,
+        image_size=ar_image_size,
+    )
     # Match the online endpoints: only an explicit complete size pins the AR
     # <img_ratio_*> token. If either dimension is omitted, AR keeps greedy
     # bucket selection, while DiT falls back to its default/input-image size.
-    user_h, user_w = args.height, args.width
     force_ratio_token_from_user_size = (
         args.modality in ("text2img", "img2img") and user_h is not None and user_w is not None
     )

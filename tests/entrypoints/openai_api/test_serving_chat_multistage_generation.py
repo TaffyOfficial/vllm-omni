@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -126,11 +127,38 @@ def test_build_multistage_generation_inputs_parses_infer_align_flag(serving_chat
     )
 
     if expected_enabled:
-        assert engine_prompt["mm_processor_kwargs"]["infer_align_image_size"] is True
+        assert "infer_align_image_size" not in engine_prompt["mm_processor_kwargs"]
         assert sampling_params_list[1].extra_args["infer_align_image_size"] is True
     else:
         assert "infer_align_image_size" not in engine_prompt["mm_processor_kwargs"]
         assert "infer_align_image_size" not in sampling_params_list[1].extra_args
+
+
+def test_build_multistage_generation_inputs_forwards_infer_align_to_reference_image_processor(serving_chat):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.0),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+
+    engine_prompt, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="edit a robot",
+        extra_body={"infer_align_image_size": True},
+        reference_images=[Image.new("RGB", (32, 48), color="red")],
+        gen_params=OmniDiffusionSamplingParams(),
+    )
+
+    assert engine_prompt["mm_processor_kwargs"]["infer_align_image_size"] is True
+    assert sampling_params_list[1].extra_args["infer_align_image_size"] is True
 
 
 @pytest.mark.parametrize(
@@ -447,12 +475,12 @@ def test_build_multistage_generation_inputs_custom_system_prompt(serving_chat):
 
 def test_build_multistage_generation_inputs_sets_ar_stop_token_ids_with_explicit_size(serving_chat):
     """When height+width are provided with bot_task, the AR (llm) stage
-    must still stop on ratio tokens so the sampler can force the requested
-    bucket instead of stopping before `<img_ratio_*>`.
+    receives the explicit image_size contract and stops on the cot terminator.
 
-    Without this, AR would generate past the cot boundary and produce
-    garbage that the DiT bridge cannot parse.
+    Without this, AR would keep waiting for a ratio token even though the
+    requested bucket is already fixed by height+width.
     """
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
     class FakeTokenizer:
@@ -492,10 +520,10 @@ def test_build_multistage_generation_inputs_sets_ar_stop_token_ids_with_explicit
 
     # AR stage (index 0) must have stop_token_ids set.
     ar_params = sampling_params_list[0]
-    assert ar_params.stop_token_ids is not None, (
-        "AR stage must have stop_token_ids set when height+width and bot_task are provided"
-    )
-    assert len(ar_params.stop_token_ids) > 0, "stop_token_ids must be non-empty"
+    assert ar_params.stop_token_ids == [
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"],
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"],
+    ]
     assert ar_params.extra_args == {"target_h": 768, "target_w": 1024}
 
     # Diffusion stage (index 1) must NOT have stop_token_ids set.
@@ -526,6 +554,35 @@ def test_build_multistage_generation_inputs_rejects_partial_size(serving_chat):
             reference_images=[],
             gen_params=OmniDiffusionSamplingParams(height=768),
         )
+
+
+def test_generate_diffusion_images_returns_structured_error_for_partial_size(serving_chat):
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+    class FakeAsyncOmni(AsyncOmni):
+        pass
+
+    engine = object.__new__(FakeAsyncOmni)
+    engine.stage_configs = [
+        SimpleNamespace(stage_type="llm", is_comprehension=True),
+        SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+    ]
+    engine.default_sampling_params_list = [
+        SamplingParams(temperature=0.0),
+        OmniDiffusionSamplingParams(),
+    ]
+
+    serving_chat._prepare_diffusion_image_request = lambda **_: (
+        engine,
+        {"prompt": "draw a cat"},
+        OmniDiffusionSamplingParams(height=768),
+        [],
+    )
+
+    result = asyncio.run(serving_chat.generate_diffusion_images(prompt="draw a cat", extra_body={}))
+
+    assert result.error.code == 400
+    assert "height and width must both be specified" in result.error.message
 
 
 def test_build_multistage_generation_inputs_no_stop_token_ids_without_size(serving_chat):

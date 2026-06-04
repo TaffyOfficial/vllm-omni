@@ -1733,11 +1733,6 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             # Backward-compatible fallback for processors reading top-level fields.
             prompt["height"] = height
             prompt["width"] = width
-        # HunyuanImage3 uses this in both stages: AR condition-image
-        # preprocessing switches resize/crop, and DiT postprocess restores the
-        # input aspect ratio from extra_args.
-        if request.infer_align_image_size:
-            prompt.setdefault("mm_processor_kwargs", {})["infer_align_image_size"] = request.infer_align_image_size
         app_state_args = getattr(raw_request.app.state, "args", None)
         _check_max_generated_image_size(app_state_args, width, height)
 

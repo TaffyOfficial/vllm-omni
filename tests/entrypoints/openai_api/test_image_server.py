@@ -668,6 +668,112 @@ def test_multistage_images_async_omni_construction(async_omni_test_client):
     assert captured[1].guidance_scale == 6.5
 
 
+def test_chat_completion_img2img_reference_image_keeps_img2img_key():
+    """Chat-completions img2img keeps Bagel-style multimodal payload ownership."""
+    import asyncio
+
+    class CapturingEngine:
+        errored = False
+        dead_error = RuntimeError("engine dead")
+        output_modalities = ["image"]
+
+        async def get_tokenizer(self):
+            return object()
+
+        def generate(self, *, prompt, request_id, sampling_params_list, output_modalities):
+            self.captured_prompt = prompt
+            self.captured_sampling_params_list = sampling_params_list
+            self.captured_output_modalities = output_modalities
+
+            async def _gen():
+                yield MockGenerationResult([Image.new("RGB", (16, 16), color="green")])
+
+            return _gen()
+
+    class Renderer:
+        tokenizer = object()
+
+        def get_tokenizer(self):
+            return self.tokenizer
+
+    async def _check_model(request):
+        return None
+
+    async def _preprocess_chat(*args, **kwargs):
+        return [], [{"prompt": "unused"}]
+
+    async def _full_generator(*args, **kwargs):
+        return SimpleNamespace()
+
+    engine = CapturingEngine()
+    handler = object.__new__(OmniOpenAIServingChat)
+    handler._diffusion_mode = False
+    handler.engine_client = engine
+    handler.reasoning_parser_cls = None
+    handler.tool_parser = None
+    handler.use_harmony = False
+    handler.enable_auto_tools = False
+    handler.exclude_tools_when_tool_choice_none = False
+    handler.models = SimpleNamespace(model_name=lambda lora_request: "test-model")
+    handler.renderer = Renderer()
+    handler.default_chat_template_kwargs = {}
+    handler.chat_template = None
+    handler.chat_template_content_format = "auto"
+    handler.trust_request_chat_template = False
+    handler._check_model = _check_model
+    handler._maybe_get_adapters = lambda *args, **kwargs: None
+    handler._validate_chat_template = lambda *args, **kwargs: None
+    handler._prepare_extra_chat_template_kwargs = lambda kwargs, defaults: kwargs or {}
+    handler._preprocess_chat = _preprocess_chat
+    handler._build_sampling_params_list_from_request = lambda request: [
+        SamplingParams(),
+        OmniDiffusionSamplingParams(),
+    ]
+    handler._get_diffusion_extra_body_params = lambda: frozenset()
+    handler._get_supported_speakers = lambda: set()
+    handler._log_inputs = lambda *args, **kwargs: None
+    handler._base_request_id = lambda raw_request, request_id: request_id or "test"
+    handler.chat_completion_full_generator = _full_generator
+
+    img_b64 = base64.b64encode(make_test_image_bytes((16, 16))).decode()
+    request = SimpleNamespace(
+        request_id="req-1",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "edit this image"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+                    },
+                ],
+            }
+        ],
+        modalities=["image"],
+        extra_body={},
+        model_extra={},
+        stream=False,
+        tool_choice=None,
+        tools=None,
+        chat_template=None,
+        chat_template_kwargs={},
+        reasoning_effort=None,
+        add_generation_prompt=True,
+        continue_final_message=False,
+        add_special_tokens=False,
+    )
+
+    asyncio.run(handler._create_chat_completion(request))
+
+    captured_prompt = engine.captured_prompt
+    assert captured_prompt["modalities"] == ["img2img"]
+    assert captured_prompt["mm_processor_kwargs"]["modalities"] == ["img2img"]
+    assert "img2img" in captured_prompt["multi_modal_data"]
+    assert "image" not in captured_prompt["multi_modal_data"]
+    assert captured_prompt["multi_modal_uuids"]["img2img"] == ["chatcmpl-req-1-img2img-0"]
+
+
 def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
     """GLM-Image multistage: stage-0 gets target_h/w from requested size.
 
@@ -1231,7 +1337,7 @@ def test_parameters_passed_through(test_client, mock_async_diffusion):
     assert captured.seed == 42
 
 
-def test_image_generation_forwards_true_infer_align_image_size(test_client, mock_async_diffusion):
+def test_image_generation_forwards_true_infer_align_image_size_to_sampling_params(test_client, mock_async_diffusion):
     response = test_client.post(
         "/v1/images/generations",
         json={
@@ -1243,7 +1349,7 @@ def test_image_generation_forwards_true_infer_align_image_size(test_client, mock
 
     captured_prompt = mock_async_diffusion.captured_prompt
     captured_params = mock_async_diffusion.captured_sampling_params_list[0]
-    assert captured_prompt["mm_processor_kwargs"]["infer_align_image_size"] is True
+    assert "mm_processor_kwargs" not in captured_prompt
     assert captured_params.extra_args["infer_align_image_size"] is True
 
 
@@ -1494,9 +1600,9 @@ def test_image_edit_ignores_mock_like_multimodal_limit(async_omni_test_client):
     assert response.status_code == 200
     captured_prompt = engine.captured_prompt
     assert captured_prompt is not None
-    # Multi-stage path keeps the standard "image" key; "img2img" is carried
-    # by modalities/mm_processor_kwargs, not by the multimodal payload key.
-    processed_images = captured_prompt["multi_modal_data"]["image"]
+    # Generic multistage image-edit payloads keep the shared img2img key; the
+    # HunyuanImage3 AR-to-DiT bridge converts it to the DiT-owned image key.
+    processed_images = captured_prompt["multi_modal_data"]["img2img"]
     assert isinstance(processed_images, Image.Image)
     assert processed_images.size == (16, 16)
 
