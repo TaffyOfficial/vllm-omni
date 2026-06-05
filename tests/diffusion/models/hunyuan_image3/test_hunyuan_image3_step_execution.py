@@ -395,7 +395,7 @@ def test_denoise_step_uses_input_batch_group_order_and_splits_back(monkeypatch):
     pipeline.prepare_inputs_for_generation = fake_prepare_inputs_for_generation
     pipeline.forward_call = lambda **kwargs: {"diffusion_prediction": torch.tensor([[10.0], [20.0], [1.0], [2.0]])}
     pipeline._update_model_kwargs_for_generation = lambda model_output, model_kwargs: model_kwargs
-    pipeline.pipeline = SimpleNamespace(cfg_operator=lambda cond, uncond, scale, step: cond + uncond)
+    pipeline._pipeline = SimpleNamespace(cfg_operator=lambda cond, uncond, scale, step: cond + uncond)
 
     batch = InputBatch.make_batch(states)
     out = pipeline.denoise_step(batch)
