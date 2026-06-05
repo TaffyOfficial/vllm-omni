@@ -126,11 +126,11 @@ def test_build_multistage_generation_inputs_parses_infer_align_flag(serving_chat
         gen_params=OmniDiffusionSamplingParams(),
     )
 
-    if expected_enabled:
+    if "mm_processor_kwargs" in engine_prompt:
         assert "infer_align_image_size" not in engine_prompt["mm_processor_kwargs"]
+    if expected_enabled:
         assert sampling_params_list[1].extra_args["infer_align_image_size"] is True
     else:
-        assert "infer_align_image_size" not in engine_prompt["mm_processor_kwargs"]
         assert "infer_align_image_size" not in sampling_params_list[1].extra_args
 
 
