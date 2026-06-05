@@ -277,6 +277,29 @@ def test_piecewise_matches_causal_full_mask_with_padding_gap():
     torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
 
 
+def test_piecewise_rejects_masked_span_count_mismatch():
+    torch.manual_seed(0)
+    B, H, D, Sq, Sk = 2, 2, 16, 3, 5
+    key = torch.randn(B, Sk, H, D, device=DEVICE)
+    value = torch.randn(B, Sk, H, D, device=DEVICE)
+    query = torch.randn(B, Sq, H, D, device=DEVICE)
+    attn_mask = torch.stack(
+        [_piecewise_allowed_mask([], Sk - Sq, Sk, Sk) for _ in range(B)],
+        dim=0,
+    )
+
+    with pytest.raises(ValueError, match="Expected 2 full-attention span entries, got 1"):
+        piecewise_attn(
+            query,
+            key,
+            value,
+            full_attn_spans=[[]],
+            softmax_scale=1.0 / (D**0.5),
+            attn_func=_sdpa_attn_func,
+            attn_mask=attn_mask,
+        )
+
+
 def test_piecewise_rejects_pairwise_mask_hole():
     torch.manual_seed(0)
     B, H, D, Sq, Sk = 1, 2, 16, 4, 6

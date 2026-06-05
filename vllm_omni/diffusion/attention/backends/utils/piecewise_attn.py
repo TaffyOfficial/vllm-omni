@@ -193,6 +193,8 @@ def piecewise_attn(
         return _piecewise_attn_grouped(query, key, value, full_attn_spans, softmax_scale, attn_func)
 
     B, Sq, H, D = query.shape
+    if len(full_attn_spans) != B:
+        raise ValueError(f"Expected {B} full-attention span entries, got {len(full_attn_spans)}.")
     key_len = key.shape[1]
     original_query_offset = key_len - Sq
     mask = _normalize_attention_mask(attn_mask, B, Sq, key_len)

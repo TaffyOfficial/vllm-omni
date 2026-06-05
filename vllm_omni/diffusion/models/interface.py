@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     import torch
 
     from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 
@@ -48,8 +49,8 @@ class SupportsStepExecution(Protocol):
     def prepare_encode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionRequestState:
         """Prepare request-level inputs and return initialized state."""
 
-    def denoise_step(self, state: DiffusionRequestState, **kwargs: Any) -> torch.Tensor | None:
-        """Run one denoise step."""
+    def denoise_step(self, input_batch: InputBatch, **kwargs: Any) -> torch.Tensor | None:
+        """Run one denoise step for the grouped runner batch."""
 
     def step_scheduler(self, state: DiffusionRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
         """Run one scheduler step."""
