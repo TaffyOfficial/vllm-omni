@@ -71,6 +71,8 @@ class AttentionMetadata:
     # Well-known optional keys (convention, not required on all forwards):
     #   "kv_cache_dtype": str | None — quantized KV dtype (e.g. "fp8"); backends
     #     decide whether/how to apply.
+    #   "piecewise_mask_plan": list[dict] | None — Hunyuan row-level plan for
+    #     grouped mixed causal/full FlashAttention.
 
     # Piecewise attention metadata (mixed causal/full masks).
     # full_attn_spans: per-sample [start, end) spans in global coordinates using full attention.

@@ -13,6 +13,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
+    piecewise_attn_with_plan,
 )
 
 logger = init_logger(__name__)
@@ -159,6 +160,31 @@ class FlashAttentionImpl(AttentionImpl):
         # (b s) h d -> b s h d
         return out.reshape(batch_size, q_len, *out.shape[1:])
 
+    def _forward_sdpa_masked(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if attention_mask.ndim == 2:
+            attention_mask = attention_mask[:, None, None, :]
+        elif attention_mask.ndim == 3:
+            attention_mask = attention_mask[:, None, :, :]
+        elif attention_mask.ndim != 4:
+            raise ValueError(f"Unsupported SDPA fallback mask rank: {attention_mask.ndim}.")
+        query, key, value = (x.transpose(1, 2) for x in (query, key, value))
+        out = torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=self.softmax_scale,
+        )
+        return out.transpose(1, 2)
+
     def forward_cuda(
         self,
         query: torch.Tensor,
@@ -181,6 +207,9 @@ class FlashAttentionImpl(AttentionImpl):
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
+        piecewise_mask_plan = None
+        if attn_metadata is not None:
+            piecewise_mask_plan = attn_metadata.extra.get("piecewise_mask_plan")
 
         # Try piecewise attention
         if full_attn_spans is not None:
@@ -189,6 +218,23 @@ class FlashAttentionImpl(AttentionImpl):
                 FlashAttentionImpl._flash_wrapper,
                 attn_func=flash_attn_func,
             )
+            if piecewise_mask_plan is not None:
+                try:
+                    return piecewise_attn_with_plan(
+                        query,
+                        key,
+                        value,
+                        piecewise_mask_plan,
+                        self.softmax_scale,
+                        attn_func,
+                    )
+                except ValueError:
+                    logger.warning(
+                        "Falling back from piecewise mask plan to SDPA for masked mixed attention.",
+                        exc_info=True,
+                    )
+                    if attention_mask is not None:
+                        return self._forward_sdpa_masked(query, key, value, attention_mask)
 
             return piecewise_attn(
                 query,

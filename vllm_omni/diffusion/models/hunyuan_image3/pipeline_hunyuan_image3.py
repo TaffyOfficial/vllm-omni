@@ -149,6 +149,82 @@ def _to_python_scalar(value: Any) -> Any:
     return value
 
 
+def _make_piecewise_mask_plan(
+    full_attn_spans: list[list[tuple[int, int]]],
+    query_len: int,
+    key_len: int,
+    *,
+    mask_kind: str = "baseline",
+) -> list[dict[str, Any]]:
+    """Build row-owned piecewise FA metadata without inspecting dense masks."""
+    query_offset = key_len - query_len
+    plan: list[dict[str, Any]] = []
+    for spans in full_attn_spans:
+        normalized_spans = [(int(start), int(end)) for start, end in spans]
+        signature = (
+            mask_kind,
+            query_len,
+            key_len,
+            query_offset,
+            tuple(normalized_spans),
+        )
+        plan.append(
+            {
+                "mask_kind": mask_kind,
+                "query_range": (query_offset, query_offset + query_len),
+                "key_ranges": [(0, key_len)],
+                "compact_query_offset": query_offset,
+                "full_attn_spans": normalized_spans,
+                "signature": signature,
+            }
+        )
+    return plan
+
+
+def _shift_full_attn_spans(
+    spans: list[tuple[int, int]],
+    prefix_len: int | None,
+    max_prefix_len: int | None,
+) -> list[tuple[int, int]]:
+    if prefix_len is None or max_prefix_len is None:
+        return list(spans)
+    shift = max_prefix_len - prefix_len
+    if shift == 0:
+        return list(spans)
+    return [(start + shift, end + shift) if start >= prefix_len else (start, end) for start, end in spans]
+
+
+def _shift_piecewise_mask_plan(
+    plan: list[dict[str, Any]],
+    prefix_len: int | None,
+    max_prefix_len: int | None,
+) -> list[dict[str, Any]]:
+    if prefix_len is None or max_prefix_len is None:
+        return [dict(entry) for entry in plan]
+
+    shifted: list[dict[str, Any]] = []
+    for entry in plan:
+        query_start, query_end = entry["query_range"]
+        query_len = int(query_end) - int(query_start)
+        spans = _shift_full_attn_spans(
+            entry.get("full_attn_spans", []),
+            prefix_len,
+            max_prefix_len,
+        )
+        mask_kind = entry.get("mask_kind", "baseline")
+        if prefix_len != max_prefix_len:
+            mask_kind = "complex"
+        shifted.append(
+            _make_piecewise_mask_plan(
+                [spans],
+                query_len=query_len,
+                key_len=max_prefix_len + query_len,
+                mask_kind=mask_kind,
+            )[0]
+        )
+    return shifted
+
+
 def _image_info_to_payload(image_info: ImageInfo) -> dict[str, Any]:
     return {
         "image_type": image_info.image_type,
@@ -614,12 +690,7 @@ class HunyuanImage3Pipeline(
         prefix_len: int | None,
         max_prefix_len: int | None,
     ) -> list[tuple[int, int]]:
-        if prefix_len is None or max_prefix_len is None:
-            return list(spans)
-        shift = max_prefix_len - prefix_len
-        if shift == 0:
-            return list(spans)
-        return [(start + shift, end + shift) if start >= prefix_len else (start, end) for start, end in spans]
+        return _shift_full_attn_spans(spans, prefix_len, max_prefix_len)
 
     def _row_from_value(self, value: Any, branch: int, pad_value: int = 0) -> Any:
         if isinstance(value, torch.Tensor):
@@ -738,6 +809,16 @@ class HunyuanImage3Pipeline(
             if key == "full_attn_spans" and values[0] is not None:
                 merged[key] = [
                     self._shift_full_attn_spans(value[branch], prefix_len, max_prefix_len)
+                    for value, branch, prefix_len in zip(
+                        values,
+                        row_branches,
+                        prefix_lens or [None] * len(row_branches),
+                    )
+                ]
+                continue
+            if key == "piecewise_mask_plan" and values[0] is not None:
+                merged[key] = [
+                    _shift_piecewise_mask_plan([value[branch]], prefix_len, max_prefix_len)[0]
                     for value, branch, prefix_len in zip(
                         values,
                         row_branches,
@@ -1363,6 +1444,11 @@ class HunyuanImage3Pipeline(
                 full_attn_spans[i].sort(key=lambda x: x[0])
         attention_mask = attention_mask.unsqueeze(1)
         model_kwargs["full_attn_spans"] = full_attn_spans
+        model_kwargs["piecewise_mask_plan"] = _make_piecewise_mask_plan(
+            full_attn_spans,
+            query_len=seq_len,
+            key_len=seq_len,
+        )
         return attention_mask
 
     def prepare_inputs_for_generation(
@@ -1408,6 +1494,7 @@ class HunyuanImage3Pipeline(
                 "num_image_tokens": kwargs.get("num_image_tokens"),
                 "ar_kv_reuse_len": kwargs.get("ar_kv_reuse_len", 0),
                 "full_attn_spans": kwargs.get("full_attn_spans"),
+                "piecewise_mask_plan": kwargs.get("piecewise_mask_plan"),
             }
         )
         return model_inputs
@@ -1428,6 +1515,8 @@ class HunyuanImage3Pipeline(
         }
         if "full_attn_spans" in model_kwargs:
             updated_model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"]
+        if "piecewise_mask_plan" in model_kwargs:
+            updated_model_kwargs["piecewise_mask_plan"] = model_kwargs["piecewise_mask_plan"]
 
         # update past_key_values keeping its naming used in model code
         for possible_cache_name in ALL_CACHE_NAMES:
@@ -1485,6 +1574,12 @@ class HunyuanImage3Pipeline(
                 attention_mask = torch.stack(mask_list, dim=0)
                 updated_model_kwargs["attention_mask"] = attention_mask
                 updated_model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"]
+                if "full_attn_spans" in updated_model_kwargs:
+                    updated_model_kwargs["piecewise_mask_plan"] = _make_piecewise_mask_plan(
+                        updated_model_kwargs["full_attn_spans"],
+                        query_len=int(attention_mask.shape[-2]),
+                        key_len=int(attention_mask.shape[-1]),
+                    )
 
         else:
             if mode == "gen_text":
@@ -1575,6 +1670,7 @@ class HunyuanImage3Pipeline(
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
+        piecewise_mask_plan: list[dict[str, Any]] | None = None,
     ) -> tuple | CausalMMOutputWithPast:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # Sanity Check of Inputs
@@ -1680,6 +1776,7 @@ class HunyuanImage3Pipeline(
                 uncond_cfg_prefill=uncond_cfg_prefill,
                 ar_kv_reuse_len=ar_kv_reuse_len,
                 full_attn_spans=full_attn_spans,
+                piecewise_mask_plan=piecewise_mask_plan,
             )
         hidden_states = outputs[0]
 
@@ -1969,7 +2066,7 @@ class HunyuanImage3Pipeline(
             for key, value in merged_kwargs.items():
                 if key in {"query_lens", "seq_lens"}:
                     continue
-                if key == "full_attn_spans":
+                if key in {"full_attn_spans", "piecewise_mask_plan"}:
                     next_kwargs[key] = state.extra[_STEP_MODEL_KWARGS].get(key)
                 elif key == "attention_mask" and isinstance(value, torch.Tensor):
                     cache = state.extra.get(_STEP_PROMPT_KV)

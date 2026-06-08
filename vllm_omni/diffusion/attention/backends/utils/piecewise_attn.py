@@ -180,6 +180,87 @@ def _piecewise_attn_grouped(
     return out
 
 
+def _validate_plan_entry(entry: dict, query_len: int, key_len: int) -> tuple[tuple, int, list[tuple[int, int]]]:
+    mask_kind = entry.get("mask_kind")
+    if mask_kind not in {"baseline", "no_padding"}:
+        raise ValueError(f"Unsupported piecewise mask plan kind: {mask_kind!r}.")
+    query_start, query_end = entry["query_range"]
+    if int(query_end) - int(query_start) != query_len:
+        raise ValueError(
+            "piecewise mask plan query_range does not match the query tensor length: "
+            f"{entry['query_range']} vs {query_len}."
+        )
+    key_ranges = entry.get("key_ranges")
+    if key_ranges != [(0, key_len)]:
+        raise ValueError(f"Unsupported piecewise mask plan key_ranges: {key_ranges!r}.")
+    compact_query_offset = int(entry["compact_query_offset"])
+    if compact_query_offset != int(query_start):
+        raise ValueError("piecewise mask plan compact_query_offset must match query_range start.")
+    spans = [(int(start), int(end)) for start, end in entry.get("full_attn_spans", [])]
+    signature = (
+        mask_kind,
+        query_len,
+        key_len,
+        compact_query_offset,
+        tuple(spans),
+    )
+    if entry.get("signature") is not None and tuple(entry["signature"]) != signature:
+        raise ValueError("piecewise mask plan signature does not match its row metadata.")
+    return signature, compact_query_offset, spans
+
+
+def piecewise_attn_with_plan(
+    query,  # (B, Sq, H, D)
+    key,
+    value,
+    piecewise_mask_plan: list[dict],
+    softmax_scale: float,
+    attn_func,
+) -> torch.Tensor:
+    B, Sq, H, D = query.shape
+    if len(piecewise_mask_plan) != B:
+        raise ValueError(f"Expected {B} piecewise plan entries, got {len(piecewise_mask_plan)}.")
+
+    key_len = key.shape[1]
+    out = query.new_zeros(B, Sq, H, D)
+    grouped_rows: dict[tuple, tuple[int, list[tuple[int, int]], list[int]]] = {}
+    for row, entry in enumerate(piecewise_mask_plan):
+        signature, query_offset, spans = _validate_plan_entry(entry, Sq, key_len)
+        if signature not in grouped_rows:
+            grouped_rows[signature] = (query_offset, spans, [])
+        grouped_rows[signature][2].append(row)
+
+    for query_offset, spans, rows in grouped_rows.values():
+        if len(rows) == rows[-1] - rows[0] + 1:
+            row_slice = slice(rows[0], rows[-1] + 1)
+            query_rows = query[row_slice]
+            key_rows = key[row_slice]
+            value_rows = value[row_slice]
+            out_rows = out[row_slice].clone()
+        else:
+            query_rows = torch.cat([query[row : row + 1] for row in rows], dim=0)
+            key_rows = torch.cat([key[row : row + 1] for row in rows], dim=0)
+            value_rows = torch.cat([value[row : row + 1] for row in rows], dim=0)
+            out_rows = query_rows.new_zeros(len(rows), Sq, H, D)
+        for s, e, mode in build_segments(spans, query_offset, Sq):
+            q_s = s - query_offset
+            q_e = e - query_offset
+            out_seg = attn_func(
+                query_rows[:, q_s:q_e],
+                key_rows[:, :e],
+                value_rows[:, :e],
+                causal=(mode == "causal"),
+                softmax_scale=softmax_scale,
+            )
+            out_rows[:, q_s:q_e] = out_seg
+        if len(rows) == rows[-1] - rows[0] + 1:
+            out[rows[0] : rows[-1] + 1] = out_rows
+        else:
+            for compact_row, original_row in enumerate(rows):
+                out[original_row : original_row + 1] = out_rows[compact_row : compact_row + 1]
+    return out
+
+
 def piecewise_attn(
     query,  # (B, Sq, H, D)
     key,

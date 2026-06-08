@@ -1111,11 +1111,16 @@ class ImageKVCacheManager:
         attention_mask = attention_mask.contiguous()
 
         full_attn_spans = kwargs.get("full_attn_spans", None)
+        piecewise_mask_plan = kwargs.get("piecewise_mask_plan", None)
+        extra = {}
+        if piecewise_mask_plan is not None:
+            extra["piecewise_mask_plan"] = piecewise_mask_plan
 
         if self.sp_size <= 1:
             attn_metadata = AttentionMetadata(
                 attn_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
+                extra=extra,
             )
         else:
             attn_metadata = AttentionMetadata(
@@ -1125,6 +1130,7 @@ class ImageKVCacheManager:
                 joint_strategy="front",
                 attn_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
+                extra=extra,
             )
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
@@ -2322,6 +2328,7 @@ class HunyuanImage3Model(nn.Module):
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
+        piecewise_mask_plan: list[dict[str, Any]] | None = None,
     ) -> tuple | BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -2428,6 +2435,7 @@ class HunyuanImage3Model(nn.Module):
                 shard_padding_size=shard_padding_size,
                 uncond_cfg_prefill=uncond_cfg_prefill,
                 full_attn_spans=full_attn_spans,
+                piecewise_mask_plan=piecewise_mask_plan,
             )
 
             hidden_states = layer_outputs[0]
@@ -2671,6 +2679,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # List[List[...]] per-sample metadata indexed along the CFG batch dim
         if isinstance(model_kwargs.get("full_attn_spans"), list):
             model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"][s.start : s.stop]
+        if isinstance(model_kwargs.get("piecewise_mask_plan"), list):
+            model_kwargs["piecewise_mask_plan"] = model_kwargs["piecewise_mask_plan"][s.start : s.stop]
 
         # custom_pos_emb: tuple of (cos, sin)
         if "custom_pos_emb" in model_kwargs and model_kwargs["custom_pos_emb"] is not None:
@@ -2842,6 +2852,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         model_kwargs.pop("cond_timestep_scatter_index", None)
         model_kwargs.pop("cond_timestep", None)
         model_kwargs.pop("cond_vit_images", None)
+        model_kwargs.pop("piecewise_mask_plan", None)
 
         return input_ids
 

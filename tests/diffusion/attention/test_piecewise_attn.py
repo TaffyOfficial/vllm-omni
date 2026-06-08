@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
+    piecewise_attn_with_plan,
 )
 
 DEVICE = torch.device("cpu")
@@ -181,6 +182,88 @@ def test_piecewise_matches_full_with_heterogeneous_spans():
         dim=0,
     )
     torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_piecewise_plan_matches_grouped_reference_with_mixed_signatures():
+    torch.manual_seed(0)
+    B, H, D, Sk = 4, 2, 16, 64
+    q_start, q_end = 0, 64
+    Sq = q_end - q_start
+
+    key = torch.randn(B, Sk, H, D, device=DEVICE)
+    value = torch.randn(B, Sk, H, D, device=DEVICE)
+    query = torch.randn(B, Sq, H, D, device=DEVICE)
+    full_attn_spans = [
+        [],
+        [(0, 64)],
+        [],
+        [(0, 64)],
+    ]
+    plan = [
+        {
+            "mask_kind": "baseline",
+            "query_range": (q_start, q_end),
+            "key_ranges": [(0, Sk)],
+            "compact_query_offset": q_start,
+            "full_attn_spans": spans,
+            "signature": ("baseline", Sq, Sk, q_start, tuple(spans)),
+        }
+        for spans in full_attn_spans
+    ]
+    softmax_scale = 1.0 / (D**0.5)
+    calls = 0
+
+    def tracked_attn_func(q, k, v, causal, softmax_scale):
+        nonlocal calls
+        calls += 1
+        return _sdpa_attn_func(q, k, v, causal, softmax_scale)
+
+    got = piecewise_attn_with_plan(
+        query,
+        key,
+        value,
+        piecewise_mask_plan=plan,
+        softmax_scale=softmax_scale,
+        attn_func=tracked_attn_func,
+    )
+    expected = piecewise_attn(
+        query,
+        key,
+        value,
+        full_attn_spans=full_attn_spans,
+        softmax_scale=softmax_scale,
+        attn_func=_sdpa_attn_func,
+    )
+    assert calls == 2
+    torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_piecewise_plan_rejects_complex_mask_kind():
+    torch.manual_seed(0)
+    B, H, D, Sq, Sk = 1, 2, 16, 8, 8
+    key = torch.randn(B, Sk, H, D, device=DEVICE)
+    value = torch.randn(B, Sk, H, D, device=DEVICE)
+    query = torch.randn(B, Sq, H, D, device=DEVICE)
+    plan = [
+        {
+            "mask_kind": "complex",
+            "query_range": (0, Sq),
+            "key_ranges": [(0, Sk)],
+            "compact_query_offset": 0,
+            "full_attn_spans": [],
+            "signature": ("complex", Sq, Sk, 0, ()),
+        }
+    ]
+
+    with pytest.raises(ValueError, match="Unsupported piecewise mask plan kind"):
+        piecewise_attn_with_plan(
+            query,
+            key,
+            value,
+            piecewise_mask_plan=plan,
+            softmax_scale=1.0 / (D**0.5),
+            attn_func=_sdpa_attn_func,
+        )
 
 
 def test_piecewise_matches_full_with_padding_gaps():
