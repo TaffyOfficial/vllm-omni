@@ -680,7 +680,15 @@ def test_chat_completion_img2img_reference_image_keeps_img2img_key():
         async def get_tokenizer(self):
             return object()
 
-        def generate(self, *, prompt, request_id, sampling_params_list, output_modalities):
+        def generate(
+            self,
+            *,
+            prompt,
+            request_id,
+            sampling_params_list,
+            output_modalities,
+            **kwargs,
+        ):
             self.captured_prompt = prompt
             self.captured_sampling_params_list = sampling_params_list
             self.captured_output_modalities = output_modalities
