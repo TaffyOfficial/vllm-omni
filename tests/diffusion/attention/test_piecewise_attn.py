@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
     piecewise_attn_with_plan,
+    piecewise_attn_with_plan_and_mask_fallback,
 )
 
 DEVICE = torch.device("cpu")
@@ -263,6 +264,100 @@ def test_piecewise_plan_rejects_complex_mask_kind():
             piecewise_mask_plan=plan,
             softmax_scale=1.0 / (D**0.5),
             attn_func=_sdpa_attn_func,
+        )
+
+
+def test_piecewise_plan_mixed_complex_rows_use_masked_fa_fallback():
+    torch.manual_seed(0)
+    B, H, D, Sq, Sk = 2, 2, 16, 4, 6
+    key = torch.randn(B, Sk, H, D, device=DEVICE)
+    value = torch.randn(B, Sk, H, D, device=DEVICE)
+    query = torch.randn(B, Sq, H, D, device=DEVICE)
+    full_attn_spans = [[(2, 6)], [(2, 6)]]
+    softmax_scale = 1.0 / (D**0.5)
+    q_start = Sk - Sq
+    attn_mask = torch.stack(
+        [_piecewise_allowed_mask(spans, q_start, Sk, Sk) for spans in full_attn_spans],
+        dim=0,
+    )
+    attn_mask[1, :, 1] = False
+    plan = [
+        {
+            "mask_kind": "baseline",
+            "query_range": (q_start, Sk),
+            "key_ranges": [(0, Sk)],
+            "compact_query_offset": q_start,
+            "full_attn_spans": [(2, 6)],
+            "signature": ("baseline", Sq, Sk, q_start, ((2, 6),)),
+        },
+        {
+            "mask_kind": "complex",
+            "query_range": (q_start, Sk),
+            "key_ranges": [(0, Sk)],
+            "compact_query_offset": q_start,
+            "full_attn_spans": [(2, 6)],
+            "signature": ("complex", Sq, Sk, q_start, ((2, 6),)),
+        },
+    ]
+    fallback_rows = []
+
+    got = piecewise_attn_with_plan_and_mask_fallback(
+        query,
+        key,
+        value,
+        full_attn_spans=full_attn_spans,
+        piecewise_mask_plan=plan,
+        softmax_scale=softmax_scale,
+        attn_func=_sdpa_attn_func,
+        attn_mask=attn_mask,
+        fallback_callback=fallback_rows.append,
+    )
+    expected = piecewise_attn(
+        query,
+        key,
+        value,
+        full_attn_spans=full_attn_spans,
+        softmax_scale=softmax_scale,
+        attn_func=_sdpa_attn_func,
+        attn_mask=attn_mask,
+    )
+
+    assert fallback_rows == [[1]]
+    torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_piecewise_plan_masked_fa_fallback_rejects_arbitrary_pairwise_hole():
+    torch.manual_seed(0)
+    B, H, D, Sq, Sk = 1, 2, 16, 4, 6
+    key = torch.randn(B, Sk, H, D, device=DEVICE)
+    value = torch.randn(B, Sk, H, D, device=DEVICE)
+    query = torch.randn(B, Sq, H, D, device=DEVICE)
+    full_attn_spans = [[(2, 6)]]
+    softmax_scale = 1.0 / (D**0.5)
+    q_start = Sk - Sq
+    attn_mask = _piecewise_allowed_mask(full_attn_spans[0], q_start, Sk, Sk).unsqueeze(0)
+    attn_mask[0, 1, 2] = False
+    plan = [
+        {
+            "mask_kind": "complex",
+            "query_range": (q_start, Sk),
+            "key_ranges": [(0, Sk)],
+            "compact_query_offset": q_start,
+            "full_attn_spans": [(2, 6)],
+            "signature": ("complex", Sq, Sk, q_start, ((2, 6),)),
+        }
+    ]
+
+    with pytest.raises(ValueError, match="arbitrary query-key mask holes"):
+        piecewise_attn_with_plan_and_mask_fallback(
+            query,
+            key,
+            value,
+            full_attn_spans=full_attn_spans,
+            piecewise_mask_plan=plan,
+            softmax_scale=softmax_scale,
+            attn_func=_sdpa_attn_func,
+            attn_mask=attn_mask,
         )
 
 

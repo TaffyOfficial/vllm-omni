@@ -261,6 +261,101 @@ def piecewise_attn_with_plan(
     return out
 
 
+def _slice_rows(tensor: torch.Tensor, rows: list[int]) -> torch.Tensor:
+    if len(rows) == rows[-1] - rows[0] + 1:
+        return tensor[rows[0] : rows[-1] + 1]
+    return torch.cat([tensor[row : row + 1] for row in rows], dim=0)
+
+
+def _copy_rows(dst: torch.Tensor, rows: list[int], src: torch.Tensor) -> None:
+    if len(rows) == rows[-1] - rows[0] + 1:
+        dst[rows[0] : rows[-1] + 1] = src
+        return
+    for src_row, dst_row in enumerate(rows):
+        dst[dst_row : dst_row + 1] = src[src_row : src_row + 1]
+
+
+def piecewise_attn_with_plan_and_mask_fallback(
+    query,  # (B, Sq, H, D)
+    key,
+    value,
+    full_attn_spans: list[list[tuple[int, int]]],
+    piecewise_mask_plan: list[dict],
+    softmax_scale: float,
+    attn_func,
+    attn_mask: torch.Tensor | None,
+    fallback_callback=None,
+) -> torch.Tensor:
+    B, Sq, H, D = query.shape
+    key_len = key.shape[1]
+    if len(piecewise_mask_plan) != B:
+        if attn_mask is None:
+            raise ValueError(f"Expected {B} piecewise plan entries, got {len(piecewise_mask_plan)}.")
+        fallback_rows = list(range(B))
+        if fallback_callback is not None:
+            fallback_callback(fallback_rows)
+        return piecewise_attn(
+            query,
+            key,
+            value,
+            full_attn_spans,
+            softmax_scale,
+            attn_func,
+            attn_mask=attn_mask,
+        )
+
+    fast_rows: list[int] = []
+    fast_plan: list[dict] = []
+    fallback_rows: list[int] = []
+    for row, entry in enumerate(piecewise_mask_plan):
+        try:
+            _validate_plan_entry(entry, Sq, key_len)
+        except ValueError:
+            fallback_rows.append(row)
+        else:
+            fast_rows.append(row)
+            fast_plan.append(entry)
+
+    if not fallback_rows:
+        return piecewise_attn_with_plan(
+            query,
+            key,
+            value,
+            piecewise_mask_plan,
+            softmax_scale,
+            attn_func,
+        )
+
+    if attn_mask is None:
+        raise ValueError("Masked piecewise FlashAttention fallback requires an attention mask.")
+    if fallback_callback is not None:
+        fallback_callback(fallback_rows)
+
+    out = query.new_zeros(B, Sq, H, D)
+    if fast_rows:
+        fast_out = piecewise_attn_with_plan(
+            _slice_rows(query, fast_rows),
+            _slice_rows(key, fast_rows),
+            _slice_rows(value, fast_rows),
+            fast_plan,
+            softmax_scale,
+            attn_func,
+        )
+        _copy_rows(out, fast_rows, fast_out)
+
+    fallback_out = piecewise_attn(
+        _slice_rows(query, fallback_rows),
+        _slice_rows(key, fallback_rows),
+        _slice_rows(value, fallback_rows),
+        [full_attn_spans[row] for row in fallback_rows],
+        softmax_scale,
+        attn_func,
+        attn_mask=_slice_rows(attn_mask, fallback_rows),
+    )
+    _copy_rows(out, fallback_rows, fallback_out)
+    return out
+
+
 def piecewise_attn(
     query,  # (B, Sq, H, D)
     key,

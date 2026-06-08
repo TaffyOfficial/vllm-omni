@@ -13,7 +13,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
-    piecewise_attn_with_plan,
+    piecewise_attn_with_plan_and_mask_fallback,
 )
 
 logger = init_logger(__name__)
@@ -53,6 +53,7 @@ class FlashAttentionImpl(AttentionImpl):
     _supported_kv_cache_dtypes = {
         "npu": {"fp8"},
     }
+    _piecewise_plan_masked_fallback_warned = False
     _piecewise_plan_fallback_warned = False
 
     def __init__(
@@ -220,19 +221,38 @@ class FlashAttentionImpl(AttentionImpl):
                 attn_func=flash_attn_func,
             )
             if piecewise_mask_plan is not None:
+
+                def warn_masked_piecewise_fallback(rows):
+                    if not FlashAttentionImpl._piecewise_plan_masked_fallback_warned:
+                        logger.warning(
+                            "Falling back from grouped piecewise mask plan to masked "
+                            "piecewise FlashAttention for %d row(s).",
+                            len(rows),
+                        )
+                        FlashAttentionImpl._piecewise_plan_masked_fallback_warned = True
+                    else:
+                        logger.debug(
+                            "Repeated masked piecewise FlashAttention fallback for %d row(s).",
+                            len(rows),
+                        )
+
                 try:
-                    return piecewise_attn_with_plan(
+                    return piecewise_attn_with_plan_and_mask_fallback(
                         query,
                         key,
                         value,
+                        full_attn_spans,
                         piecewise_mask_plan,
                         self.softmax_scale,
                         attn_func,
+                        attention_mask,
+                        fallback_callback=warn_masked_piecewise_fallback,
                     )
                 except ValueError as exc:
                     if not FlashAttentionImpl._piecewise_plan_fallback_warned:
                         logger.warning(
-                            "Falling back from piecewise mask plan to SDPA for masked mixed attention.",
+                            "Emergency fallback from masked piecewise FlashAttention to SDPA "
+                            "for masked mixed attention.",
                             exc_info=True,
                         )
                         FlashAttentionImpl._piecewise_plan_fallback_warned = True
