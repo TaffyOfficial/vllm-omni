@@ -864,6 +864,41 @@ class HunYuanRotary2DEmbedder:
         return q, k
 
 
+def _align_piecewise_mask_plan_to_runtime_tensors(
+    piecewise_mask_plan: list[dict] | None,
+    query_len: int,
+    key_len: int,
+) -> list[dict] | None:
+    if piecewise_mask_plan is None:
+        return None
+
+    aligned_plan = []
+    for entry in piecewise_mask_plan:
+        mask_kind = entry.get("mask_kind")
+        if mask_kind not in {"baseline", "no_padding"}:
+            aligned_plan.append(entry)
+            continue
+
+        spans = [(int(start), int(end)) for start, end in entry.get("full_attn_spans", [])]
+        query_start = int(entry.get("compact_query_offset", entry["query_range"][0]))
+        query_range = (query_start, query_start + query_len)
+        signature = (
+            mask_kind,
+            query_len,
+            key_len,
+            query_start,
+            tuple(spans),
+        )
+        aligned_entry = dict(entry)
+        aligned_entry["query_range"] = query_range
+        aligned_entry["key_ranges"] = [(0, key_len)]
+        aligned_entry["compact_query_offset"] = query_start
+        aligned_entry["full_attn_spans"] = spans
+        aligned_entry["signature"] = signature
+        aligned_plan.append(aligned_entry)
+    return aligned_plan
+
+
 class ImageKVCacheManager:
     """
     Manages specialized caching and updating of KV-Cache for image tokens in multimodal models.
@@ -1111,7 +1146,11 @@ class ImageKVCacheManager:
         attention_mask = attention_mask.contiguous()
 
         full_attn_spans = kwargs.get("full_attn_spans", None)
-        piecewise_mask_plan = kwargs.get("piecewise_mask_plan", None)
+        piecewise_mask_plan = _align_piecewise_mask_plan_to_runtime_tensors(
+            kwargs.get("piecewise_mask_plan", None),
+            query.shape[1],
+            key.shape[1],
+        )
         extra = {}
         if piecewise_mask_plan is not None:
             extra["piecewise_mask_plan"] = piecewise_mask_plan

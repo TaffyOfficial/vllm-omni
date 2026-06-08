@@ -53,6 +53,7 @@ class FlashAttentionImpl(AttentionImpl):
     _supported_kv_cache_dtypes = {
         "npu": {"fp8"},
     }
+    _piecewise_plan_fallback_warned = False
 
     def __init__(
         self,
@@ -228,11 +229,15 @@ class FlashAttentionImpl(AttentionImpl):
                         self.softmax_scale,
                         attn_func,
                     )
-                except ValueError:
-                    logger.warning(
-                        "Falling back from piecewise mask plan to SDPA for masked mixed attention.",
-                        exc_info=True,
-                    )
+                except ValueError as exc:
+                    if not FlashAttentionImpl._piecewise_plan_fallback_warned:
+                        logger.warning(
+                            "Falling back from piecewise mask plan to SDPA for masked mixed attention.",
+                            exc_info=True,
+                        )
+                        FlashAttentionImpl._piecewise_plan_fallback_warned = True
+                    else:
+                        logger.debug("Repeated piecewise mask plan fallback: %s", exc)
                     if attention_mask is not None:
                         return self._forward_sdpa_masked(query, key, value, attention_mask)
 
