@@ -1576,6 +1576,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 ]
             )
             self._blocked_token_ids.update(self._all_ratio_ids)
+        self._blocked_token_ids_tensor: torch.Tensor | None = None
 
         # For generation mode, build stage transition map.
         # Official logic: </think> → [<recaption>],
@@ -1623,6 +1624,13 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         self._replace_rotary_embeddings()
         self._patch_moe_blocks()
+
+    def _get_blocked_token_ids_tensor(self, device: torch.device) -> torch.Tensor:
+        blocked = self._blocked_token_ids_tensor
+        if blocked is None or blocked.device != device:
+            blocked = torch.tensor(sorted(self._blocked_token_ids), device=device, dtype=torch.long)
+            self._blocked_token_ids_tensor = blocked
+        return blocked
 
     def _patch_moe_blocks(self):
         """Replace stock ``HunYuanSparseMoeBlock`` instances with
@@ -2027,27 +2035,29 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         min_score = torch.finfo(logits.dtype).min
 
+        if self._is_comprehension:
+            blocked_token_ids = self._get_blocked_token_ids_tensor(logits.device)
+            if blocked_token_ids.numel() > 0:
+                logits.index_fill_(1, blocked_token_ids, min_score)
+            return self._sampler(logits=logits, sampling_metadata=sampling_metadata)
+
         for req_idx in range(logits.shape[0]):
             decoded_tokens: list[int] = (
                 sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
             )
             last_token = decoded_tokens[-1] if decoded_tokens else -1
 
-            if self._is_comprehension:
-                for tid in self._blocked_token_ids:
-                    logits[req_idx, tid] = min_score
-            else:
-                forced = self._get_forced_token(decoded_tokens)
-                if forced is not None:
-                    logits[req_idx].fill_(min_score)
-                    logits[req_idx, forced] = 0
-                elif last_token == self._size_token_id:
-                    self._apply_ratio_restriction(logits, req_idx, min_score)
-                    # Already collapsed to a single allowed token below; no
-                    # further sampler logic needs to read extra_args.
-                elif last_token in self._all_ratio_ids:
-                    logits[req_idx].fill_(min_score)
-                    logits[req_idx, self._eos_token_id] = 0
+            forced = self._get_forced_token(decoded_tokens)
+            if forced is not None:
+                logits[req_idx].fill_(min_score)
+                logits[req_idx, forced] = 0
+            elif last_token == self._size_token_id:
+                self._apply_ratio_restriction(logits, req_idx, min_score)
+                # Already collapsed to a single allowed token below; no
+                # further sampler logic needs to read extra_args.
+            elif last_token in self._all_ratio_ids:
+                logits[req_idx].fill_(min_score)
+                logits[req_idx, self._eos_token_id] = 0
 
         return self._sampler(logits=logits, sampling_metadata=sampling_metadata)
 

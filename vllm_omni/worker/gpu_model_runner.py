@@ -1289,7 +1289,41 @@ class OmniGPUModelRunner(GPUModelRunner):
         # modal outputs after that to ensure the correct order
         ec_connector_output = None
 
-        if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
+        req_ids = self.input_batch.req_ids
+        num_scheduled_tokens_np = np.array(
+            [scheduler_output.num_scheduled_tokens[rid] for rid in req_ids],
+            dtype=np.int32,
+        )
+        self._omni_num_scheduled_tokens_np = num_scheduled_tokens_np
+
+        def can_use_decode_token_id_fast_path() -> bool:
+            if (
+                not self.supports_mm_inputs
+                or not is_first_rank
+                or is_encoder_decoder
+                or self.enable_prompt_embeds
+                or getattr(self.model, "has_preprocess", False)
+                or scheduler_output.scheduled_encoder_inputs
+            ):
+                return False
+            if len(req_ids) == 0 or num_scheduled_tokens != len(req_ids):
+                return False
+            if not np.all(num_scheduled_tokens_np == 1):
+                return False
+            num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu
+            for req_index, req_id in enumerate(req_ids):
+                req_state = self.requests.get(req_id)
+                prompt_token_ids = getattr(req_state, "prompt_token_ids", None)
+                prompt_len = len(prompt_token_ids or ())
+                if int(num_computed_tokens_cpu[req_index]) < prompt_len:
+                    return False
+            return True
+
+        if can_use_decode_token_id_fast_path():
+            input_ids = self.input_ids.gpu[:num_input_tokens]
+            inputs_embeds = None
+            model_kwargs = self._init_model_kwargs()
+        elif self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
             # Run the multimodal encoder if any.
             with self.maybe_get_ec_connector_output(
                 scheduler_output,
@@ -1377,13 +1411,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             # ever have a single encoder input.
             encoder_outputs = self._execute_mm_encoder(scheduler_output)
             model_kwargs.update({"encoder_outputs": encoder_outputs})
-
-        req_ids = self.input_batch.req_ids
-        num_scheduled_tokens_np = np.array(
-            [scheduler_output.num_scheduled_tokens[rid] for rid in req_ids],
-            dtype=np.int32,
-        )
-        self._omni_num_scheduled_tokens_np = num_scheduled_tokens_np
 
         # Note: only prefill need collect additional_information for now.
         # Decode don't need per_req_additional_information anymore.
