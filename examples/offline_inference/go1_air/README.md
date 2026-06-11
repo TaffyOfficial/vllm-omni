@@ -17,10 +17,18 @@ bash run.sh
 
 The smoke succeeds when it prints `[smoke] OK action shape=(1, 30, 16)`.
 
+Repository tests use the CPU-friendly tiny mode:
+
+```bash
+python examples/offline_inference/go1_air/smoke.py --tiny-config --device cpu --dtype float32
+pytest -q tests/examples/offline_inference/test_go1_air.py
+```
+
 ## Input schema
 
 `Go1AirPipeline` expects pre-built tensors in
-`sampling_params.extra_args["batch_inputs"]`:
+`sampling_params.extra_args["batch_inputs"]`, or an OpenPI robot observation in
+`sampling_params.extra_args["robot_obs"]`:
 
 * `observation.state`: `torch.Tensor[B, 16]`
 * `observation.task`: one string for `B=1`, or a string list/tuple of length `B`
@@ -30,6 +38,13 @@ The smoke succeeds when it prints `[smoke] OK action shape=(1, 30, 16)`.
 
 `extra_args["noise"]` is optional for deterministic debugging and must match
 `[B, 30, 16]`.
+
+For online robot serving, use `vllm_omni/deploy/go1_air.yaml`; it declares the
+OpenPI policy-server metadata consumed by `/v1/realtime/robot/openpi`. The
+pipeline converts OpenPI-style observation keys such as
+`observation/joint_position` and `observation/exterior_image_0_left` into the
+same `batch_inputs` schema and returns actions through
+`multimodal_output["actions"]`.
 
 ## Upstream license note
 

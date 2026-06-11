@@ -34,6 +34,7 @@ if str(_REPO_ROOT) not in sys.path:
 from vllm_omni.diffusion.data import OmniDiffusionConfig  # noqa: E402
 from vllm_omni.diffusion.models.go1_air import (  # noqa: E402
     Go1AirPipeline,
+    get_go1_air_actions,
 )
 from vllm_omni.diffusion.models.go1_air.config import (  # noqa: E402
     OBS_IMAGES,
@@ -59,7 +60,63 @@ def parse_args() -> argparse.Namespace:
         "--dtype",
         default="bfloat16" if torch.cuda.is_available() else "float32",
     )
+    parser.add_argument(
+        "--tiny-config",
+        action="store_true",
+        help="Use a tiny CPU-friendly config for repository tests.",
+    )
     return parser.parse_args()
+
+
+def tiny_model_config() -> dict:
+    return {
+        "action_chunk_size": 2,
+        "force_image_size": 28,
+        "downsample_ratio": 0.5,
+        "img_context_token_id": 3,
+        "pad_token_id": 0,
+        "vision_config": {
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "patch_size": 14,
+            "image_size": 28,
+            "qkv_bias": True,
+        },
+        "llm_config": {
+            "vocab_size": 16,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "max_position_embeddings": 64,
+            "pad_token_id": 0,
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+        },
+        "action_config": {
+            "hidden_size": 8,
+            "input_hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "max_position_embeddings": 64,
+            "action_dim": 4,
+            "state_dim": 4,
+            "state_token_num": 1,
+            "pad_token_id": 0,
+        },
+        "noise_scheduler_config": {
+            "num_inference_timesteps": 1,
+            "num_train_timesteps": 10,
+            "beta_schedule": "squaredcos_cap_v2",
+            "prediction_type": "sample",
+        },
+    }
 
 
 def build_fake_batch(*, image_size: int, state_dim: int, device: str, dtype: torch.dtype):
@@ -82,6 +139,7 @@ def main() -> int:
         model_class_name="Go1AirPipeline",
         model=args.model_dir or "",
         dtype=args.dtype,
+        model_config=tiny_model_config() if args.tiny_config else {},
         custom_pipeline_args={
             "device": args.device,
             "dtype": args.dtype,
@@ -105,6 +163,7 @@ def main() -> int:
     req = OmniDiffusionRequest(
         prompts=[""],
         sampling_params=sampling_params,
+        request_id="go1-air-smoke",
     )
 
     output = pipeline.forward(req)
@@ -112,7 +171,7 @@ def main() -> int:
         print(f"[smoke] FAIL: {output.error}")
         return 1
 
-    actions = output.output
+    actions = get_go1_air_actions(output)
     assert isinstance(actions, torch.Tensor), f"expected tensor, got {type(actions)}"
     expected = (1, cfg.chunk_size, cfg.max_action_dim)
     assert tuple(actions.shape) == expected, f"shape {tuple(actions.shape)} != {expected}"

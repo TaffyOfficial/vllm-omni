@@ -23,10 +23,17 @@ bash examples/offline_inference/go1_air/run.sh
 
 The smoke test prints `[smoke] OK action shape=(1, 30, 16)` on success.
 
+The repository-level offline smoke test is:
+
+```bash
+pytest -q tests/examples/offline_inference/test_go1_air.py
+```
+
 ## Input contract
 
 GO-1-Air consumes repository-side tensors through
-`sampling_params.extra_args["batch_inputs"]`:
+`sampling_params.extra_args["batch_inputs"]`, or OpenPI robot observations
+through `sampling_params.extra_args["robot_obs"]`:
 
 | Key | Shape / type | Notes |
 | --- | --- | --- |
@@ -38,6 +45,23 @@ GO-1-Air consumes repository-side tensors through
 
 `extra_args["noise"]` may be provided for deterministic debugging and must
 match `[B, 30, 16]`.
+
+## OpenPI robot serving
+
+GO-1-Air can be exposed through the OpenPI-compatible robot endpoint added by
+the realtime serving layer:
+
+```bash
+vllm serve /path/to/GO-1-Air \
+  --omni \
+  --deploy-config vllm_omni/deploy/go1_air.yaml
+```
+
+The endpoint is `/v1/realtime/robot/openpi`. The deploy file provides the
+policy-server metadata, and the pipeline converts OpenPI observation keys such
+as `observation/joint_position`, `observation/gripper_position`, and
+`observation/exterior_image_0_left` into the same tensor schema used by offline
+inference. Actions are returned through `multimodal_output["actions"]`.
 
 ## Notes
 

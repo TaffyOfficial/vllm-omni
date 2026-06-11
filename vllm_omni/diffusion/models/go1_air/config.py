@@ -22,6 +22,17 @@ DEFAULT_INTERNVL_PROCESSOR = os.getenv(
     "OpenGVLab/InternVL3-2B-hf",
 )
 
+DEFAULT_GO1_AIR_POLICY_SERVER_CONFIG = {
+    "image_resolution": [448, 448],
+    "n_external_cameras": 1,
+    "needs_wrist_camera": False,
+    "needs_stereo_camera": False,
+    "needs_session_id": True,
+    "action_space": "joint_position",
+    "action_horizon": 30,
+    "action_dim": 16,
+}
+
 
 @dataclass
 class Go1AirConfig:
@@ -122,6 +133,9 @@ class Go1AirConfig:
     # Full upstream config.json kept verbatim for fields we don't flatten.
     raw_config: dict[str, Any] = field(default_factory=dict)
 
+    # Metadata consumed by the OpenPI-compatible robot serving endpoint.
+    policy_server_config: dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_GO1_AIR_POLICY_SERVER_CONFIG))
+
     @classmethod
     def from_pretrained(cls, checkpoint_dir: str | Path) -> Go1AirConfig:
         checkpoint_dir = Path(checkpoint_dir)
@@ -160,6 +174,8 @@ class Go1AirConfig:
             flat["latent_planning"] = bool(raw["latent_planning"])
         if "pad_token_id" in raw:
             flat["llm_pad_token_id"] = int(raw["pad_token_id"])
+        if "policy_server_config" in raw:
+            flat["policy_server_config"] = dict(raw["policy_server_config"])
 
         # Nested vision_config.
         vision_cfg = raw.get("vision_config") or {}
