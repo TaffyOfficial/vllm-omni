@@ -2128,11 +2128,16 @@ class HunyuanImage3Pipeline(
         else:
             self._restore_prompt_kv_cache(states, row_state_indexes, row_branches)
 
+        forward_model_kwargs = model_kwargs
+        if len(states) == 1 and "piecewise_mask_plan" in model_kwargs:
+            forward_model_kwargs = dict(model_kwargs)
+            forward_model_kwargs.pop("piecewise_mask_plan", None)
+
         model_inputs = self.prepare_inputs_for_generation(
             input_ids,
             images=latent_model_input,
             timestep=timestep,
-            **model_kwargs,
+            **forward_model_kwargs,
         )
 
         step_indexes = {state.step_index for state in states}
