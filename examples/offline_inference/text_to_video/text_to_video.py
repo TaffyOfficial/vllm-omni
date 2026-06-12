@@ -10,39 +10,15 @@ from typing import Any
 import numpy as np
 import torch
 
+from examples.offline_inference.video_model_defaults import (
+    default_text_to_video_class_name,
+    detect_text_to_video_preset,
+)
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
-
-_MODEL_PRESETS = {
-    "wan": {
-        "height": 720,
-        "width": 1280,
-        "num_frames": 81,
-        "num_inference_steps": 40,
-        "guidance_scale": 4.0,
-        "fps": 24,
-        "output": "wan22_output.mp4",
-    },
-    "hunyuan": {
-        "height": 480,
-        "width": 832,
-        "num_frames": 121,
-        "num_inference_steps": 50,
-        "guidance_scale": 6.0,
-        "fps": 24,
-        "output": "hunyuan_video_15_output.mp4",
-    },
-}
-
-
-def _detect_preset(model: str) -> dict:
-    model_lower = model.lower()
-    if "hunyuan" in model_lower:
-        return _MODEL_PRESETS["hunyuan"]
-    return _MODEL_PRESETS["wan"]
 
 
 def parse_profiler_config(value: str) -> dict[str, Any]:
@@ -53,6 +29,22 @@ def parse_profiler_config(value: str) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
     return config
+
+
+def build_text_to_video_sampling_kwargs(args: argparse.Namespace, generator: torch.Generator) -> dict[str, Any]:
+    sampling_kwargs = dict(
+        height=args.height,
+        width=args.width,
+        generator=generator,
+        guidance_scale=args.guidance_scale,
+        num_inference_steps=args.num_inference_steps,
+        num_frames=args.num_frames,
+        fps=args.fps,
+        frame_rate=args.frame_rate,
+    )
+    if args.guidance_scale_high is not None:
+        sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
+    return sampling_kwargs
 
 
 def parse_args() -> argparse.Namespace:
@@ -260,10 +252,10 @@ def _extract_peak_memory_mb(result: Any) -> float:
 
 def main():
     args = parse_args()
-    model_class_name = args.model_class_name
+    model_class_name = default_text_to_video_class_name(args.model, args.model_class_name)
 
-    preset = _detect_preset(args.model)
-    for key, default_val in preset.items():
+    preset = detect_text_to_video_preset(args.model, model_class_name)
+    for key, default_val in preset.__dict__.items():
         if getattr(args, key.replace("-", "_"), None) is None:
             setattr(args, key.replace("-", "_"), default_val)
 
@@ -347,16 +339,7 @@ def main():
     if args.negative_prompt:
         prompt_dict["negative_prompt"] = args.negative_prompt
 
-    sampling_kwargs = dict(
-        height=args.height,
-        width=args.width,
-        generator=generator,
-        guidance_scale=args.guidance_scale,
-        num_inference_steps=args.num_inference_steps,
-        num_frames=args.num_frames,
-    )
-    if args.guidance_scale_high is not None:
-        sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
+    sampling_kwargs = build_text_to_video_sampling_kwargs(args, generator)
 
     generation_start = time.perf_counter()
     frames = omni.generate(
@@ -374,6 +357,7 @@ def main():
         print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB)")
 
     audio = None
+    audio_sample_rate = args.audio_sample_rate
     if isinstance(frames, list):
         frames = frames[0] if frames else None
 
@@ -384,11 +368,13 @@ def main():
             )
         if frames.multimodal_output and "audio" in frames.multimodal_output:
             audio = frames.multimodal_output["audio"]
+            audio_sample_rate = frames.multimodal_output.get("audio_sample_rate", audio_sample_rate)
         if frames.is_pipeline_output and frames.request_output is not None:
             inner_output = frames.request_output
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]
+                    audio_sample_rate = inner_output.multimodal_output.get("audio_sample_rate", audio_sample_rate)
                 frames = inner_output
         if isinstance(frames, OmniRequestOutput):
             if frames.images:
@@ -396,6 +382,7 @@ def main():
                     frames, audio = frames.images[0]
                 elif len(frames.images) == 1 and isinstance(frames.images[0], dict):
                     audio = frames.images[0].get("audio")
+                    audio_sample_rate = frames.images[0].get("audio_sample_rate", audio_sample_rate)
                     frames = frames.images[0].get("frames") or frames.images[0].get("video")
                 else:
                     frames = frames.images
@@ -408,6 +395,7 @@ def main():
             frames, audio = first_item
         elif isinstance(first_item, dict):
             audio = first_item.get("audio")
+            audio_sample_rate = first_item.get("audio_sample_rate", audio_sample_rate)
             frames = first_item.get("frames") or first_item.get("video")
         elif isinstance(first_item, list):
             frames = first_item
@@ -416,6 +404,7 @@ def main():
         frames, audio = frames
     elif isinstance(frames, dict):
         audio = frames.get("audio")
+        audio_sample_rate = frames.get("audio_sample_rate", audio_sample_rate)
         frames = frames.get("frames") or frames.get("video")
 
     if frames is None:
@@ -530,7 +519,7 @@ def main():
             frames_u8,
             audio_np,
             fps=float(args.fps),
-            audio_sample_rate=args.audio_sample_rate,
+            audio_sample_rate=audio_sample_rate,
         )
         with open(str(output_path), "wb") as f:
             f.write(video_bytes)

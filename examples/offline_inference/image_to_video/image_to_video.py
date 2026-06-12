@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Image-to-Video generation example using Wan2.2 I2V/TI2V models, LTX2, or HunyuanVideo-1.5.
+Image-to-Video generation example using Wan2.2 I2V/TI2V models, LTX2/LTX-2.3,
+or HunyuanVideo-1.5.
 
 Supports:
 - Wan2.2-I2V-A14B-Diffusers: MoE model with CLIP image encoder
@@ -26,6 +27,12 @@ Usage:
         --num-frames 121 --num-inference-steps 40 --guidance-scale 4.0 \
         --frame-rate 24 --fps 24 --output ltx2_i2v.mp4
 
+    # LTX-2.3 image-to-video
+    python image_to_video.py --model dg845/LTX-2.3-Diffusers \
+        --image input.jpg --prompt "A cinematic dolly shot of a boat" \
+        --height 384 --width 512 --num-frames 25 --num-inference-steps 20 \
+        --frame-rate 24 --fps 24 --output ltx23_i2v.mp4
+
     # HunyuanVideo-1.5 I2V (480p)
     python image_to_video.py --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v \
         --image input.jpg --prompt "A cat playing with yarn" \
@@ -42,6 +49,11 @@ import numpy as np
 import PIL.Image
 import torch
 
+from examples.offline_inference.video_model_defaults import (
+    default_image_to_video_class_name,
+    is_ltx2_model,
+    is_ltx23_model,
+)
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -60,22 +72,24 @@ def parse_profiler_config(value: str) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate a video from an image (Wan2.2, LTX2, HunyuanVideo-1.5).")
+    parser = argparse.ArgumentParser(
+        description="Generate a video from an image (Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5)."
+    )
     parser.add_argument(
         "--model",
         default="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        help="Diffusers I2V model ID or local path (Wan2.2 or HunyuanVideo-1.5).",
+        help="Diffusers I2V model ID or local path (Wan2.2, LTX2/LTX-2.3, or HunyuanVideo-1.5).",
     )
     parser.add_argument(
         "--model-class-name",
         default=None,
-        help="Override model class name (e.g., LTX2ImageToVideoPipeline).",
+        help="Override model class name (e.g., LTX2ImageToVideoPipeline or LTX23ImageToVideoPipeline).",
     )
     parser.add_argument("--image", required=True, help="Path to input image.")
     parser.add_argument("--prompt", default="", help="Text prompt describing the desired motion.")
     parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--guidance-scale", type=float, default=5.0, help="CFG scale.")
+    parser.add_argument("--guidance-scale", type=float, default=None, help="CFG scale. Default: model-specific.")
     parser.add_argument(
         "--guidance-scale-high", type=float, default=None, help="Optional separate CFG for high-noise (MoE only)."
     )
@@ -83,8 +97,13 @@ def parse_args() -> argparse.Namespace:
         "--height", type=int, default=None, help="Video height (auto-calculated from image if not set)."
     )
     parser.add_argument("--width", type=int, default=None, help="Video width (auto-calculated from image if not set).")
-    parser.add_argument("--num-frames", type=int, default=81, help="Number of frames.")
-    parser.add_argument("--num-inference-steps", type=int, default=50, help="Sampling steps.")
+    parser.add_argument("--num-frames", type=int, default=None, help="Number of frames. Default: model-specific.")
+    parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help="Sampling steps. Default: model-specific.",
+    )
     parser.add_argument("--boundary-ratio", type=float, default=0.875, help="Boundary split ratio for MoE models.")
     parser.add_argument(
         "--frame-rate",
@@ -265,10 +284,9 @@ def main():
     args = parse_args()
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
     model_name = str(args.model).lower() if args.model is not None else ""
-    model_class_name = args.model_class_name
-    is_ltx2 = "ltx2" in model_name or (model_class_name and "ltx2" in model_class_name.lower())
-    if model_class_name is None and is_ltx2:
-        model_class_name = "LTX2ImageToVideoPipeline"
+    model_class_name = default_image_to_video_class_name(args.model, args.model_class_name)
+    is_ltx2 = is_ltx2_model(model_name, model_class_name)
+    is_ltx23 = is_ltx23_model(model_name, model_class_name)
 
     # Load input image
     image = PIL.Image.open(args.image).convert("RGB")
@@ -276,8 +294,12 @@ def main():
     fps = args.fps if args.fps is not None else (24 if is_ltx2 else 16)
     frame_rate = args.frame_rate if args.frame_rate is not None else float(fps)
     guidance_scale = args.guidance_scale if args.guidance_scale is not None else (4.0 if is_ltx2 else 5.0)
-    num_frames = args.num_frames if args.num_frames is not None else (121 if is_ltx2 else 81)
-    num_inference_steps = args.num_inference_steps if args.num_inference_steps is not None else (40 if is_ltx2 else 50)
+    default_ltx_frames = 25 if is_ltx23 else 121
+    default_ltx_steps = 20 if is_ltx23 else 40
+    num_frames = args.num_frames if args.num_frames is not None else (default_ltx_frames if is_ltx2 else 81)
+    num_inference_steps = (
+        args.num_inference_steps if args.num_inference_steps is not None else (default_ltx_steps if is_ltx2 else 50)
+    )
 
     # Calculate dimensions if not provided
     height = args.height
@@ -367,8 +389,8 @@ def main():
     print(f"\n{'=' * 60}")
     print("Generation Configuration:")
     print(f"  Model: {args.model}")
-    print(f"  Inference steps: {args.num_inference_steps}")
-    print(f"  Frames: {args.num_frames}")
+    print(f"  Inference steps: {num_inference_steps}")
+    print(f"  Frames: {num_frames}")
     print(f"  Solver: {args.sample_solver}")
     print(f"  diffusion_kv_cache_dtype(config): {args.diffusion_kv_cache_dtype}")
     print(f"  diffusion_kv_cache_skip_steps(config): {args.diffusion_kv_cache_skip_steps}")
@@ -378,7 +400,7 @@ def main():
         f" tensor_parallel_size={args.tensor_parallel_size}, vae_patch_parallel_size={args.vae_patch_parallel_size},"
         f" pipeline_parallel_size={args.pipeline_parallel_size}"
     )
-    print(f"  Video size: {args.width}x{args.height}")
+    print(f"  Video size: {width}x{height}")
     print(f"{'=' * 60}\n")
 
     generation_start = time.perf_counter()
@@ -412,6 +434,7 @@ def main():
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
     audio = None
+    audio_sample_rate = args.audio_sample_rate
     if isinstance(frames, list):
         frames = frames[0] if frames else None
 
@@ -422,11 +445,13 @@ def main():
             )
         if frames.multimodal_output and "audio" in frames.multimodal_output:
             audio = frames.multimodal_output["audio"]
+            audio_sample_rate = frames.multimodal_output.get("audio_sample_rate", audio_sample_rate)
         if frames.is_pipeline_output and frames.request_output is not None:
             inner_output = frames.request_output
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]
+                    audio_sample_rate = inner_output.multimodal_output.get("audio_sample_rate", audio_sample_rate)
                 frames = inner_output
         if isinstance(frames, OmniRequestOutput):
             if frames.images:
@@ -434,6 +459,7 @@ def main():
                     frames, audio = frames.images[0]
                 elif len(frames.images) == 1 and isinstance(frames.images[0], dict):
                     audio = frames.images[0].get("audio")
+                    audio_sample_rate = frames.images[0].get("audio_sample_rate", audio_sample_rate)
                     frames = frames.images[0].get("frames") or frames.images[0].get("video")
                 else:
                     frames = frames.images
@@ -446,6 +472,7 @@ def main():
             frames, audio = first_item
         elif isinstance(first_item, dict):
             audio = first_item.get("audio")
+            audio_sample_rate = first_item.get("audio_sample_rate", audio_sample_rate)
             frames = first_item.get("frames") or first_item.get("video")
         elif isinstance(first_item, list):
             frames = first_item
@@ -454,6 +481,7 @@ def main():
         frames, audio = frames
     elif isinstance(frames, dict):
         audio = frames.get("audio")
+        audio_sample_rate = frames.get("audio_sample_rate", audio_sample_rate)
         frames = frames.get("frames") or frames.get("video")
 
     if frames is None:
@@ -572,7 +600,7 @@ def main():
             frames_u8,
             audio_np,
             fps=float(fps),
-            audio_sample_rate=args.audio_sample_rate,
+            audio_sample_rate=audio_sample_rate,
         )
         with open(str(output_path), "wb") as f:
             f.write(video_bytes)

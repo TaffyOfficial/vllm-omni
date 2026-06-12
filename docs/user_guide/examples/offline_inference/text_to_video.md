@@ -14,6 +14,8 @@ For backend selection and SageAttention usage, see the [Diffusion Attention Back
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
+| `Lightricks/LTX-2` | 480x768 | 41 | 20 | 4.0 | model dependent |
+| `dg845/LTX-2.3-Diffusers` | 384x512 | 25 | 20 | 4.0 | model dependent |
 
 ## Local CLI Usage
 
@@ -49,6 +51,28 @@ python text_to_video.py \
   --frame-rate 24 \
   --output ltx2_out.mp4
 ```
+
+LTX-2.3 text-to-video example:
+
+```bash
+python text_to_video.py \
+  --model "dg845/LTX-2.3-Diffusers" \
+  --prompt "A cinematic close-up of ocean waves at golden hour with synchronized ambient sound." \
+  --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
+  --height 384 \
+  --width 512 \
+  --num-frames 25 \
+  --num-inference-steps 20 \
+  --guidance-scale 4.0 \
+  --frame-rate 24 \
+  --output ltx23_out.mp4
+```
+
+LTX-2.3 Diffusers-format checkpoints such as `dg845/LTX-2.3-Diffusers` are
+routed to `LTX23Pipeline` automatically. The upstream `Lightricks/LTX-2.3`
+repository contains raw safetensors and is not directly loadable by this
+Diffusers-subfolder pipeline. The script also uses the audio sample rate
+returned by the pipeline when muxing synchronized audio.
 
 ### HunyuanVideo-1.5 (480p)
 
@@ -124,7 +148,8 @@ python text_to_video.py \
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 - `--enable-layerwise-offload`: enable layerwise offloading on DiT modules.
 - `--frame-rate`: generation FPS for pipelines that require it (e.g., LTX2).
-- `--audio-sample-rate`: audio sample rate for embedded audio (when the pipeline returns audio).
+- `--audio-sample-rate`: fallback audio sample rate for embedded audio. Pipelines
+  such as LTX-2.3 may return their own sample rate, which takes precedence.
 - `--quantization`: quantization method (`fp8` for FP8, `gguf` for GGUF).
 - `--flow-shift`: scheduler flow_shift parameter.
 
@@ -147,6 +172,9 @@ python text_to_video.py \
 | CFG-distilled | (same) | 1.0 | 50 |
 
 > If you encounter OOM errors, try `--vae-use-slicing`, `--vae-use-tiling`, `--enable-cpu-offload`, or `--quantization fp8`.
+
+For LTX-2 and LTX-2.3, use output dimensions divisible by 32 and frame counts
+that satisfy `8k + 1` when possible.
 
 ## Example materials
 
