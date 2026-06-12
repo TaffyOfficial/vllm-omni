@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_AR_KV,
     _STEP_CFG_FACTOR,
@@ -23,6 +24,9 @@ from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 def _pipeline():
     pipeline = object.__new__(HunyuanImage3Pipeline)
     pipeline._tkwrapper = SimpleNamespace(pad_token_id=0)
+    pipeline.od_config = SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA")),
+    )
     return pipeline
 
 
@@ -58,44 +62,25 @@ def test_hunyuan_step_group_key_ignores_step_index_for_later_steps():
     assert [state.request_id for state in groups[0]] == ["req-0", "req-1"]
 
 
-def test_single_request_denoise_does_not_forward_piecewise_mask_plan(monkeypatch):
+def test_grouped_denoise_rejects_non_sdpa_attention_backend():
     pipeline = _pipeline()
-    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
-    state = _state("single", 0)
-    state.latents = torch.zeros(1, 1)
-    state.extra[_STEP_MODEL_KWARGS].update(
-        {
-            "attention_mask": torch.ones(1, 1, 2, 2, dtype=torch.bool),
-            "full_attn_spans": [[(0, 2)]],
-            "piecewise_mask_plan": [
-                {
-                    "mask_kind": "baseline",
-                    "query_range": (0, 2),
-                    "key_ranges": [(0, 2)],
-                    "compact_query_offset": 0,
-                    "full_attn_spans": [(0, 2)],
-                    "signature": ("baseline", 2, 2, 0, ((0, 2),)),
-                }
-            ],
-        }
-    )
-    captured = {}
+    pipeline.od_config.diffusion_attention_config = AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN"))
 
-    def fake_prepare_inputs_for_generation(input_ids, images, timestep, **model_kwargs):
-        del input_ids, images, timestep
-        captured["has_piecewise_mask_plan"] = "piecewise_mask_plan" in model_kwargs
-        return {}
+    with pytest.raises(ValueError, match="only supports TORCH_SDPA"):
+        pipeline._ensure_grouped_attention_backend_supported(2)
 
-    pipeline._restore_injected_ar_kv = lambda states, row_state_indexes, row_branches: None
-    pipeline._capture_prompt_kv_cache = lambda states, row_state_indexes, row_branches: None
-    pipeline.prepare_inputs_for_generation = fake_prepare_inputs_for_generation
-    pipeline.forward_call = lambda **kwargs: {"diffusion_prediction": torch.zeros(1, 1)}
-    pipeline._update_model_kwargs_for_generation = lambda model_output, model_kwargs: model_kwargs
 
-    pipeline._denoise_step_group([state])
+def test_single_denoise_allows_non_sdpa_attention_backend():
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_attention_config = AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN"))
 
-    assert captured["has_piecewise_mask_plan"] is False
-    assert "piecewise_mask_plan" in state.extra[_STEP_MODEL_KWARGS]
+    pipeline._ensure_grouped_attention_backend_supported(1)
+
+
+def test_grouped_denoise_allows_sdpa_attention_backend():
+    pipeline = _pipeline()
+
+    pipeline._ensure_grouped_attention_backend_supported(2)
 
 
 def test_step_scheduler_preserves_latent_dtype_for_mixed_progress_batches():

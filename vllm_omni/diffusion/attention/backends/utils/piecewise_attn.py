@@ -16,8 +16,6 @@ from __future__ import annotations
 
 from typing import Literal, NamedTuple
 
-import torch
-
 
 class Segment(NamedTuple):
     start: int
@@ -58,302 +56,17 @@ def build_segments(full_attn_spans, query_offset, query_len):
     return segs
 
 
-def _segments_key(segments: list[Segment]) -> tuple[Segment, ...]:
-    return tuple(segments)
-
-
-def _compact_spans(spans: list[tuple[int, int]], kept_positions: list[int]) -> list[tuple[int, int]]:
-    compact_spans: list[tuple[int, int]] = []
-    for start, end in spans:
-        span_positions = [compact_pos for compact_pos, old_pos in enumerate(kept_positions) if start <= old_pos < end]
-        if not span_positions:
-            continue
-        span_start = span_positions[0]
-        previous = span_start
-        for compact_pos in span_positions[1:]:
-            if compact_pos != previous + 1:
-                compact_spans.append((span_start, previous + 1))
-                span_start = compact_pos
-            previous = compact_pos
-        compact_spans.append((span_start, previous + 1))
-    return compact_spans
-
-
-def _normalize_attention_mask(attn_mask: torch.Tensor, batch: int, query_len: int, key_len: int) -> torch.Tensor:
-    if attn_mask.dtype != torch.bool:
-        raise ValueError(f"piecewise attention requires a boolean attention mask, got {attn_mask.dtype}.")
-    if attn_mask.ndim == 4:
-        if attn_mask.shape[0] != batch or attn_mask.shape[-2:] != (query_len, key_len):
-            raise ValueError(
-                "4D attention mask shape must be broadcastable to "
-                f"({batch}, *, {query_len}, {key_len}), got {tuple(attn_mask.shape)}."
-            )
-        if attn_mask.shape[1] != 1:
-            head_mask = attn_mask[:, :1]
-            if not torch.equal(attn_mask, head_mask.expand_as(attn_mask)):
-                raise ValueError("piecewise attention does not support different masks per attention head.")
-        return attn_mask[:, 0]
-    if attn_mask.ndim == 3:
-        if tuple(attn_mask.shape) != (batch, query_len, key_len):
-            raise ValueError(
-                f"3D attention mask shape must be ({batch}, {query_len}, {key_len}), got {tuple(attn_mask.shape)}."
-            )
-        return attn_mask
-    if attn_mask.ndim == 2:
-        if tuple(attn_mask.shape) != (batch, key_len):
-            raise ValueError(f"2D attention mask shape must be ({batch}, {key_len}), got {tuple(attn_mask.shape)}.")
-        return attn_mask.unsqueeze(1).expand(batch, query_len, key_len)
-    raise ValueError(f"Unsupported attention mask rank for piecewise attention: {attn_mask.ndim}.")
-
-
-def _piecewise_mask(
-    spans: list[tuple[int, int]],
-    query_offset: int,
-    query_len: int,
-    key_len: int,
-    device: torch.device,
-) -> torch.Tensor:
-    query_positions = torch.arange(query_offset, query_offset + query_len, device=device)
-    key_positions = torch.arange(key_len, device=device)
-    mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
-    for start, end in spans:
-        query_in_span = (query_positions >= start) & (query_positions < end)
-        if torch.any(query_in_span):
-            mask[query_in_span] |= key_positions < end
-    return mask
-
-
-def _padding_keep_masks(row_mask: torch.Tensor, baseline_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    if torch.any(row_mask & ~baseline_mask):
-        raise ValueError("piecewise attention mask cannot allow tokens outside the causal/full-attention layout.")
-    query_keep = row_mask.any(dim=-1)
-    key_keep = row_mask.any(dim=-2)
-    expected_mask = baseline_mask & query_keep[:, None] & key_keep[None, :]
-    if not torch.equal(row_mask, expected_mask):
-        raise ValueError(
-            "piecewise attention only supports padding-style attention masks "
-            "that remove whole query rows or key columns; arbitrary query-key "
-            "mask holes are not supported."
-        )
-    return query_keep, key_keep
-
-
-def _piecewise_attn_grouped(
-    query,  # (B, Sq, H, D)
-    key,
-    value,
+def _check_homogeneous(
     full_attn_spans: list[list[tuple[int, int]]],
-    softmax_scale: float,
-    attn_func,
-    query_offset: int | None = None,
-) -> torch.Tensor:
-    B, Sq, H, D = query.shape
-    if len(full_attn_spans) != B:
-        raise ValueError(f"Expected {B} full-attention span entries, got {len(full_attn_spans)}.")
-
-    if query_offset is None:
-        query_offset = key.shape[1] - Sq
-    out = query.new_zeros(B, Sq, H, D)
-    grouped_rows: dict[tuple[Segment, ...], list[int]] = {}
-    for row, spans in enumerate(full_attn_spans):
-        segments = build_segments(spans, query_offset, Sq)
-        grouped_rows.setdefault(_segments_key(segments), []).append(row)
-
-    for segments, rows in grouped_rows.items():
-        row_index = query.new_tensor(rows, dtype=torch.long).to(device=query.device)
-        query_rows = query.index_select(0, row_index)
-        key_rows = key.index_select(0, row_index)
-        value_rows = value.index_select(0, row_index)
-        out_rows = out.index_select(0, row_index)
-        for s, e, mode in segments:
-            q_s = s - query_offset
-            q_e = e - query_offset
-            out_seg = attn_func(
-                query_rows[:, q_s:q_e],
-                key_rows[:, :e],
-                value_rows[:, :e],
-                causal=(mode == "causal"),
-                softmax_scale=softmax_scale,
-            )
-            out_rows[:, q_s:q_e] = out_seg
-        out.index_copy_(0, row_index, out_rows)
-    return out
-
-
-def _validate_plan_entry(entry: dict, query_len: int, key_len: int) -> tuple[tuple, int, list[tuple[int, int]]]:
-    mask_kind = entry.get("mask_kind")
-    if mask_kind not in {"baseline", "no_padding"}:
-        raise ValueError(f"Unsupported piecewise mask plan kind: {mask_kind!r}.")
-    query_start, query_end = entry["query_range"]
-    if int(query_end) - int(query_start) != query_len:
-        raise ValueError(
-            "piecewise mask plan query_range does not match the query tensor length: "
-            f"{entry['query_range']} vs {query_len}."
-        )
-    key_ranges = entry.get("key_ranges")
-    if key_ranges != [(0, key_len)]:
-        raise ValueError(f"Unsupported piecewise mask plan key_ranges: {key_ranges!r}.")
-    compact_query_offset = int(entry["compact_query_offset"])
-    if compact_query_offset != int(query_start):
-        raise ValueError("piecewise mask plan compact_query_offset must match query_range start.")
-    spans = [(int(start), int(end)) for start, end in entry.get("full_attn_spans", [])]
-    signature = (
-        mask_kind,
-        query_len,
-        key_len,
-        compact_query_offset,
-        tuple(spans),
-    )
-    if entry.get("signature") is not None and tuple(entry["signature"]) != signature:
-        raise ValueError("piecewise mask plan signature does not match its row metadata.")
-    return signature, compact_query_offset, spans
-
-
-def piecewise_attn_with_plan(
-    query,  # (B, Sq, H, D)
-    key,
-    value,
-    piecewise_mask_plan: list[dict],
-    softmax_scale: float,
-    attn_func,
-) -> torch.Tensor:
-    B, Sq, H, D = query.shape
-    if len(piecewise_mask_plan) != B:
-        raise ValueError(f"Expected {B} piecewise plan entries, got {len(piecewise_mask_plan)}.")
-
-    key_len = key.shape[1]
-    out = query.new_zeros(B, Sq, H, D)
-    grouped_rows: dict[tuple, tuple[int, list[tuple[int, int]], list[int]]] = {}
-    for row, entry in enumerate(piecewise_mask_plan):
-        signature, query_offset, spans = _validate_plan_entry(entry, Sq, key_len)
-        if signature not in grouped_rows:
-            grouped_rows[signature] = (query_offset, spans, [])
-        grouped_rows[signature][2].append(row)
-
-    for query_offset, spans, rows in grouped_rows.values():
-        if len(rows) == rows[-1] - rows[0] + 1:
-            row_slice = slice(rows[0], rows[-1] + 1)
-            query_rows = query[row_slice]
-            key_rows = key[row_slice]
-            value_rows = value[row_slice]
-            out_rows = out[row_slice].clone()
-        else:
-            query_rows = torch.cat([query[row : row + 1] for row in rows], dim=0)
-            key_rows = torch.cat([key[row : row + 1] for row in rows], dim=0)
-            value_rows = torch.cat([value[row : row + 1] for row in rows], dim=0)
-            out_rows = query_rows.new_zeros(len(rows), Sq, H, D)
-        for s, e, mode in build_segments(spans, query_offset, Sq):
-            q_s = s - query_offset
-            q_e = e - query_offset
-            out_seg = attn_func(
-                query_rows[:, q_s:q_e],
-                key_rows[:, :e],
-                value_rows[:, :e],
-                causal=(mode == "causal"),
-                softmax_scale=softmax_scale,
-            )
-            out_rows[:, q_s:q_e] = out_seg
-        if len(rows) == rows[-1] - rows[0] + 1:
-            out[rows[0] : rows[-1] + 1] = out_rows
-        else:
-            for compact_row, original_row in enumerate(rows):
-                out[original_row : original_row + 1] = out_rows[compact_row : compact_row + 1]
-    return out
-
-
-def _slice_rows(tensor: torch.Tensor, rows: list[int]) -> torch.Tensor:
-    if len(rows) == rows[-1] - rows[0] + 1:
-        return tensor[rows[0] : rows[-1] + 1]
-    return torch.cat([tensor[row : row + 1] for row in rows], dim=0)
-
-
-def _copy_rows(dst: torch.Tensor, rows: list[int], src: torch.Tensor) -> None:
-    if len(rows) == rows[-1] - rows[0] + 1:
-        dst[rows[0] : rows[-1] + 1] = src
-        return
-    for src_row, dst_row in enumerate(rows):
-        dst[dst_row : dst_row + 1] = src[src_row : src_row + 1]
-
-
-def piecewise_attn_with_plan_and_mask_fallback(
-    query,  # (B, Sq, H, D)
-    key,
-    value,
-    full_attn_spans: list[list[tuple[int, int]]],
-    piecewise_mask_plan: list[dict],
-    softmax_scale: float,
-    attn_func,
-    attn_mask: torch.Tensor | None,
-    fallback_callback=None,
-) -> torch.Tensor:
-    B, Sq, H, D = query.shape
-    key_len = key.shape[1]
-    if len(piecewise_mask_plan) != B:
-        if attn_mask is None:
-            raise ValueError(f"Expected {B} piecewise plan entries, got {len(piecewise_mask_plan)}.")
-        fallback_rows = list(range(B))
-        if fallback_callback is not None:
-            fallback_callback(fallback_rows)
-        return piecewise_attn(
-            query,
-            key,
-            value,
-            full_attn_spans,
-            softmax_scale,
-            attn_func,
-            attn_mask=attn_mask,
-        )
-
-    fast_rows: list[int] = []
-    fast_plan: list[dict] = []
-    fallback_rows: list[int] = []
-    for row, entry in enumerate(piecewise_mask_plan):
-        try:
-            _validate_plan_entry(entry, Sq, key_len)
-        except ValueError:
-            fallback_rows.append(row)
-        else:
-            fast_rows.append(row)
-            fast_plan.append(entry)
-
-    if not fallback_rows:
-        return piecewise_attn_with_plan(
-            query,
-            key,
-            value,
-            piecewise_mask_plan,
-            softmax_scale,
-            attn_func,
-        )
-
-    if attn_mask is None:
-        raise ValueError("Masked piecewise FlashAttention fallback requires an attention mask.")
-    if fallback_callback is not None:
-        fallback_callback(fallback_rows)
-
-    out = query.new_zeros(B, Sq, H, D)
-    if fast_rows:
-        fast_out = piecewise_attn_with_plan(
-            _slice_rows(query, fast_rows),
-            _slice_rows(key, fast_rows),
-            _slice_rows(value, fast_rows),
-            fast_plan,
-            softmax_scale,
-            attn_func,
-        )
-        _copy_rows(out, fast_rows, fast_out)
-
-    fallback_out = piecewise_attn(
-        _slice_rows(query, fallback_rows),
-        _slice_rows(key, fallback_rows),
-        _slice_rows(value, fallback_rows),
-        [full_attn_spans[row] for row in fallback_rows],
-        softmax_scale,
-        attn_func,
-        attn_mask=_slice_rows(attn_mask, fallback_rows),
-    )
-    _copy_rows(out, fallback_rows, fallback_out)
-    return out
+) -> None:
+    """Assert all samples share identical spans."""
+    if len(full_attn_spans) > 1:
+        ref = full_attn_spans[0]
+        for i, s in enumerate(full_attn_spans[1:], 1):
+            if s != ref:
+                raise ValueError(
+                    f"piecewise_attn requires homogeneous batch: sample 0 spans {ref} != sample {i} spans {s}"
+                )
 
 
 def piecewise_attn(
@@ -363,56 +76,23 @@ def piecewise_attn(
     full_attn_spans: list[list[tuple[int, int]]],
     softmax_scale: float,
     attn_func,
-    attn_mask: torch.Tensor | None = None,
 ):
-    if attn_mask is None:
-        return _piecewise_attn_grouped(query, key, value, full_attn_spans, softmax_scale, attn_func)
-
     B, Sq, H, D = query.shape
-    if len(full_attn_spans) != B:
-        raise ValueError(f"Expected {B} full-attention span entries, got {len(full_attn_spans)}.")
-    key_len = key.shape[1]
-    original_query_offset = key_len - Sq
-    mask = _normalize_attention_mask(attn_mask, B, Sq, key_len)
+    _check_homogeneous(full_attn_spans)
 
+    query_offset = key.shape[1] - Sq
+    spans = full_attn_spans[0]
     out = query.new_zeros(B, Sq, H, D)
-    for row, spans in enumerate(full_attn_spans):
-        row_mask = mask[row]
-        baseline_mask = _piecewise_mask(spans, original_query_offset, Sq, key_len, row_mask.device)
-        if attn_mask.ndim == 2:
-            row_mask = baseline_mask & row_mask
-        query_keep, key_keep = _padding_keep_masks(row_mask, baseline_mask)
-        if not torch.any(query_keep):
-            continue
-        if not torch.any(key_keep):
-            raise ValueError("Piecewise attention row has query tokens but no visible key tokens.")
 
-        query_index = torch.nonzero(query_keep, as_tuple=False).flatten()
-        key_index = torch.nonzero(key_keep, as_tuple=False).flatten()
-        kept_positions = key_index.tolist()
-        old_query_positions = (query_index + original_query_offset).tolist()
-        compact_query_positions: list[int] = []
-        for old_query_position in old_query_positions:
-            try:
-                compact_query_positions.append(kept_positions.index(old_query_position))
-            except ValueError as e:
-                raise ValueError(
-                    "piecewise attention requires valid query positions to be present in the key mask."
-                ) from e
-        compact_query_start = compact_query_positions[0]
-        if compact_query_positions != list(
-            range(compact_query_start, compact_query_start + len(compact_query_positions))
-        ):
-            raise ValueError("piecewise attention requires contiguous valid query positions after mask compaction.")
-        compact_spans = _compact_spans(spans, kept_positions)
-        compact_out = _piecewise_attn_grouped(
-            query[row : row + 1].index_select(1, query_index),
-            key[row : row + 1].index_select(1, key_index),
-            value[row : row + 1].index_select(1, key_index),
-            [compact_spans],
-            softmax_scale,
-            attn_func,
-            query_offset=compact_query_start,
+    for s, e, mode in build_segments(spans, query_offset, Sq):
+        q_s = s - query_offset
+        q_e = e - query_offset
+        out_seg = attn_func(
+            query[:, q_s:q_e],
+            key[:, :e],
+            value[:, :e],
+            causal=(mode == "causal"),
+            softmax_scale=softmax_scale,
         )
-        out[row : row + 1].index_copy_(1, query_index, compact_out)
+        out[:, q_s:q_e] = out_seg
     return out

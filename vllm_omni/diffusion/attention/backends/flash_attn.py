@@ -13,7 +13,6 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
-    piecewise_attn_with_plan_and_mask_fallback,
 )
 
 logger = init_logger(__name__)
@@ -53,8 +52,6 @@ class FlashAttentionImpl(AttentionImpl):
     _supported_kv_cache_dtypes = {
         "npu": {"fp8"},
     }
-    _piecewise_plan_masked_fallback_warned = False
-    _piecewise_plan_fallback_warned = False
 
     def __init__(
         self,
@@ -162,31 +159,6 @@ class FlashAttentionImpl(AttentionImpl):
         # (b s) h d -> b s h d
         return out.reshape(batch_size, q_len, *out.shape[1:])
 
-    def _forward_sdpa_masked(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        if attention_mask.ndim == 2:
-            attention_mask = attention_mask[:, None, None, :]
-        elif attention_mask.ndim == 3:
-            attention_mask = attention_mask[:, None, :, :]
-        elif attention_mask.ndim != 4:
-            raise ValueError(f"Unsupported SDPA fallback mask rank: {attention_mask.ndim}.")
-        query, key, value = (x.transpose(1, 2) for x in (query, key, value))
-        out = torch.nn.functional.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            scale=self.softmax_scale,
-        )
-        return out.transpose(1, 2)
-
     def forward_cuda(
         self,
         query: torch.Tensor,
@@ -209,9 +181,6 @@ class FlashAttentionImpl(AttentionImpl):
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
-        piecewise_mask_plan = None
-        if attn_metadata is not None:
-            piecewise_mask_plan = attn_metadata.extra.get("piecewise_mask_plan")
 
         # Try piecewise attention
         if full_attn_spans is not None:
@@ -220,46 +189,6 @@ class FlashAttentionImpl(AttentionImpl):
                 FlashAttentionImpl._flash_wrapper,
                 attn_func=flash_attn_func,
             )
-            if piecewise_mask_plan is not None:
-
-                def warn_masked_piecewise_fallback(rows):
-                    if not FlashAttentionImpl._piecewise_plan_masked_fallback_warned:
-                        logger.warning(
-                            "Falling back from grouped piecewise mask plan to masked "
-                            "piecewise FlashAttention for %d row(s).",
-                            len(rows),
-                        )
-                        FlashAttentionImpl._piecewise_plan_masked_fallback_warned = True
-                    else:
-                        logger.debug(
-                            "Repeated masked piecewise FlashAttention fallback for %d row(s).",
-                            len(rows),
-                        )
-
-                try:
-                    return piecewise_attn_with_plan_and_mask_fallback(
-                        query,
-                        key,
-                        value,
-                        full_attn_spans,
-                        piecewise_mask_plan,
-                        self.softmax_scale,
-                        attn_func,
-                        attention_mask,
-                        fallback_callback=warn_masked_piecewise_fallback,
-                    )
-                except ValueError as exc:
-                    if not FlashAttentionImpl._piecewise_plan_fallback_warned:
-                        logger.warning(
-                            "Emergency fallback from masked piecewise FlashAttention to SDPA "
-                            "for masked mixed attention.",
-                            exc_info=True,
-                        )
-                        FlashAttentionImpl._piecewise_plan_fallback_warned = True
-                    else:
-                        logger.debug("Repeated piecewise mask plan fallback: %s", exc)
-                    if attention_mask is not None:
-                        return self._forward_sdpa_masked(query, key, value, attention_mask)
 
             return piecewise_attn(
                 query,
@@ -268,7 +197,6 @@ class FlashAttentionImpl(AttentionImpl):
                 full_attn_spans,
                 self.softmax_scale,
                 attn_func,
-                attn_mask=attention_mask,
             )
 
         if attention_mask is not None and torch.any(~attention_mask):
@@ -303,11 +231,9 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
         """XPU flash attention implementation."""
-        full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
-        if full_attn_spans is not None:
-            raise ValueError("XPU FlashAttention does not support piecewise full_attn_spans yet.")
-
-        from vllm_omni.diffusion.attention.backends.utils.fa import HAS_FLASH_ATTN
+        from vllm_omni.diffusion.attention.backends.utils.fa import (
+            HAS_FLASH_ATTN,
+        )
 
         if not HAS_FLASH_ATTN:
             raise ImportError(
