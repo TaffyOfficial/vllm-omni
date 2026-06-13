@@ -255,7 +255,9 @@ def _make_runner():
     runner.cache_backend = None
     runner.offload_backend = None
     runner.state_cache = {}
-    runner.kv_transfer_manager = SimpleNamespace()
+    runner.kv_transfer_manager = SimpleNamespace(
+        receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None
+    )
     return runner
 
 
@@ -271,7 +273,9 @@ def _make_distributed_runner(mode: str, device: torch.device):
     runner.cache_backend = None
     runner.offload_backend = None
     runner.state_cache = {}
-    runner.kv_transfer_manager = SimpleNamespace()
+    runner.kv_transfer_manager = SimpleNamespace(
+        receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None
+    )
     return runner
 
 
@@ -470,6 +474,36 @@ class TestRunner:
 
         result = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
         assert len(result) == 2
+
+    def test_receives_kv_payload_before_prepare_encode(self, monkeypatch):
+        runner = _make_runner()
+        captured: dict[str, object] = {}
+        kv_payload = object()
+
+        class _CapturingStepPipeline(_StepPipeline):
+            def prepare_encode(self, state, **kwargs):
+                captured["past_key_values"] = getattr(state.sampling, "past_key_values", None)
+                return super().prepare_encode(state, **kwargs)
+
+        class _KVTransferManager:
+            def receive_multi_kv_cache_distributed(self, req, cfg_kv_collect_func=None, target_device=None):
+                captured["cfg_kv_collect_func"] = cfg_kv_collect_func
+                captured["target_device"] = target_device
+                req.sampling_params.past_key_values = kv_payload
+
+        runner.pipeline = _CapturingStepPipeline()
+        runner.pipeline.device = torch.device("cpu")
+        runner.od_config.cfg_kv_collect_func = "collect-cfg"
+        runner.kv_transfer_manager = _KVTransferManager()
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        req = _make_step_request()
+
+        DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
+
+        assert captured["past_key_values"] is kv_payload
+        assert captured["cfg_kv_collect_func"] == "collect-cfg"
+        assert captured["target_device"] == torch.device("cpu")
+        assert getattr(req.sampling_params, "past_key_values", None) is None
 
     def test_rejects_missing_cached_state(self):
         runner = _make_runner()

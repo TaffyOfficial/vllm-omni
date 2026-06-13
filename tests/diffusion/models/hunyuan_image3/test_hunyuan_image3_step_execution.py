@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_AR_KV,
@@ -28,7 +29,11 @@ def _pipeline():
     pipeline._tkwrapper = SimpleNamespace(pad_token_id=0)
     pipeline.od_config = SimpleNamespace(
         diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA")),
+        parallel_config=SimpleNamespace(sequence_parallel_size=1, cfg_parallel_size=1),
+        cache_backend=None,
+        diffusion_kv_cache_skip_step_indices=None,
     )
+    pipeline._pipeline = SimpleNamespace()
     return pipeline
 
 
@@ -54,6 +59,22 @@ def _state(request_id: str, step_index: int) -> DiffusionRequestState:
     return state
 
 
+def _sampling_params(**extra_args):
+    return SimpleNamespace(
+        timesteps=None,
+        sigmas=None,
+        num_outputs_per_prompt=None,
+        extra_args=extra_args,
+        height=512,
+        width=512,
+        num_inference_steps=4,
+        guidance_scale=1.0,
+        guidance_scale_provided=True,
+        guidance_rescale=0.0,
+        generator=None,
+    )
+
+
 def test_hunyuan_step_group_key_ignores_step_index_for_later_steps():
     pipeline = _pipeline()
     states = [_state("req-0", 1), _state("req-1", 3)]
@@ -62,6 +83,56 @@ def test_hunyuan_step_group_key_ignores_step_index_for_later_steps():
 
     assert len(groups) == 1
     assert [state.request_id for state in groups[0]] == ["req-0", "req-1"]
+
+
+@pytest.mark.parametrize(
+    ("sampling", "prompt_item", "expected_bot_task"),
+    [
+        pytest.param(
+            _sampling_params(bot_task="think_recaption", use_system_prompt="dynamic"),
+            {"prompt": "prompt", "bot_task": "vanilla"},
+            "think",
+            id="extra-args-precedence",
+        ),
+        pytest.param(
+            _sampling_params(use_system_prompt="dynamic"),
+            {"prompt": "prompt", "bot_task": "vanilla"},
+            "image",
+            id="prompt-dict-fallback",
+        ),
+    ],
+)
+def test_prepare_encode_preserves_normal_hunyuan_bot_task_semantics(
+    monkeypatch,
+    sampling,
+    prompt_item,
+    expected_bot_task,
+):
+    pipeline = _pipeline()
+    captured: dict[str, object] = {}
+
+    def fake_get_system_prompt(sys_type, bot_task, system_prompt=None):
+        del sys_type, system_prompt
+        captured["system_prompt_bot_task"] = bot_task
+        return "system prompt"
+
+    def fake_prepare_model_inputs(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after prepare_model_inputs")
+
+    monkeypatch.setattr(hy3_module, "get_system_prompt", fake_get_system_prompt)
+    pipeline.prepare_model_inputs = fake_prepare_model_inputs
+    state = DiffusionRequestState(
+        request_id="req-bot-task",
+        sampling=sampling,
+        prompts=[prompt_item],
+    )
+
+    with pytest.raises(RuntimeError, match="stop after prepare_model_inputs"):
+        pipeline.prepare_encode(state)
+
+    assert captured["bot_task"] == expected_bot_task
+    assert captured["system_prompt_bot_task"] == expected_bot_task
 
 
 def test_grouped_denoise_rejects_non_sdpa_attention_backend():

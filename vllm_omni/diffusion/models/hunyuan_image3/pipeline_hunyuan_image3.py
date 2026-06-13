@@ -497,22 +497,38 @@ class HunyuanImage3Pipeline(
     def _extract_step_prompt_inputs(
         self,
         state: "DiffusionRequestState",
-    ) -> tuple[list[str], list[str | None], str | None, list[list[JointImageInfo]] | None]:
+    ) -> tuple[list[str], list[str | None], str | None, list[list[JointImageInfo]] | None, str]:
         sampling = state.sampling
         prompts = state.prompts or []
         extra_args = getattr(sampling, "extra_args", {}) or {}
         is_dummy_warmup = OmniDiffusionRequest.is_dummy_run_request_id(state.request_id)
+        bot_task = extra_args.get("bot_task")
         use_system_prompt = extra_args.get("use_system_prompt")
         system_prompt = extra_args.get("system_prompt")
 
         first_prompt = prompts[0]
         if isinstance(first_prompt, dict):
+            if bot_task is None:
+                bot_task = first_prompt.get("bot_task")
             if use_system_prompt is None:
                 use_system_prompt = first_prompt.get("use_system_prompt")
             if system_prompt is None:
                 system_prompt = first_prompt.get("system_prompt")
+        if isinstance(bot_task, str) and bot_task.lower() == "none":
+            bot_task = None
+        tokenizer_bot_task = bot_task
+        if tokenizer_bot_task == "think_recaption":
+            tokenizer_bot_task = "think"
+        elif tokenizer_bot_task == "vanilla":
+            tokenizer_bot_task = "image"
+        supported_bot_tasks = {"auto", "image", "think", "recaption", "img_ratio"}
+        if tokenizer_bot_task is not None and tokenizer_bot_task not in supported_bot_tasks:
+            raise ValueError(
+                f"Unsupported HunyuanImage3 single-stage bot_task: {tokenizer_bot_task!r}. "
+                f"Supported values are: {sorted(supported_bot_tasks)}."
+            )
         if use_system_prompt is not None:
-            system_prompt = get_system_prompt(use_system_prompt, "image", system_prompt)
+            system_prompt = get_system_prompt(use_system_prompt, tokenizer_bot_task or "image", system_prompt)
             system_prompt = system_prompt.strip() if system_prompt is not None else ""
 
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in prompts]
@@ -540,7 +556,7 @@ class HunyuanImage3Pipeline(
                 raise ValueError("HunyuanImage3 step execution does not support image editing requests yet.")
             batch_cond_image_info = None
 
-        return prompt, cot_text_list, system_prompt, batch_cond_image_info
+        return prompt, cot_text_list, system_prompt, batch_cond_image_info, tokenizer_bot_task or "auto"
 
     def _snapshot_injected_ar_kv(self) -> list[list[tuple[torch.Tensor, torch.Tensor]] | None] | None:
         snapshot: list[list[tuple[torch.Tensor, torch.Tensor]] | None] = []
@@ -1793,7 +1809,13 @@ class HunyuanImage3Pipeline(
         self._validate_step_request(state)
         pipe = self.pipeline
         sampling = state.sampling
-        prompt, cot_text_list, system_prompt, batch_cond_image_info = self._extract_step_prompt_inputs(state)
+        (
+            prompt,
+            cot_text_list,
+            system_prompt,
+            batch_cond_image_info,
+            tokenizer_bot_task,
+        ) = self._extract_step_prompt_inputs(state)
         cot_text = (
             [self._normalize_cot_text(text) for text in cot_text_list]
             if any(text is not None for text in cot_text_list)
@@ -1820,6 +1842,7 @@ class HunyuanImage3Pipeline(
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             batch_cond_image_info=batch_cond_image_info,
+            bot_task=tokenizer_bot_task,
         )
         model_kwargs.update(self._extract_ar_kv_from_sampling(sampling))
         model_kwargs["use_cache"] = False
