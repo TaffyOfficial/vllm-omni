@@ -86,11 +86,12 @@ def test_hunyuan_step_group_key_ignores_step_index_for_later_steps():
 
 
 @pytest.mark.parametrize(
-    ("sampling", "prompt_item", "expected_bot_task"),
+    ("sampling", "prompt_item", "expected_model_bot_task", "expected_system_bot_task"),
     [
         pytest.param(
             _sampling_params(bot_task="think_recaption", use_system_prompt="dynamic"),
             {"prompt": "prompt", "bot_task": "vanilla"},
+            "think",
             "think",
             id="extra-args-precedence",
         ),
@@ -98,7 +99,15 @@ def test_hunyuan_step_group_key_ignores_step_index_for_later_steps():
             _sampling_params(use_system_prompt="dynamic"),
             {"prompt": "prompt", "bot_task": "vanilla"},
             "image",
+            "image",
             id="prompt-dict-fallback",
+        ),
+        pytest.param(
+            _sampling_params(use_system_prompt="dynamic"),
+            {"prompt": "prompt"},
+            "auto",
+            "image",
+            id="default-auto-system-prompt",
         ),
     ],
 )
@@ -106,7 +115,8 @@ def test_prepare_encode_preserves_normal_hunyuan_bot_task_semantics(
     monkeypatch,
     sampling,
     prompt_item,
-    expected_bot_task,
+    expected_model_bot_task,
+    expected_system_bot_task,
 ):
     pipeline = _pipeline()
     captured: dict[str, object] = {}
@@ -131,8 +141,36 @@ def test_prepare_encode_preserves_normal_hunyuan_bot_task_semantics(
     with pytest.raises(RuntimeError, match="stop after prepare_model_inputs"):
         pipeline.prepare_encode(state)
 
-    assert captured["bot_task"] == expected_bot_task
-    assert captured["system_prompt_bot_task"] == expected_bot_task
+    assert captured["bot_task"] == expected_model_bot_task
+    assert captured["system_prompt_bot_task"] == expected_system_bot_task
+
+
+def test_forward_uses_same_hunyuan_bot_task_semantics(monkeypatch):
+    pipeline = _pipeline()
+    captured: dict[str, object] = {}
+
+    def fake_get_system_prompt(sys_type, bot_task, system_prompt=None):
+        del sys_type, system_prompt
+        captured["system_prompt_bot_task"] = bot_task
+        return "system prompt"
+
+    def fake_prepare_model_inputs(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after prepare_model_inputs")
+
+    monkeypatch.setattr(hy3_module, "get_system_prompt", fake_get_system_prompt)
+    pipeline.prepare_model_inputs = fake_prepare_model_inputs
+    req = SimpleNamespace(
+        request_id="req-forward-bot-task",
+        sampling_params=_sampling_params(bot_task="think_recaption", use_system_prompt="dynamic"),
+        prompts=[{"prompt": "prompt", "bot_task": "vanilla"}],
+    )
+
+    with pytest.raises(RuntimeError, match="stop after prepare_model_inputs"):
+        pipeline.forward(req)
+
+    assert captured["bot_task"] == "think"
+    assert captured["system_prompt_bot_task"] == "think"
 
 
 def test_grouped_denoise_rejects_non_sdpa_attention_backend():
