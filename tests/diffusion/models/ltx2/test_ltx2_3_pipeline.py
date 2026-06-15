@@ -38,6 +38,41 @@ def _make_ltx23_pipeline(sequence_parallel_size: int = 1):
     return pipeline
 
 
+def _make_request_pipe(cls):
+    pipe = object.__new__(cls)
+    torch.nn.Module.__init__(pipe)
+    pipe.device = torch.device("cpu")
+    pipe.tokenizer_max_length = 99
+    return pipe
+
+
+def _resolve_ltx23_request_inputs(pipe, req):
+    return pipe._resolve_request_inputs(
+        req,
+        prompt=None,
+        negative_prompt=None,
+        height=None,
+        width=None,
+        num_frames=None,
+        frame_rate=None,
+        num_inference_steps=None,
+        timesteps=None,
+        guidance_scale=4.0,
+        num_videos_per_prompt=1,
+        generator=None,
+        latents=None,
+        audio_latents=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        prompt_attention_mask=None,
+        negative_prompt_attention_mask=None,
+        decode_timestep=0.0,
+        decode_noise_scale=None,
+        output_type="np",
+        max_sequence_length=None,
+    )
+
+
 class TestLTX23RequestParsing:
     def test_t2v_and_i2v_share_request_input_resolution(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ImageToVideoPipeline, LTX23Pipeline
@@ -83,64 +118,11 @@ class TestLTX23RequestParsing:
             request_id="ltx23-shared-request-inputs",
         )
 
-        def make_pipe(cls):
-            pipe = object.__new__(cls)
-            torch.nn.Module.__init__(pipe)
-            pipe.device = torch.device("cpu")
-            pipe.tokenizer_max_length = 99
-            return pipe
+        resolved_t2v = _resolve_ltx23_request_inputs(_make_request_pipe(LTX23Pipeline), req)
+        resolved_i2v = _resolve_ltx23_request_inputs(_make_request_pipe(LTX23ImageToVideoPipeline), req)
 
-        resolved_t2v = make_pipe(LTX23Pipeline)._resolve_request_inputs(
-            req,
-            prompt=None,
-            negative_prompt=None,
-            height=None,
-            width=None,
-            num_frames=None,
-            frame_rate=None,
-            num_inference_steps=None,
-            timesteps=None,
-            guidance_scale=4.0,
-            num_videos_per_prompt=1,
-            generator=None,
-            latents=None,
-            audio_latents=None,
-            prompt_embeds=None,
-            negative_prompt_embeds=None,
-            prompt_attention_mask=None,
-            negative_prompt_attention_mask=None,
-            decode_timestep=0.0,
-            decode_noise_scale=None,
-            output_type="np",
-            max_sequence_length=None,
-        )
-        resolved_i2v = make_pipe(LTX23ImageToVideoPipeline)._resolve_request_inputs(
-            req,
-            prompt=None,
-            negative_prompt=None,
-            height=None,
-            width=None,
-            num_frames=None,
-            frame_rate=None,
-            num_inference_steps=None,
-            timesteps=None,
-            guidance_scale=4.0,
-            num_videos_per_prompt=1,
-            generator=None,
-            latents=None,
-            audio_latents=None,
-            prompt_embeds=None,
-            negative_prompt_embeds=None,
-            prompt_attention_mask=None,
-            negative_prompt_attention_mask=None,
-            decode_timestep=0.0,
-            decode_noise_scale=None,
-            output_type="np",
-            max_sequence_length=None,
-        )
-
-        assert resolved_i2v.prompt == resolved_t2v.prompt == ["shared prompt"]
-        assert resolved_i2v.negative_prompt == resolved_t2v.negative_prompt == ["shared negative"]
+        assert resolved_i2v.prompt is resolved_t2v.prompt is None
+        assert resolved_i2v.negative_prompt is resolved_t2v.negative_prompt is None
         assert resolved_i2v.height == resolved_t2v.height == 384
         assert resolved_i2v.width == resolved_t2v.width == 512
         assert resolved_i2v.num_frames == resolved_t2v.num_frames == 25
@@ -172,15 +154,32 @@ class TestLTX23RequestParsing:
             torch.stack([negative_attention_mask]),
         )
 
+        _make_request_pipe(LTX23Pipeline).check_inputs(
+            prompt=resolved_t2v.prompt,
+            height=resolved_t2v.height,
+            width=resolved_t2v.width,
+            prompt_embeds=resolved_t2v.prompt_embeds,
+            negative_prompt_embeds=resolved_t2v.negative_prompt_embeds,
+            prompt_attention_mask=resolved_t2v.prompt_attention_mask,
+            negative_prompt_attention_mask=resolved_t2v.negative_prompt_attention_mask,
+        )
+        _make_request_pipe(LTX23ImageToVideoPipeline).check_inputs(
+            image=torch.zeros(1, 3, 16, 16),
+            height=resolved_i2v.height,
+            width=resolved_i2v.width,
+            prompt=resolved_i2v.prompt,
+            prompt_embeds=resolved_i2v.prompt_embeds,
+            negative_prompt_embeds=resolved_i2v.negative_prompt_embeds,
+            prompt_attention_mask=resolved_i2v.prompt_attention_mask,
+            negative_prompt_attention_mask=resolved_i2v.negative_prompt_attention_mask,
+        )
+
     def test_request_input_resolution_rejects_mixed_precomputed_prompt_fields(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-        pipe = object.__new__(LTX23Pipeline)
-        torch.nn.Module.__init__(pipe)
-        pipe.device = torch.device("cpu")
-        pipe.tokenizer_max_length = 99
+        pipe = _make_request_pipe(LTX23Pipeline)
         req = OmniDiffusionRequest(
             prompts=[
                 {
@@ -199,30 +198,7 @@ class TestLTX23RequestParsing:
         )
 
         with pytest.raises(ValueError, match="prompt_embeds.*every prompt"):
-            pipe._resolve_request_inputs(
-                req,
-                prompt=None,
-                negative_prompt=None,
-                height=None,
-                width=None,
-                num_frames=None,
-                frame_rate=None,
-                num_inference_steps=None,
-                timesteps=None,
-                guidance_scale=4.0,
-                num_videos_per_prompt=1,
-                generator=None,
-                latents=None,
-                audio_latents=None,
-                prompt_embeds=None,
-                negative_prompt_embeds=None,
-                prompt_attention_mask=None,
-                negative_prompt_attention_mask=None,
-                decode_timestep=0.0,
-                decode_noise_scale=None,
-                output_type="np",
-                max_sequence_length=None,
-            )
+            _resolve_ltx23_request_inputs(pipe, req)
 
 
 class TestPipelineIndependence:
@@ -307,6 +283,18 @@ class TestLTX23ImageToVideoPipeline:
         assert LTX23ImageToVideoPipeline._resolve_single_prompt_image([image]) is image
         with pytest.raises(ValueError, match="exactly one image per prompt"):
             LTX23ImageToVideoPipeline._resolve_single_prompt_image([object(), object()])
+
+    def test_ltx23_i2v_additional_image_resolution_accepts_tensor_values(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ImageToVideoPipeline
+
+        image = torch.zeros(1, 3, 16, 16)
+
+        assert LTX23ImageToVideoPipeline._resolve_additional_image({"preprocessed_image": image}) is image
+        assert (
+            LTX23ImageToVideoPipeline._resolve_additional_image({"preprocessed_image": None, "pixel_values": image})
+            is image
+        )
+        assert LTX23ImageToVideoPipeline._resolve_additional_image({"image": image}) is image
 
     def test_ltx23_i2v_packed_latents_noise_preserves_conditioning_frame(self, monkeypatch):
         import vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 as ltx23

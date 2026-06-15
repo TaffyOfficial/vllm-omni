@@ -1021,6 +1021,7 @@ class LTX23Pipeline(
         stacked_prompt_embeds = _stack_prompt_field_if_present(req_prompt_embeds, "prompt_embeds")
         if stacked_prompt_embeds is not None:
             prompt_embeds = stacked_prompt_embeds
+            prompt = None
 
         req_negative_prompt_embeds = [_get_prompt_field(p, "negative_prompt_embeds") for p in req.prompts]
         stacked_negative_prompt_embeds = _stack_prompt_field_if_present(
@@ -1028,6 +1029,7 @@ class LTX23Pipeline(
         )
         if stacked_negative_prompt_embeds is not None:
             negative_prompt_embeds = stacked_negative_prompt_embeds
+            negative_prompt = None
 
         req_prompt_attention_masks = []
         for prompt_item in req.prompts:
@@ -1554,6 +1556,15 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
             return raw_image[0]
         return raw_image
 
+    @staticmethod
+    def _resolve_additional_image(additional: dict[str, Any]) -> Any:
+        raw_image = additional.get("preprocessed_image")
+        if raw_image is None:
+            raw_image = additional.get("pixel_values")
+        if raw_image is None:
+            raw_image = additional.get("image")
+        return raw_image
+
     def prepare_latents(
         self,
         image: torch.Tensor | None = None,
@@ -1822,11 +1833,7 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
                     raw_image = multi_modal_data.get("image")
                     if raw_image is None:
                         additional = prompt_item.get("additional_information") or {}
-                        raw_image = (
-                            additional.get("preprocessed_image")
-                            or additional.get("pixel_values")
-                            or additional.get("image")
-                        )
+                        raw_image = self._resolve_additional_image(additional)
                 raw_image = self._resolve_single_prompt_image(raw_image)
                 if isinstance(raw_image, str):
                     raw_image = PIL.Image.open(raw_image).convert("RGB")

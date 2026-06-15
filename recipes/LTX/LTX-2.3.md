@@ -15,9 +15,9 @@
 Use this recipe when you want to serve LTX-2.3 for text-to-video or
 image-to-video generation with audio. The model generates videos up to 20+
 seconds at 768x512 resolution with 48kHz audio from text prompts, and can
-condition video generation on an initial image. Start with a 96GB-class GPU for
-validation because the model combines a 22B parameter transformer with text
-encoder, VAE, and vocoder components.
+condition video generation on an initial image. Start validation on H200 or
+another GPU with at least 96GB memory because the model combines a 22B parameter
+transformer with text encoder, VAE, and vocoder components.
 
 ## References
 
@@ -51,18 +51,24 @@ vllm serve dg845/LTX-2.3-Diffusers \
 # Health check
 curl http://localhost:8000/health
 
-# Generate a 3-second video (81 frames at 24fps)
+# Generate a small smoke video matching the bundled perf workload.
 curl -X POST http://localhost:8000/v1/videos \
   -F "prompt=A majestic bald eagle soaring over a misty mountain valley at dawn, golden sunlight breaking through clouds" \
   -F "negative_prompt=blurry, low quality, distorted, watermark" \
   -F "model=dg845/LTX-2.3-Diffusers" \
-  -F "num_frames=81" \
+  -F "num_frames=25" \
   -F "fps=24" \
-  -F "size=768x512" \
-  -F "num_inference_steps=30" \
+  -F "size=512x384" \
+  -F "num_inference_steps=20" \
   -F "guidance_scale=4.0" \
   -F "seed=42"
+```
 
+Larger 10s/20s examples are model-capability workloads. Validate latency,
+memory, and timeout settings on the target hardware before publishing them as
+deployment recipes.
+
+```bash
 # Generate a 10-second video (241 frames)
 curl -X POST http://localhost:8000/v1/videos \
   -F "prompt=A cozy Japanese ramen shop at night in the rain, steam rising from bowls, neon signs reflecting on wet cobblestone streets" \
@@ -130,15 +136,14 @@ curl -X POST http://localhost:8000/v1/videos/sync \
 
 ## Hardware Support
 
-## GPU
-
-### 1x NVIDIA RTX PRO 6000 Blackwell (96GB)
+### H200 validation target
 
 #### Environment
 
 - OS: Ubuntu 22.04
 - Python: 3.10+
-- Driver / runtime: CUDA 13.0, Driver 580.126.09
+- GPU: H200-class validation target
+- Driver / runtime: record from the validation host
 - vLLM version: Match the PR or release checkout being validated
 - vLLM-Omni version or commit: Use the commit you are deploying from
 
@@ -150,5 +155,13 @@ only after running a latest-head sweep on the target hardware.
 For formal PR benchmarking, reuse
 `tests/dfx/perf/tests/test_ltx2_3_vllm_omni.json` with
 `tests/dfx/perf/scripts/run_diffusion_benchmark.py`. That config captures the
-single-device eager baseline and CFG-parallel=2 case for a small 384x512,
-25-frame, 20-step workload.
+following H200 target topologies for a small 384x512, 25-frame, 20-step T2V
+workload:
+
+- 1 GPU: single-device eager baseline
+- 2 GPUs: CFG-parallel=2 eager
+- 1 GPU: torch.compile path
+
+Large 10s/20s workloads and I2V serving smoke are not covered by this perf
+config; validate them separately before publishing H200 latency or peak-memory
+numbers.
