@@ -1,0 +1,6 @@
+{
+    "architectures": [
+        "LTX23MockPipelineForTest"
+    ],
+    "model_type": "ltx23_mock"
+}
