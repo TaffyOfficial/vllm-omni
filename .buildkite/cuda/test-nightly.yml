@@ -448,10 +448,13 @@ steps:
             EXIT1=$$?
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
             EXIT2=$$?
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_ltx2_3_vllm_omni.json
+            EXIT3=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             if [ $$EXIT1 -ne 0 ]; then exit $$EXIT1; fi
-            exit $$EXIT2
+            if [ $$EXIT2 -ne 0 ]; then exit $$EXIT2; fi
+            exit $$EXIT3
         mirror_hardwares: h100_2
 
   - group: ":card_index_dividers: Diffusion Test"
