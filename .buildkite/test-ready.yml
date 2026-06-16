@@ -588,6 +588,7 @@ steps:
         source_file_dependencies:
           - tests/e2e/offline_inference/test_ltx2_3_t2v.py
           - tests/e2e/offline_inference/custom_pipeline/ltx23_mock_pipeline.py
+          - tests/e2e/offline_inference/fixtures/ltx23_mock_model/config.json
         commands:
           - |
             timeout 40m bash -c "

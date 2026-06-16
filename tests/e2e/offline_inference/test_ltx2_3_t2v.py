@@ -20,7 +20,7 @@ CUSTOM_PIPELINE_CLASS = "tests.e2e.offline_inference.custom_pipeline.ltx23_mock_
 
 @pytest.mark.core_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize(
     "omni_runner",
     [
