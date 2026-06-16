@@ -448,7 +448,7 @@ steps:
             EXIT1=$$?
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
             EXIT2=$$?
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_ltx2_3_vllm_omni.json
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_ltx2_3_vllm_omni.json --assert-baseline
             EXIT3=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
