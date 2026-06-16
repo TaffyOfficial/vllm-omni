@@ -25,6 +25,7 @@
                 "num-prompts": 3,
                 "max-concurrency": 1,
                 "enable-negative-prompt": true,
+                "baseline-tolerance": 0.1,
                 "baseline": {
                     "throughput_qps": 0.1663,
                     "latency_mean": 6.0142,
