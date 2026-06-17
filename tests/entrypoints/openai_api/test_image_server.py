@@ -1227,6 +1227,10 @@ def test_parameter_validation():
     assert req.size is None  # Engine will use model defaults
     assert req.num_inference_steps is None  # Engine will use model defaults
     assert req.true_cfg_scale is None  # Engine will use model defaults
+    assert req.infer_align_image_size is None
+
+    req = ImageGenerationRequest(prompt="test", infer_align_image_size=False)
+    assert req.infer_align_image_size is False
 
     # Invalid num_inference_steps (out of range)
     with pytest.raises(ValueError):
@@ -1248,6 +1252,19 @@ def test_parameter_validation():
 
     with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", layers=11)
+
+
+def test_hunyuan_edit_extra_args_preserve_infer_align_false():
+    from vllm_omni.entrypoints.openai.api_server import _build_hunyuan_edit_extra_args
+
+    extra_args = _build_hunyuan_edit_extra_args(
+        bot_task=None,
+        sys_type=None,
+        system_prompt=None,
+        infer_align_image_size=False,
+    )
+
+    assert extra_args["infer_align_image_size"] is False
 
 
 # Pass-Through Tests

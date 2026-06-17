@@ -76,6 +76,12 @@ def default(val, d):
     return val if val is not None else d
 
 
+def _flag_value_enabled(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def to_device(data, device):
     if device is None:
         return data
@@ -124,11 +130,19 @@ def _to_pil_image(image: Any) -> PILImage.Image:
     raise TypeError(f"Unsupported image input type: {type(image)}")
 
 
-def _resize_and_crop_center(image: PILImage.Image, target_width: int, target_height: int) -> PILImage.Image:
+def _resize_and_crop(
+    image: PILImage.Image,
+    target_width: int,
+    target_height: int,
+    *,
+    crop_type: str,
+) -> PILImage.Image:
     # Mirrors HunyuanImage3Processor._resize_and_crop in
     # vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 so the AR
     # and DiT stages preprocess condition images identically.
     tw, th = target_width, target_height
+    if crop_type == "resize":
+        return image.resize((tw, th), resample=PILImage.Resampling.LANCZOS)
     w, h = image.size
     tr = th / tw
     r = h / w
@@ -142,6 +156,10 @@ def _resize_and_crop_center(image: PILImage.Image, target_width: int, target_hei
     crop_top = int(round((resize_height - th) / 2.0))
     crop_left = int(round((resize_width - tw) / 2.0))
     return resized.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
+
+
+def _resize_and_crop_center(image: PILImage.Image, target_width: int, target_height: int) -> PILImage.Image:
+    return _resize_and_crop(image, target_width, target_height, crop_type="center")
 
 
 def _to_python_scalar(value: Any) -> Any:
@@ -174,6 +192,8 @@ def _image_info_to_payload(image_info: ImageInfo) -> dict[str, Any]:
         "image_token_length": _to_python_scalar(image_info.image_token_length),
         "base_size": _to_python_scalar(image_info.base_size),
         "ratio_index": _to_python_scalar(image_info.ratio_index),
+        "ori_image_width": _to_python_scalar(image_info.ori_image_width),
+        "ori_image_height": _to_python_scalar(image_info.ori_image_height),
         "add_timestep_token": image_info.add_timestep_token,
         "add_guidance_token": image_info.add_guidance_token,
         "use_front_boi_token": image_info.use_front_boi_token,
@@ -200,6 +220,8 @@ def _image_info_from_payload(payload: dict[str, Any]) -> ImageInfo:
         image_token_length=payload.get("image_token_length"),
         base_size=payload.get("base_size"),
         ratio_index=payload.get("ratio_index"),
+        ori_image_width=payload.get("ori_image_width"),
+        ori_image_height=payload.get("ori_image_height"),
         add_timestep_token=payload.get("add_timestep_token", True),
         add_guidance_token=payload.get("add_guidance_token", False),
         use_front_boi_token=payload.get("use_front_boi_token", True),
@@ -243,7 +265,7 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
     if isinstance(vit_patch_size, tuple | list):
         vit_patch_size = int(vit_patch_size[0])
 
-    def _build_cond_joint_image(raw_image: Any) -> dict[str, Any]:
+    def _build_cond_joint_image(raw_image: Any, *, crop_type: str) -> dict[str, Any]:
         pil_image = _to_pil_image(raw_image).convert("RGB")
         orig_width, orig_height = pil_image.size
 
@@ -258,12 +280,14 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
         reso = image_processor.reso_group[ratio_idx]
         target_width = int(reso.width)
         target_height = int(reso.height)
-        vae_input = _resize_and_crop_center(pil_image, target_width, target_height)
+        vae_input = _resize_and_crop(pil_image, target_width, target_height, crop_type=crop_type)
         vae_tensor = image_processor.vae_processor(vae_input)
 
         vae_info = ImageInfo(
             image_type="vae",
             image_tensor=vae_tensor,
+            ori_image_width=orig_width,
+            ori_image_height=orig_height,
             image_width=target_width,
             image_height=target_height,
             token_width=target_width // vae_w_factor,
@@ -282,6 +306,8 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
         vit_info = ImageInfo(
             image_type="siglip2",
             image_tensor=vit_tensor,
+            ori_image_width=orig_width,
+            ori_image_height=orig_height,
             image_width=vit_token_w * vit_patch_size,
             image_height=vit_token_h * vit_patch_size,
             token_width=vit_token_w,
@@ -304,6 +330,9 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
         prompt = request.prompt
         if isinstance(prompt, str):
             prompt = OmniTextPrompt(prompt=prompt)
+        extra_args = getattr(getattr(request, "sampling_params", None), "extra_args", {}) or {}
+        infer_align_image_size = _flag_value_enabled(extra_args.get("infer_align_image_size", False))
+        crop_type = "resize" if infer_align_image_size else "center"
 
         if "additional_information" not in prompt:
             prompt["additional_information"] = {}
@@ -315,7 +344,7 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
         has_images = raw_images is not None and (not isinstance(raw_images, list) or len(raw_images) > 0)
         if has_images:
             image_list = raw_images if isinstance(raw_images, list) else [raw_images]
-            cond_image_infos = [_build_cond_joint_image(image) for image in image_list]
+            cond_image_infos = [_build_cond_joint_image(image, crop_type=crop_type) for image in image_list]
             prompt["additional_information"]["batch_cond_image_info"] = cond_image_infos
 
             bridge_h = prompt.get("height") if isinstance(prompt, dict) else None
@@ -2274,6 +2303,7 @@ class HunyuanImage3Pipeline(
         generator = req.sampling_params.generator or generator
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
+        infer_align_image_size = _flag_value_enabled(extra_args.get("infer_align_image_size", False))
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
@@ -2301,6 +2331,11 @@ class HunyuanImage3Pipeline(
         model_inputs.update(ar_kv_kwargs)
 
         outputs = self._generate(**model_inputs, **kwargs)
+        outputs = self.image_processor.postprocess_outputs(
+            outputs,
+            batch_cond_image_info=batch_cond_image_info,
+            infer_align_image_size=infer_align_image_size,
+        )
         image = outputs[0]
         custom_output = {}
         if any(t is not None for t in cot_text_list):
