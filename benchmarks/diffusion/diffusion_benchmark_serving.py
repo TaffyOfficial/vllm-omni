@@ -1012,7 +1012,8 @@ def _make_warmup_request(
             num_inference_steps=args.warmup_num_inference_steps,
         )
     if args.task == "t2v":
-        warm_req = replace(warm_req, num_frames=1)
+        num_frames = args.warmup_num_frames if args.warmup_num_frames is not None else 1
+        warm_req = replace(warm_req, num_frames=num_frames)
     return warm_req
 
 
@@ -1029,9 +1030,11 @@ async def _run_warmups(
     warmup_concurrency = min(int(args.warmup_concurrency), len(warmup_requests))
     warmup_semaphore = asyncio.Semaphore(warmup_concurrency)
 
+    warmup_num_frames = args.warmup_num_frames if args.task == "t2v" and args.warmup_num_frames is not None else 1
     print(
         f"Running {len(warmup_requests)} warmup request(s) "
         f"with num_inference_steps={args.warmup_num_inference_steps} "
+        f"and num_frames={warmup_num_frames if args.task == 't2v' else None} "
         f"and warmup_concurrency={warmup_concurrency}..."
     )
 
@@ -1476,6 +1479,16 @@ if __name__ == "__main__":
         default=2,
         help="Number of inference steps used for warmup requests. "
         "Default is 2 to ensure at least one denoising step is executed.",
+    )
+    parser.add_argument(
+        "--warmup-num-frames",
+        type=int,
+        default=None,
+        help=(
+            "Number of frames used for T2V warmup requests. "
+            "Default keeps the existing lightweight T2V warmup at 1 frame; "
+            "set this to the measured frame count when warming torch.compile or CUDA graph shapes."
+        ),
     )
     parser.add_argument(
         "--warmup-concurrency",

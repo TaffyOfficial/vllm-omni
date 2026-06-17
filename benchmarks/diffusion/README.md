@@ -131,9 +131,13 @@ Warmup flags:
 
 - `--warmup-requests`: Number of warmup requests.
 - `--warmup-num-inference-steps`: Steps used during warmup.
+- `--warmup-num-frames`: Frames used during T2V warmup. The default keeps the
+  existing lightweight T2V warmup at 1 frame; set this to the measured frame
+  count when the warmup must cover a torch.compile or CUDA graph shape.
 - `--warmup-concurrency`: Maximum concurrent warmup requests. Use this to warm
   the same batch shape as the measured run instead of warming only batch=`1`.
-- For `--task t2v`: warmup requests are forced to use `num_frames=1` to make warmup faster and less noisy.
+- For `--task t2v`: warmup requests use `num_frames=1` by default to make
+  warmup faster and less noisy.
 
 Traffic / concurrency flags:
 
