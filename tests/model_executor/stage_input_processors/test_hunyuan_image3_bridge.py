@@ -90,3 +90,14 @@ def test_ar2diffusion_forwards_custom_system_prompt_body():
 
     assert result[0]["use_system_prompt"] == "custom"
     assert result[0]["system_prompt"] == marker
+
+
+def test_ar2diffusion_forwards_img2img_multimodal_data_as_image():
+    img = object()
+
+    result = ar2diffusion(
+        [_source_output([100], text="thought")],
+        prompt=[{"prompt": "edit", "multi_modal_data": {"img2img": img}}],
+    )
+
+    assert result[0]["multi_modal_data"] == {"image": img}
