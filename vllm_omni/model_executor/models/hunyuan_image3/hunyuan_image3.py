@@ -1593,6 +1593,24 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             )
             self._blocked_token_ids.update(self._all_ratio_ids)
 
+        self._cur_sampling_extra_args: list[dict] | None = None
+        self._reso_group: HunyuanImage3Processor.ResolutionGroup | None = None
+        self._ratio_idx_to_token_id: list[int] = []
+        if not self._is_comprehension:
+            self.vllm_config.model_config.has_sampling_extra_args = True
+
+            from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+                HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS,
+            )
+
+            self._reso_group = HunyuanImage3Processor.ResolutionGroup(
+                base_size=image_base_size,
+                extra_resolutions=[HunyuanImage3Processor.Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
+            )
+            self._ratio_idx_to_token_id = [
+                tokenizer.convert_tokens_to_ids(f"<img_ratio_{i}>") for i in range(len(self._reso_group))
+            ]
+
         # For generation mode, build stage transition map.
         # Official logic: </think> → [<recaption>],
         #   </recaption> → [<answer>, <boi>, <img_size_*>]
@@ -2036,6 +2054,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
         model_input_ids = None if inputs_embeds is not None else input_ids
+        self._cur_sampling_extra_args = kwargs.get("sampling_extra_args")
         model_output = self.model(model_input_ids, positions, intermediate_tensors, inputs_embeds)
         return model_output
 
@@ -2149,7 +2168,15 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         """Port of official _ConditionalSliceVocabLogitsProcessor.__call__.
 
         After the size token, only allow ratio tokens and pick greedily.
+        When the request carries a user-requested target size, force the
+        matching ratio token so AR and DiT agree on the requested aspect.
         """
+        target_token_id = self._resolve_forced_ratio_token(req_idx)
+        if target_token_id is not None:
+            logits[req_idx].fill_(min_score)
+            logits[req_idx, target_token_id] = 0
+            return
+
         original = logits[req_idx].clone()
         logits[req_idx].fill_(min_score)
         # Allow primary ratio range.
@@ -2163,6 +2190,27 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         max_id = logits[req_idx].argmax().item()
         logits[req_idx].fill_(min_score)
         logits[req_idx, max_id] = 0
+
+    def _resolve_forced_ratio_token(self, req_idx: int) -> int | None:
+        extra_args_list = self._cur_sampling_extra_args
+        if not extra_args_list or req_idx >= len(extra_args_list):
+            return None
+
+        extra_args = extra_args_list[req_idx] or {}
+        target_h = extra_args.get("target_h")
+        target_w = extra_args.get("target_w")
+        if target_h is None or target_w is None or self._reso_group is None:
+            return None
+
+        target_h = int(target_h)
+        target_w = int(target_w)
+        if target_h <= 0 or target_w <= 0:
+            return None
+
+        _, ratio_idx = self._reso_group.get_base_size_and_ratio_index(target_w, target_h)
+        if ratio_idx >= len(self._ratio_idx_to_token_id):
+            return None
+        return int(self._ratio_idx_to_token_id[ratio_idx])
 
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device

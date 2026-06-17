@@ -22,6 +22,13 @@ RATIO_OTHER_START = 220
 RATIO_OTHER_END = 223
 
 
+class _FakeResolutionGroup:
+    def get_base_size_and_ratio_index(self, width: int, height: int):
+        if (width, height) == (1280, 768):
+            return 1024, 4
+        return 1024, 0
+
+
 class FakeSamplerModel:
     """Minimal stub that replicates the sampler-relevant attributes of
     HunyuanImage3ForConditionalGeneration without loading real weights."""
@@ -40,6 +47,9 @@ class FakeSamplerModel:
         self._ratio_other_slices = [(RATIO_OTHER_START, RATIO_OTHER_END + 1)]
         self._all_ratio_ids = set(range(RATIO_START, RATIO_END + 1))
         self._all_ratio_ids.update(range(RATIO_OTHER_START, RATIO_OTHER_END + 1))
+        self._cur_sampling_extra_args = None
+        self._reso_group = _FakeResolutionGroup()
+        self._ratio_idx_to_token_id = [RATIO_START + i for i in range(RATIO_END - RATIO_START + 1)]
 
         self._stage_transitions: dict[int, list[int]] = {}
         if not is_comprehension:
@@ -58,6 +68,7 @@ class FakeSamplerModel:
 
     _get_forced_token = _Real._get_forced_token
     _apply_ratio_restriction = _Real._apply_ratio_restriction
+    _resolve_forced_ratio_token = _Real._resolve_forced_ratio_token
 
 
 class TestGetForcedToken:
@@ -171,6 +182,20 @@ class TestRatioRestriction:
 
         assert logits[0, RATIO_OTHER_START].item() == 0
         assert logits[0, RATIO_START].item() == min_score
+
+    def test_target_size_forces_matching_ratio_token(self):
+        model = FakeSamplerModel(is_comprehension=False)
+        model._cur_sampling_extra_args = [{"target_h": "768", "target_w": "1280"}]
+        vocab_size = 300
+        logits = torch.zeros(1, vocab_size)
+        logits[0, RATIO_START + 1] = 15.0
+        logits[0, RATIO_START + 4] = 1.0
+        min_score = torch.finfo(logits.dtype).min
+
+        model._apply_ratio_restriction(logits, 0, min_score)
+
+        assert logits[0, RATIO_START + 4].item() == 0
+        assert logits[0, RATIO_START + 1].item() == min_score
 
 
 class TestForceEosAfterRatio:
