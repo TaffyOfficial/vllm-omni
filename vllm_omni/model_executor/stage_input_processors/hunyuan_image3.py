@@ -19,7 +19,7 @@ from typing import Any
 from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+from vllm_omni.diffusion.models.hunyuan_image3.image_processing import (
     Resolution,
     ResolutionGroup,
     get_cached_resolution_group,

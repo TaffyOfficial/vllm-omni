@@ -5,7 +5,6 @@ import inspect
 import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any, cast
 
 import numpy as np
@@ -76,6 +75,18 @@ from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe import HunyuanFusedMoE
+from vllm_omni.diffusion.models.hunyuan_image3.image_processing import (
+    HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS as HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS,
+)
+from vllm_omni.diffusion.models.hunyuan_image3.image_processing import (
+    Resolution as Resolution,
+)
+from vllm_omni.diffusion.models.hunyuan_image3.image_processing import (
+    ResolutionGroup as ResolutionGroup,
+)
+from vllm_omni.diffusion.models.hunyuan_image3.image_processing import (
+    get_cached_resolution_group,
+)
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
 logger = logging.getLogger(__name__)
@@ -442,199 +453,6 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 def default(value, default_value):
     return value if value is not None else default_value
-
-
-class Resolution:
-    def __init__(self, size, *args):
-        if isinstance(size, str):
-            if "x" in size:
-                size = size.split("x")
-                size = (int(size[0]), int(size[1]))
-            else:
-                size = int(size)
-        if len(args) > 0:
-            size = (size, args[0])
-        if isinstance(size, int):
-            size = (size, size)
-
-        self.h = self.height = size[0]
-        self.w = self.width = size[1]
-        self.r = self.ratio = self.height / self.width
-
-        self.extra_res = set()
-
-    def match(self, width, height) -> tuple[int, int]:
-        if not self.extra_res:
-            return self.w, self.h
-        else:
-            ret_w, ret_h = self.w, self.h
-            target_area = width * height
-            min_area_diff = abs((self.w * self.h) - target_area)
-            for res in self.extra_res:
-                area_diff = abs((res[0] * res[1]) - target_area)
-                if area_diff < min_area_diff:
-                    min_area_diff = area_diff
-                    ret_w, ret_h = res[0], res[1]
-            return (ret_w, ret_h)
-
-    def __getitem__(self, idx):
-        if idx == 0:
-            return self.h
-        elif idx == 1:
-            return self.w
-        else:
-            raise IndexError(f"Index {idx} out of range")
-
-    def __str__(self):
-        return f"{self.h}x{self.w}"
-
-    def __repr__(self) -> str:
-        if not self.extra_res:
-            return "{" + f"{self.h}x{self.w}" + "}"
-        else:
-            ret_str = "{" + f"[{self.h}x{self.w}]"
-            for er in self.extra_res:
-                ret_str = ret_str + f"[{er[0]}x{er[1]}]"
-            ret_str = ret_str + "}"
-            return ret_str
-
-    def append(self, res: "Resolution"):
-        self.extra_res.add((res.w, res.h))
-
-
-# Baked-in extras matching the official model's
-# `HunyuanImage3ImageProcessor.vae_reso_group` (image_processor.py:147-152).
-# These four aspect buckets sit at ratio_token indices 33-36 in the trained
-# model and the AR was trained to address them, so any deviation breaks the
-# ratio-token vocab → output-shape lookup.
-HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS: tuple[str, ...] = (
-    "1024x768",
-    "1280x720",
-    "768x1024",
-    "720x1280",
-    "512x512",
-    "640x640",
-    "768x768",
-    "896x896",
-)
-
-
-class ResolutionGroup:
-    def __init__(self, base_size=None, step=None, align=1, extra_resolutions=None):
-        self.align = align
-        self.base_size = base_size
-        assert base_size % align == 0, f"base_size {base_size} is not divisible by align {align}"
-        if base_size is not None and not isinstance(base_size, int):
-            raise ValueError(f"base_size must be None or int, but got {type(base_size)}")
-        if step is None:
-            step = base_size // 16
-        if step is not None and step > base_size // 2:
-            raise ValueError(f"step must be smaller than base_size // 2, but got {step} > {base_size // 2}")
-
-        self.step = step
-        self.data = self._calc_by_step()
-
-        if extra_resolutions is not None:
-            for er in extra_resolutions:
-                for r in self.data:
-                    if r.ratio == er.ratio:
-                        r.append(er)
-                        break
-                else:
-                    self.data.append(er)
-
-        self.ratio = np.array([x.ratio for x in self.data])
-        self.attr = ["" for _ in range(len(self.data))]
-        self.prefix_space = 0
-        logger.debug(f"ResolutionGroup: {self}")
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return self.data[idx]
-
-    def __repr__(self):
-        prefix = self.prefix_space * " "
-        prefix_close = (self.prefix_space - 4) * " "
-        res_str = f"ResolutionGroup(base_size={self.base_size}, step={self.step}, data="
-        attr_maxlen = max([len(x) for x in self.attr] + [5])
-        res_str += (
-            f"\n{prefix}ID: height width   ratio {' ' * max(0, attr_maxlen - 4)}count  h/16 w/16    tokens\n{prefix}"
-        )
-
-        rows = []
-        for i, x in enumerate(self.data):
-            main_row = (
-                f"{i:2d}: ({x.h:4d}, {x.w:4d})  {self.ratio[i]:.4f}  {self.attr[i]:>{attr_maxlen}s}  "
-                f"({x.h // 16:3d}, {x.w // 16:3d})  {x.h // 16 * x.w // 16:6d}"
-            )
-            rows.append(main_row)
-            extra_val = getattr(x, "extra_res", None)
-            if extra_val:
-                for sub_h, sub_w in sorted(list(extra_val)):
-                    sub_ratio = sub_h / sub_w
-                    sub_h16, sub_w16 = sub_h // 16, sub_w // 16
-                    sub_tokens = sub_h16 * sub_w16
-                    sub_row = (
-                        f"    ({sub_h:4d}, {sub_w:4d})  {sub_ratio:.4f}  {' ' * attr_maxlen}  "
-                        f"({sub_h16:3d}, {sub_w16:3d})  {sub_tokens:6d}"
-                    )
-                    rows.append(sub_row)
-
-        res_str += ("\n" + prefix).join(rows)
-        res_str += f"\n{prefix_close})"
-        return res_str
-
-    def _calc_by_step(self):
-        assert self.align <= self.step, f"align {self.align} must be smaller than step {self.step}"
-
-        min_height = self.base_size // 2
-        min_width = self.base_size // 2
-        max_height = self.base_size * 2
-        max_width = self.base_size * 2
-
-        resolutions = [Resolution(self.base_size, self.base_size)]
-
-        cur_height, cur_width = self.base_size, self.base_size
-        while True:
-            if cur_height >= max_height and cur_width <= min_width:
-                break
-
-            cur_height = min(cur_height + self.step, max_height)
-            cur_width = max(cur_width - self.step, min_width)
-            resolutions.append(Resolution(cur_height // self.align * self.align, cur_width // self.align * self.align))
-
-        cur_height, cur_width = self.base_size, self.base_size
-        while True:
-            if cur_height <= min_height and cur_width >= max_width:
-                break
-
-            cur_height = max(cur_height - self.step, min_height)
-            cur_width = min(cur_width + self.step, max_width)
-            resolutions.append(Resolution(cur_height // self.align * self.align, cur_width // self.align * self.align))
-
-        resolutions = sorted(resolutions, key=lambda x: x.ratio)
-
-        return resolutions
-
-    def get_target_size(self, width, height):
-        ratio = height / width
-        idx = np.argmin(np.abs(self.ratio - ratio))
-        w, h = self.data[idx].match(width, height)
-        return w, h
-
-    def get_base_size_and_ratio_index(self, width, height):
-        ratio = height / width
-        idx = np.argmin(np.abs(self.ratio - ratio))
-        return self.base_size, idx
-
-
-@lru_cache(maxsize=4)
-def get_cached_resolution_group(base_size: int) -> ResolutionGroup:
-    extra_res_tuple = tuple(Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS)
-    extra_resolutions = list(extra_res_tuple) if extra_res_tuple else None
-    return ResolutionGroup(base_size=base_size, extra_resolutions=extra_resolutions)
 
 
 class ImageInfo:
