@@ -143,6 +143,8 @@ def _resize_and_crop(
     tw, th = target_width, target_height
     if crop_type == "resize":
         return image.resize((tw, th), resample=PILImage.Resampling.LANCZOS)
+    if crop_type != "center":
+        raise ValueError(f"Unsupported crop_type: {crop_type}")
     w, h = image.size
     tr = th / tw
     r = h / w

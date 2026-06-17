@@ -9,6 +9,7 @@ import pytest
 import torch
 from PIL import Image
 
+from vllm_omni.diffusion.models.hunyuan_image3 import pipeline_hunyuan_image3 as hunyuan_pipeline
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
     HunyuanImage3ImageProcessor,
     ImageInfo,
@@ -17,6 +18,8 @@ from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _flag_value_enabled,
 )
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 import (
     HunyuanImage3Processor,
 )
@@ -35,6 +38,8 @@ def _gradient_image(width: int = 8, height: int = 4) -> Image.Image:
 def test_flag_parser_handles_string_false():
     assert _flag_value_enabled("false") is False
     assert _flag_value_enabled("true") is True
+    assert _flag_value_enabled("0") is False
+    assert _flag_value_enabled("yes") is True
     assert _flag_value_enabled(False) is False
     assert _flag_value_enabled(True) is True
 
@@ -90,6 +95,77 @@ def test_ar_process_image_uses_requested_crop_mode_and_preserves_original_size(
     assert torch.equal(result["vae_pixel_values"], expected_tensor)
     assert result["ori_image_width"].tolist() == [src.width]
     assert result["ori_image_height"].tolist() == [src.height]
+
+
+def test_resize_and_crop_rejects_unknown_crop_type():
+    src = _gradient_image()
+
+    with pytest.raises(ValueError, match="Unsupported crop_type"):
+        HunyuanImage3Processor._resize_and_crop(None, src, (4, 4), crop_type="unknown")
+
+
+class _FixedDiffusionResolutionGroup:
+    base_size = 1024
+
+    def __getitem__(self, idx: int):
+        assert idx == 0
+        return SimpleNamespace(width=4, height=4, ratio=1.0)
+
+    def get_base_size_and_ratio_index(self, width: int, height: int):
+        return self.base_size, 0
+
+
+class _FakeVisionProcessor:
+    patch_size = 1
+
+    def __call__(self, image: Image.Image, return_tensors: str = "pt"):
+        assert return_tensors == "pt"
+        return _fake_vit_processor(image)
+
+
+class _FakeDiffusionImageProcessor:
+    def __init__(self, _hf_config):
+        self.reso_group = _FixedDiffusionResolutionGroup()
+        self.vae_processor = _fake_vae_processor
+        self.vision_encoder_processor = _FakeVisionProcessor()
+
+
+@pytest.mark.parametrize(
+    ("infer_align_image_size", "expected_image"),
+    [
+        (False, lambda src: HunyuanImage3Processor._resize_and_crop(None, src, (4, 4), crop_type="center")),
+        (True, lambda src: HunyuanImage3Processor._resize_and_crop(None, src, (4, 4), crop_type="resize")),
+    ],
+)
+def test_dit_preprocess_uses_requested_crop_mode_and_records_original_size(
+    monkeypatch: pytest.MonkeyPatch,
+    infer_align_image_size: bool,
+    expected_image,
+):
+    monkeypatch.setattr(
+        hunyuan_pipeline,
+        "get_config",
+        lambda *args, **kwargs: SimpleNamespace(vae_downsample_factor=(1, 1), patch_size=1),
+    )
+    monkeypatch.setattr(hunyuan_pipeline, "HunyuanImage3ImageProcessor", _FakeDiffusionImageProcessor)
+
+    src = _gradient_image()
+    request = OmniDiffusionRequest(
+        prompts=[{"prompt": "edit", "multi_modal_data": {"image": src}}],
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"infer_align_image_size": infer_align_image_size}),
+        request_id="req-1",
+    )
+
+    processed = hunyuan_pipeline.get_hunyuan_image_3_pre_process_func(SimpleNamespace(model="fake"))(request)
+    payload = processed.prompts[0]["additional_information"]["batch_cond_image_info"][0]
+    vae_payload = payload["vae_image_info"]
+
+    expected_tensor = _fake_vae_processor(expected_image(src))
+    assert torch.equal(vae_payload["image_tensor"], expected_tensor)
+    assert vae_payload["ori_image_width"] == src.width
+    assert vae_payload["ori_image_height"] == src.height
+    assert processed.sampling_params.width == src.width
+    assert processed.sampling_params.height == src.height
 
 
 class _FakeResolutionGroup:
@@ -150,6 +226,27 @@ def test_postprocess_single_matching_bucket_resizes_to_input_ratio_area():
     cond = _joint_cond(ratio_index=0, ori_width=1200, ori_height=800)
 
     processed = _fake_processor().postprocess_outputs([output], [[cond]], infer_align_image_size=True)
+
+    assert processed[0].size == (1254, 836)
+
+
+def test_postprocess_keeps_output_when_disabled_or_bucket_mismatched():
+    output = Image.new("RGB", (1024, 1024), color="white")
+    cond = _joint_cond(ratio_index=2, ori_width=1200, ori_height=800)
+
+    disabled = _fake_processor().postprocess_outputs([output], [[cond]], infer_align_image_size=False)
+    mismatched = _fake_processor().postprocess_outputs([output], [[cond]], infer_align_image_size=True)
+
+    assert disabled[0] is output
+    assert mismatched[0] is output
+
+
+def test_postprocess_multi_image_uses_first_matching_bucket_only():
+    output = Image.new("RGB", (1024, 1024), color="white")
+    mismatch = _joint_cond(ratio_index=2, ori_width=2048, ori_height=1024)
+    match = _joint_cond(ratio_index=0, ori_width=1200, ori_height=800)
+
+    processed = _fake_processor().postprocess_outputs([output], [[mismatch, match]], infer_align_image_size=True)
 
     assert processed[0].size == (1254, 836)
 
