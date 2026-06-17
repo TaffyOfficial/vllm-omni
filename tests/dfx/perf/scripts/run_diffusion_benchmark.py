@@ -961,12 +961,9 @@ def _build_run_params(
     if max_concurrency is not None:
         run_params["max-concurrency"] = max_concurrency
     if "baseline" in params:
-        tolerance = float(params.get("baseline-tolerance", 0))
         run_params["baseline"] = {
-            metric: _resolve_baseline_threshold(
-                metric,
+            metric: _resolve_baseline_value(
                 baseline_raw,
-                tolerance=tolerance,
                 sweep_index=sweep_index,
                 max_concurrency=max_concurrency,
                 request_rate=request_rate,
