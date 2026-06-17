@@ -1,0 +1,30 @@
+﻿{
+  "base_sha": "d897852258d9bcc05101c54dcd0973d111de9723",
+  "pr_sha": "d8530483a05d267334446bfaccb61b622c9a84a5",
+  "workload": {
+    "entrypoint": "tests.e2e.accuracy.test_hunyuan_image3._run_online",
+    "api": "/v1/images/edits",
+    "size": "1280x720",
+    "seed": 42,
+    "num_inference_steps": 50,
+    "guidance_scale": 2.5
+  },
+  "base": {
+    "image_size": "1280x720",
+    "cot_prefix_match": 127,
+    "cot_required_markers_present": true,
+    "missing_cot_markers": [],
+    "image_image_similarity": 97.28445410728455,
+    "ssim": 0.2721647322177887,
+    "psnr_db": 14.191210746765137
+  },
+  "pr": {
+    "image_size": "1280x720",
+    "cot_prefix_match": 127,
+    "cot_required_markers_present": true,
+    "missing_cot_markers": [],
+    "image_image_similarity": 97.28445410728455,
+    "ssim": 0.2721647322177887,
+    "psnr_db": 14.191210746765137
+  }
+}
