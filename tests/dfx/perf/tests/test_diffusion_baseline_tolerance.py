@@ -72,3 +72,20 @@ def test_baseline_tolerance_defaults_to_strict_threshold():
             num_prompts=1,
             assert_baseline=True,
         )
+
+
+def test_build_run_params_keeps_measured_baseline_visible():
+    params = {
+        "baseline-tolerance": 0.1,
+        "baseline": {
+            "throughput_qps": 100.0,
+            "latency_mean": 10.0,
+        },
+    }
+
+    run_params = runner._build_run_params(params, num_prompts=1)
+
+    assert run_params["baseline"] == {
+        "throughput_qps": 100.0,
+        "latency_mean": 10.0,
+    }
