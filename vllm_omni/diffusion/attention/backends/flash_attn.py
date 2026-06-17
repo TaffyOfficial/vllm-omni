@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from functools import partial
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
@@ -88,6 +89,7 @@ class FlashAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attention_mask: torch.Tensor,
+        mask_info: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             _pad_input,
@@ -99,7 +101,13 @@ class FlashAttentionImpl(AttentionImpl):
         assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
         query_length = query.size(1)
         q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
-            query, key, value, attention_mask, query_length, _unpad_input
+            query,
+            key,
+            value,
+            attention_mask,
+            query_length,
+            _unpad_input,
+            precomputed_mask_info=mask_info,
         )
 
         out_unpad = flash_attn_varlen_func(
@@ -169,6 +177,7 @@ class FlashAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         """CUDA/ROCm/MUSA flash attention implementation."""
         from vllm_omni.diffusion.attention.backends.utils.fa import (
+            FLASH_ATTN_MASK_INFO_KEY,
             HAS_FLASH_ATTN,
             flash_attn_func,
         )
@@ -182,6 +191,11 @@ class FlashAttentionImpl(AttentionImpl):
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
+        mask_info = (
+            attn_metadata.extra.get(FLASH_ATTN_MASK_INFO_KEY)
+            if attn_metadata is not None and attn_metadata.extra
+            else None
+        )
 
         # Try piecewise attention
         if full_attn_spans is not None:
@@ -200,7 +214,16 @@ class FlashAttentionImpl(AttentionImpl):
                 attn_func,
             )
 
-        if attention_mask is not None and torch.any(~attention_mask):
+        if attention_mask is not None and mask_info is not None:
+            if not mask_info.get("is_dense", False):
+                return self._forward_varlen_masked(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    mask_info=mask_info,
+                )
+        elif attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(
                 query,
                 key,
@@ -233,6 +256,7 @@ class FlashAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         """XPU flash attention implementation."""
         from vllm_omni.diffusion.attention.backends.utils.fa import (
+            FLASH_ATTN_MASK_INFO_KEY,
             HAS_FLASH_ATTN,
         )
 
@@ -244,8 +268,22 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        mask_info = (
+            attn_metadata.extra.get(FLASH_ATTN_MASK_INFO_KEY)
+            if attn_metadata is not None and attn_metadata.extra
+            else None
+        )
 
-        if attention_mask is not None and torch.any(~attention_mask):
+        if attention_mask is not None and mask_info is not None:
+            if not mask_info.get("is_dense", False):
+                return self._forward_varlen_masked(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    mask_info=mask_info,
+                )
+        elif attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(
                 query,
                 key,

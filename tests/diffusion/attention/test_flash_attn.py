@@ -62,6 +62,83 @@ def pad_tensor(tensor: torch.Tensor, target_seq_len: int, pad_value: float = 0.0
     return torch.cat([tensor, padding], dim=1)
 
 
+def test_upad_input_reuses_precomputed_kv_mask_info(monkeypatch):
+    attention_mask = torch.tensor(
+        [
+            [True, True, False, False],
+            [True, False, False, False],
+        ],
+        dtype=torch.bool,
+    )
+    mask_info = fa.make_flash_attention_mask_info(attention_mask, query_lengths=(4,))
+    query = torch.randn(2, 4, 1, 2)
+    key = torch.randn(2, 4, 1, 2)
+    value = torch.randn(2, 4, 1, 2)
+
+    def fail_get_unpad_data(_attention_mask):
+        raise AssertionError("_get_unpad_data should be reused from mask_info")
+
+    monkeypatch.setattr(fa, "_get_unpad_data", fail_get_unpad_data)
+
+    q, k, v, indices_q, (cu_seqlens_q, cu_seqlens_k), (max_q, max_k) = fa._upad_input(
+        query,
+        key,
+        value,
+        attention_mask,
+        query_length=4,
+        unpad_input_func=fa._unpad_input,
+        precomputed_mask_info=mask_info,
+    )
+
+    assert q.shape == (3, 1, 2)
+    assert k.shape == (3, 1, 2)
+    assert v.shape == (3, 1, 2)
+    torch.testing.assert_close(indices_q, mask_info["kv_unpad_data"][0])
+    torch.testing.assert_close(cu_seqlens_q, cu_seqlens_k)
+    assert max_q == max_k == 2
+
+
+def test_upad_input_reuses_precomputed_query_mask_info(monkeypatch):
+    attention_mask = torch.tensor(
+        [
+            [False, True, True, False],
+            [True, True, False, False],
+        ],
+        dtype=torch.bool,
+    )
+    mask_info = fa.make_flash_attention_mask_info(attention_mask, query_lengths=(2,))
+    query = torch.randn(2, 2, 1, 2)
+    key = torch.randn(2, 4, 1, 2)
+    value = torch.randn(2, 4, 1, 2)
+
+    def fail_unpad_input(*_args, **_kwargs):
+        raise AssertionError("query unpad data should be reused from mask_info")
+
+    def fail_get_unpad_data(_attention_mask):
+        raise AssertionError("_get_unpad_data should be reused from mask_info")
+
+    monkeypatch.setattr(fa, "_get_unpad_data", fail_get_unpad_data)
+
+    q, k, v, indices_q, (cu_seqlens_q, cu_seqlens_k), (max_q, max_k) = fa._upad_input(
+        query,
+        key,
+        value,
+        attention_mask,
+        query_length=2,
+        unpad_input_func=fail_unpad_input,
+        precomputed_mask_info=mask_info,
+    )
+
+    assert q.shape == (1, 1, 2)
+    assert k.shape == (4, 1, 2)
+    assert v.shape == (4, 1, 2)
+    torch.testing.assert_close(indices_q, mask_info["q_unpad_data_by_length"][2][0])
+    assert cu_seqlens_q.tolist() == [0, 1, 1]
+    assert cu_seqlens_k.tolist() == [0, 2, 4]
+    assert max_q == 1
+    assert max_k == 2
+
+
 @pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU")
 def test_padding_equivalence():
     """

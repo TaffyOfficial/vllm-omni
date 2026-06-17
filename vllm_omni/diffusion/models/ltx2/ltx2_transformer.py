@@ -43,6 +43,10 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.utils.fa import (
+    FLASH_ATTN_MASK_INFO_KEY,
+    make_flash_attention_mask_info,
+)
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
@@ -376,12 +380,14 @@ class LTX2AudioVideoAttnProcessor:
         attn: "LTX2Attention",
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None,
-        attention_mask: torch.Tensor | None,
+        attention_mask: torch.Tensor | AttentionMetadata | None,
         batch_size: int,
         sequence_length: int,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor | AttentionMetadata | None:
         if attention_mask is None:
             return None
+        if isinstance(attention_mask, AttentionMetadata):
+            return attention_mask
 
         if self._is_sp_enabled():
             # In SP, Ulysses expects a 2D padding mask that matches query length.
@@ -462,7 +468,7 @@ class LTX2AudioVideoAttnProcessor:
         attn: "LTX2Attention",
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | AttentionMetadata | None = None,
         query_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         key_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
@@ -514,7 +520,13 @@ class LTX2AudioVideoAttnProcessor:
         key = key.unflatten(2, (attn.heads, attn.head_dim))
         value = value.unflatten(2, (attn.heads, attn.head_dim))
 
-        attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+        attn_metadata = (
+            attention_mask
+            if isinstance(attention_mask, AttentionMetadata)
+            else AttentionMetadata(attn_mask=attention_mask)
+            if attention_mask is not None
+            else None
+        )
         hidden_states = attn.attn(query, key, value, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
@@ -982,8 +994,8 @@ class LTX2VideoTransformerBlock(nn.Module):
         audio_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         ca_video_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         ca_audio_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
-        encoder_attention_mask: torch.Tensor | None = None,
-        audio_encoder_attention_mask: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | AttentionMetadata | None = None,
+        audio_encoder_attention_mask: torch.Tensor | AttentionMetadata | None = None,
         self_attention_mask: torch.Tensor | None = None,
         audio_self_attention_mask: torch.Tensor | None = None,
         a2v_cross_attention_mask: torch.Tensor | None = None,
@@ -1770,6 +1782,45 @@ class LTX2VideoTransformer3DModel(nn.Module):
     def disable_gradient_checkpointing(self) -> None:
         self.gradient_checkpointing = False
 
+    @staticmethod
+    def _uses_flash_attention_layer(attn: LTX2Attention) -> bool:
+        return attn.attn.attn_backend.get_name().upper() == "FLASH_ATTN"
+
+    def _uses_flash_prompt_attention(self) -> bool:
+        if not self.transformer_blocks:
+            return False
+        return all(
+            self._uses_flash_attention_layer(attn)
+            for block in self.transformer_blocks
+            for attn in (block.attn2, block.audio_attn2)
+        )
+
+    def prepare_encoder_attention_metadata(
+        self,
+        attention_mask: torch.Tensor | AttentionMetadata | None,
+        *,
+        query_lengths: Iterable[int] = (),
+    ) -> torch.Tensor | AttentionMetadata | None:
+        if attention_mask is None or isinstance(attention_mask, AttentionMetadata):
+            return attention_mask
+        if attention_mask.ndim != 2:
+            return attention_mask
+        if LTX2AudioVideoAttnProcessor._is_sp_enabled():
+            return attention_mask
+        if not self._uses_flash_prompt_attention():
+            return attention_mask
+
+        padding_mask = LTX2AudioVideoAttnProcessor._to_padding_mask(attention_mask)
+        return AttentionMetadata(
+            attn_mask=padding_mask,
+            extra={
+                FLASH_ATTN_MASK_INFO_KEY: make_flash_attention_mask_info(
+                    padding_mask,
+                    query_lengths=query_lengths,
+                )
+            },
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1780,8 +1831,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
         audio_timestep: torch.LongTensor | None = None,
         sigma: torch.Tensor | None = None,
         audio_sigma: torch.Tensor | None = None,
-        encoder_attention_mask: torch.Tensor | None = None,
-        audio_encoder_attention_mask: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | AttentionMetadata | None = None,
+        audio_encoder_attention_mask: torch.Tensor | AttentionMetadata | None = None,
         num_frames: int | None = None,
         height: int | None = None,
         width: int | None = None,
@@ -1847,11 +1898,19 @@ class LTX2VideoTransformer3DModel(nn.Module):
         audio_timestep = audio_timestep if audio_timestep is not None else timestep
 
         # convert encoder_attention_mask to a bias the same way we do for attention_mask
-        if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
+        if (
+            encoder_attention_mask is not None
+            and not isinstance(encoder_attention_mask, AttentionMetadata)
+            and encoder_attention_mask.ndim == 2
+        ):
             encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
             encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
 
-        if audio_encoder_attention_mask is not None and audio_encoder_attention_mask.ndim == 2:
+        if (
+            audio_encoder_attention_mask is not None
+            and not isinstance(audio_encoder_attention_mask, AttentionMetadata)
+            and audio_encoder_attention_mask.ndim == 2
+        ):
             audio_encoder_attention_mask = (1 - audio_encoder_attention_mask.to(audio_hidden_states.dtype)) * -10000.0
             audio_encoder_attention_mask = audio_encoder_attention_mask.unsqueeze(1)
 

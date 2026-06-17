@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Adapted from https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_flash_attention_utils.py
+from collections.abc import Iterable
 from functools import lru_cache
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +23,9 @@ from vllm.logger import init_logger
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+FLASH_ATTN_MASK_INFO_KEY = "flash_attn_mask_info"
+FlashAttentionUnpadData = tuple[torch.Tensor, torch.Tensor, int]
 
 # Flash Attention function detection with fallback chain
 flash_attn_func = None
@@ -231,6 +236,42 @@ def _get_unpad_data(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.T
     )
 
 
+def make_flash_attention_mask_info(
+    attention_mask: torch.Tensor,
+    *,
+    query_lengths: Iterable[int] = (),
+) -> dict[str, Any]:
+    """Precompute reusable FlashAttention padding metadata for a stable mask.
+
+    LTX2.3 T2V reuses the same prompt mask across denoising steps and blocks.
+    Preparing the dense/varlen decision and unpad metadata once avoids repeating
+    scalar syncs in every attention call.
+    """
+    if attention_mask.ndim != 2:
+        raise ValueError("attention_mask must be 2D, (batch_size, seq_len)")
+    if attention_mask.dtype != torch.bool:
+        attention_mask = attention_mask.to(torch.bool)
+
+    is_dense = bool(attention_mask.all().item())
+    mask_info: dict[str, Any] = {"is_dense": is_dense}
+    if is_dense:
+        return mask_info
+
+    kv_unpad_data = _get_unpad_data(attention_mask)
+    q_unpad_data_by_length: dict[int, FlashAttentionUnpadData] = {}
+    for query_length in {int(length) for length in query_lengths}:
+        if query_length <= 0:
+            continue
+        if query_length == attention_mask.shape[-1]:
+            q_unpad_data_by_length[query_length] = kv_unpad_data
+        elif query_length != 1:
+            q_unpad_data_by_length[query_length] = _get_unpad_data(attention_mask[:, -query_length:])
+
+    mask_info["kv_unpad_data"] = kv_unpad_data
+    mask_info["q_unpad_data_by_length"] = q_unpad_data_by_length
+    return mask_info
+
+
 def _upad_input(
     query_layer: torch.Tensor,
     key_layer: torch.Tensor,
@@ -238,6 +279,7 @@ def _upad_input(
     attention_mask: torch.Tensor,
     query_length: int,
     unpad_input_func,
+    precomputed_mask_info: dict[str, Any] | None = None,
 ):
     """
     Unpads query, key, and values tensors, using a single dimension for all tokens even though they belong
@@ -277,7 +319,13 @@ def _upad_input(
     if torch.compiler.is_compiling():
         # allow PyTorch compiler to include operations that return scalar values (like .item()
         torch._dynamo.config.capture_scalar_outputs = True
-    indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+    kv_unpad_data = None
+    if precomputed_mask_info is not None:
+        kv_unpad_data = precomputed_mask_info.get("kv_unpad_data")
+    if kv_unpad_data is None:
+        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+    else:
+        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = kv_unpad_data
 
     # With static caches, the k/v states may be larger than the mask ->
     # we need to slice them to avoid generating garbage
@@ -303,8 +351,17 @@ def _upad_input(
         query_layer = query_layer.squeeze(1)
     else:
         # The -q_len: slice assumes left padding.
-        attention_mask = attention_mask[:, -query_length:]
-        query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q, *_ = unpad_input_func(query_layer, attention_mask)
+        query_unpad_data = None
+        if precomputed_mask_info is not None:
+            query_unpad_data = precomputed_mask_info.get("q_unpad_data_by_length", {}).get(query_length)
+        if query_unpad_data is None:
+            attention_mask = attention_mask[:, -query_length:]
+            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q, *_ = unpad_input_func(
+                query_layer, attention_mask
+            )
+        else:
+            indices_q, cu_seqlens_q, max_seqlen_in_batch_q = query_unpad_data
+            query_layer = _index_first_axis(query_layer, indices_q)
 
     return (
         query_layer,
