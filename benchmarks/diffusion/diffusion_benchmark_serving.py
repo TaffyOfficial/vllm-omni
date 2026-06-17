@@ -596,7 +596,9 @@ class CustomDataset(BaseDataset):
     - prompt (required): The text prompt for the request
     - width (optional): Image/video width
     - height (optional): Image height
+    - num_frames (optional): Number of video frames
     - num_inference_steps (optional): Number of diffusion steps
+    - fps (optional): Video frames per second
     - seed (optional): Random seed
     - image_paths (optional): List of input image paths for i2i/i2v/ti2i tasks
     - image_urls (optional): List of input image URLs (alternative to image_paths)
@@ -719,13 +721,17 @@ class CustomDataset(BaseDataset):
         prompt = item["prompt"]
         width = item.get("width", self.args.width)
         height = item.get("height", self.args.height)
+        num_frames = item.get("num_frames", self.args.num_frames)
         num_inference_steps = item.get("num_inference_steps", self.args.num_inference_steps)
+        fps = item.get("fps", self.args.fps)
         seed = item.get("seed", self.args.seed)
         reserved_keys = {
             "prompt",
             "width",
             "height",
+            "num_frames",
             "num_inference_steps",
+            "fps",
             "seed",
             "image_paths",
             "image_urls",
@@ -748,7 +754,9 @@ class CustomDataset(BaseDataset):
             extra_body=extra_body,
             width=width,
             height=height,
+            num_frames=num_frames,
             num_inference_steps=num_inference_steps,
+            fps=fps,
         )
 
     def get_requests(self) -> list[RequestFuncInput]:
