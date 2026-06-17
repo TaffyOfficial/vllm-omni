@@ -34,9 +34,9 @@
                 "max-concurrency": 1,
                 "baseline-tolerance": 0.1,
                 "baseline": {
-                    "throughput_qps": 0.1663,
-                    "latency_mean": 6.0142,
-                    "peak_memory_mb_mean": 73290
+                    "throughput_qps": 0.1662,
+                    "latency_mean": 6.0158,
+                    "peak_memory_mb_mean": 73291
                 }
             }
         ]
@@ -78,9 +78,8 @@
                 "warmup-num-frames": 25,
                 "baseline-tolerance": 0.1,
                 "baseline": {
-                    "throughput_qps": 0.0936,
-                    "latency_mean": 10.6879,
-                    "latency_median": 4.0096,
+                    "throughput_qps": 0.1663,
+                    "latency_mean": 6.0141,
                     "peak_memory_mb_mean": 73290
                 }
             }
