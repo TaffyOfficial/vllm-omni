@@ -12,7 +12,6 @@ A config JSON file is REQUIRED via --test-config-file:
   pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
 
 Optional: ``--assert-baseline`` compares metrics to the ``baseline`` block in each benchmark entry (default: off).
-Set ``baseline-tolerance`` to a fractional regression margin, for example ``0.1`` for a 10% guard band.
 
 All benchmark results for a session are consolidated into a single JSON file under
 BENCHMARK_RESULT_DIR (override via the DIFFUSION_BENCHMARK_DIR environment variable).
@@ -588,7 +587,7 @@ def run_benchmark(
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", prefix="diffusion_bench_tmp_", delete=False) as tmp:
         tmp_result_file = Path(tmp.name)
 
-    exclude_keys = {"baseline", "baseline-tolerance", "dataset", "task", "name", "skip-performance-assertion"}
+    exclude_keys = {"baseline", "dataset", "task", "name", "skip-performance-assertion"}
 
     cmd = [
         sys.executable,
@@ -762,31 +761,6 @@ def _resolve_baseline_value(
     return baseline_raw
 
 
-def _resolve_baseline_threshold(
-    metric: str,
-    baseline_raw: Any,
-    *,
-    tolerance: float,
-    sweep_index: int | None,
-    max_concurrency: Any = None,
-    request_rate: Any = None,
-) -> float:
-    """Resolve the assertion threshold for a metric after applying tolerance."""
-    if not 0 <= tolerance < 1:
-        raise ValueError(f"baseline-tolerance must be in [0, 1), got {tolerance}")
-    baseline = float(
-        _resolve_baseline_value(
-            baseline_raw,
-            sweep_index=sweep_index,
-            max_concurrency=max_concurrency,
-            request_rate=request_rate,
-        )
-    )
-    if "throughput" in metric:
-        return baseline * (1 - tolerance)
-    return baseline * (1 + tolerance)
-
-
 def assert_result(
     result: dict[str, Any],
     params: dict[str, Any],
@@ -807,14 +781,11 @@ def assert_result(
         print("Skipping performance assertions.")
         return
 
-    tolerance = float(params.get("baseline-tolerance", 0))
     for metric, baseline_raw in params.get("baseline", {}).items():
         current = result.get(metric)
         assert current is not None, f"Metric '{metric}' not found in result: {list(result.keys())}"
-        threshold = _resolve_baseline_threshold(
-            metric,
+        threshold = _resolve_baseline_value(
             baseline_raw,
-            tolerance=tolerance,
             sweep_index=sweep_index,
             max_concurrency=max_concurrency,
             request_rate=request_rate,
