@@ -62,6 +62,52 @@ def test_baseline_tolerance_relaxes_upper_bound_metrics():
         )
 
 
+def test_baseline_tolerance_supports_nested_stage_duration_metrics():
+    params = {
+        "baseline-tolerance": 0.1,
+        "baseline": {"stage_durations_mean.stage_0_gen_ms": 1000.0},
+    }
+
+    runner.assert_result(
+        {
+            "completed_requests": 1,
+            "stage_durations_mean": {"stage_0_gen_ms": 1100.0},
+        },
+        params,
+        num_prompts=1,
+        assert_baseline=True,
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match=r"stage_durations_mean\.stage_0_gen_ms: 1101\.0000 > baseline 1100\.0",
+    ):
+        runner.assert_result(
+            {
+                "completed_requests": 1,
+                "stage_durations_mean": {"stage_0_gen_ms": 1101.0},
+            },
+            params,
+            num_prompts=1,
+            assert_baseline=True,
+        )
+
+
+def test_missing_nested_baseline_metric_reports_full_path():
+    params = {"baseline": {"stage_durations_mean.stage_0_gen_ms": 1000.0}}
+
+    with pytest.raises(AssertionError, match=r"Metric 'stage_durations_mean\.stage_0_gen_ms' not found"):
+        runner.assert_result(
+            {
+                "completed_requests": 1,
+                "stage_durations_mean": {},
+            },
+            params,
+            num_prompts=1,
+            assert_baseline=True,
+        )
+
+
 def test_baseline_tolerance_defaults_to_strict_threshold():
     params = {"baseline": {"throughput_qps": 100.0}}
 

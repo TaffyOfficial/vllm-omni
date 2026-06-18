@@ -15,6 +15,7 @@ A config JSON file may be passed via --test-config-file. If omitted, every ``*.j
 
 Optional: ``--assert-baseline`` compares metrics to the ``baseline`` block in each benchmark entry (default: off).
 Set ``baseline-tolerance`` to a fractional regression margin, for example ``0.1`` for a 10% guard band.
+Nested metrics can be addressed with dotted paths, for example ``stage_durations_mean.stage_0_gen_ms``.
 
 Optional JSON field ``mark`` is applied as pytest marks on that case via
 ``pytest.param`` (e.g. ``"mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}}, "full_model", "diffusion"]``).
@@ -883,6 +884,15 @@ def _resolve_baseline_threshold(
     return baseline * (1 + tolerance)
 
 
+def _resolve_metric_value(result: dict[str, Any], metric: str) -> Any:
+    current: Any = result
+    for part in metric.split("."):
+        if not isinstance(current, dict) or part not in current:
+            raise KeyError(metric)
+        current = current[part]
+    return current
+
+
 def assert_result(
     result: dict[str, Any],
     params: dict[str, Any],
@@ -905,8 +915,11 @@ def assert_result(
 
     tolerance = float(params.get("baseline-tolerance", 0))
     for metric, baseline_raw in params.get("baseline", {}).items():
-        current = result.get(metric)
-        assert current is not None, f"Metric '{metric}' not found in result: {list(result.keys())}"
+        try:
+            current = _resolve_metric_value(result, metric)
+        except KeyError:
+            raise AssertionError(f"Metric '{metric}' not found in result: {list(result.keys())}") from None
+        assert current is not None, f"Metric '{metric}' is None"
         threshold = _resolve_baseline_threshold(
             metric,
             baseline_raw,
