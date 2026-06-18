@@ -70,6 +70,8 @@ _STEP_OUTPUT_SIZE = "hunyuan_output_size"
 _STEP_COT_TEXT_LIST = "hunyuan_cot_text_list"
 _STEP_AR_KV = "hunyuan_ar_kv"
 _STEP_PROMPT_KV = "hunyuan_prompt_kv"
+_STEP_INFER_ALIGN_IMAGE_SIZE = "hunyuan_infer_align_image_size"
+_STEP_BATCH_COND_IMAGE_INFO = "hunyuan_batch_cond_image_info"
 
 
 def default(val, d):
@@ -622,7 +624,7 @@ class HunyuanImage3Pipeline(
             [state.prompt] if state.prompt is not None else [],
             getattr(sampling, "extra_args", {}) or {},
             request_id=state.request_id,
-            allow_cond_image=False,
+            allow_cond_image=True,
         )
 
     def _snapshot_injected_ar_kv(self) -> list[list[tuple[torch.Tensor, torch.Tensor]] | None] | None:
@@ -1883,6 +1885,9 @@ class HunyuanImage3Pipeline(
             batch_cond_image_info,
             tokenizer_bot_task,
         ) = self._extract_step_prompt_inputs(state)
+        infer_align_image_size = _flag_value_enabled(
+            (getattr(sampling, "extra_args", {}) or {}).get("infer_align_image_size", False)
+        )
         cot_text = (
             [self._normalize_cot_text(text) for text in cot_text_list]
             if any(text is not None for text in cot_text_list)
@@ -1983,6 +1988,8 @@ class HunyuanImage3Pipeline(
             _STEP_OUTPUT_SIZE: (target_height, target_width),
             _STEP_COT_TEXT_LIST: cot_text_list,
             _STEP_AR_KV: self._snapshot_injected_ar_kv(),
+            _STEP_INFER_ALIGN_IMAGE_SIZE: infer_align_image_size,
+            _STEP_BATCH_COND_IMAGE_INFO: batch_cond_image_info,
         }
         return state
 
@@ -2261,6 +2268,12 @@ class HunyuanImage3Pipeline(
             output_type=output_type,
             do_denormalize=[True] * image.shape[0],
         )
+        if output_type == "pil":
+            image = self.image_processor.postprocess_outputs(
+                image,
+                batch_cond_image_info=state.extra.get(_STEP_BATCH_COND_IMAGE_INFO),
+                infer_align_image_size=state.extra.get(_STEP_INFER_ALIGN_IMAGE_SIZE, False),
+            )
 
         cot_text_list = state.extra.get(_STEP_COT_TEXT_LIST) or []
         custom_output = {}

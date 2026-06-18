@@ -97,12 +97,6 @@ from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjecto
 logger = init_logger(__name__)
 
 
-def _flag_value_enabled(value: object) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
-
-
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -821,7 +815,10 @@ class HunyuanImage3Processor:
     def __init__(self, tokenizer, hf_config, **kwargs: object):
         self.tokenizer = tokenizer
         self.hf_config = hf_config
-        self.infer_align_image_size = _flag_value_enabled(kwargs.pop("infer_align_image_size", False))
+        infer_align_image_size = kwargs.pop("infer_align_image_size", False)
+        if isinstance(infer_align_image_size, str):
+            infer_align_image_size = infer_align_image_size.strip().lower() in {"1", "true", "yes", "on"}
+        self.infer_align_image_size = bool(infer_align_image_size)
         # `HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS` mirrors the official
         # `vae_reso_group` extras (image_processor.py:147-152). Build with
         # this processor's inner Resolution class so `data` stays
