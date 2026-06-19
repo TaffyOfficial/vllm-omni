@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import os
 import pathlib
 
 import pytest
+from vllm.sampling_params import SamplingParams
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     _TASK_PRESETS,
@@ -17,6 +19,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     build_prompt_tokens,
     resolve_stop_token_ids,
 )
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -296,6 +299,15 @@ def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[4]
 
 
+def _load_end2end_module():
+    end2end_path = _repo_root() / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
+    spec = importlib.util.spec_from_file_location("hunyuan_image3_offline_end2end_for_test", end2end_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_end2end_routes_through_shared_prompt_utils():
     end2end_path = _repo_root() / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
     tree = ast.parse(end2end_path.read_text(encoding="utf-8"))
@@ -309,6 +321,51 @@ def test_end2end_routes_through_shared_prompt_utils():
             imported_from_prompt_utils.update(alias.name for alias in node.names)
     expected_imports = {"build_prompt_tokens", "resolve_stop_token_ids", "resolve_sys_type"}
     assert expected_imports <= imported_from_prompt_utils
+
+
+def test_end2end_explicit_size_sets_ar_sampling_extra_args():
+    end2end = _load_end2end_module()
+    ar_params = SamplingParams(max_tokens=128, extra_args={"keep": "value"})
+    diffusion_params = OmniDiffusionSamplingParams()
+
+    end2end._configure_sampling_params(
+        [ar_params, diffusion_params],
+        modality="text2img",
+        steps=24,
+        guidance_scale=2.5,
+        seed=42,
+        height=768,
+        width=1280,
+        ar_stop_token_ids=[101, 102],
+    )
+
+    assert ar_params.stop_token_ids == [101, 102]
+    assert ar_params.extra_args == {"keep": "value", "target_h": 768, "target_w": 1280}
+    assert diffusion_params.height == 768
+    assert diffusion_params.width == 1280
+    assert diffusion_params.num_inference_steps == 24
+    assert diffusion_params.guidance_scale == 2.5
+    assert diffusion_params.seed == 42
+
+
+def test_end2end_no_explicit_size_leaves_ar_target_size_unset():
+    end2end = _load_end2end_module()
+    ar_params = SamplingParams(max_tokens=128, extra_args={"keep": "value"})
+    diffusion_params = OmniDiffusionSamplingParams()
+
+    end2end._configure_sampling_params(
+        [ar_params, diffusion_params],
+        modality="text2img",
+        steps=24,
+        guidance_scale=2.5,
+        seed=None,
+        height=None,
+        width=None,
+        ar_stop_token_ids=[101, 102],
+    )
+
+    assert ar_params.stop_token_ids == [101, 102]
+    assert ar_params.extra_args == {"keep": "value"}
 
 
 _HUNYUAN_MODEL_ID = "tencent/HunyuanImage-3.0-Instruct"

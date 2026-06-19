@@ -14,7 +14,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     resolve_sys_type,
 )
 from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.inputs.data import OmniPromptType
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image_3_moe.yaml")
@@ -127,6 +127,40 @@ def parse_additional_config(raw_value: str | None) -> dict | None:
     return additional_config
 
 
+def _configure_sampling_params(
+    params_list: list,
+    *,
+    modality: str,
+    steps: int,
+    guidance_scale: float,
+    seed: int | None,
+    height: int | None,
+    width: int | None,
+    ar_stop_token_ids: list[int],
+) -> None:
+    user_specified_image_size = modality in ("text2img", "img2img") and height is not None and width is not None
+
+    for sp in params_list:
+        if isinstance(sp, OmniDiffusionSamplingParams):
+            sp.num_inference_steps = steps
+            sp.guidance_scale = guidance_scale
+            sp.guidance_scale_provided = True
+            if seed is not None:
+                sp.seed = seed
+            if modality == "text2img" or (modality == "img2img" and user_specified_image_size):
+                sp.height = height
+                sp.width = width
+        elif hasattr(sp, "stop_token_ids"):
+            sp.stop_token_ids = ar_stop_token_ids
+            if user_specified_image_size:
+                extra_args = getattr(sp, "extra_args", None)
+                if extra_args is None:
+                    extra_args = {}
+                    sp.extra_args = extra_args
+                extra_args["target_h"] = int(height)
+                extra_args["target_w"] = int(width)
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
@@ -224,8 +258,6 @@ def main():
 
     params_list = list(omni.default_sampling_params_list)
 
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
     if (args.height is None) != (args.width is None):
         raise ValueError("--height and --width must both be specified or both omitted.")
     user_specified_size = args.height is not None and args.width is not None
@@ -241,18 +273,16 @@ def main():
     print(
         f"[AR Config] task={task}, bot_task={bot_task}, image_size={ar_image_size}, stop_token_ids={ar_stop_token_ids}"
     )
-    for sp in params_list:
-        if isinstance(sp, OmniDiffusionSamplingParams):
-            sp.num_inference_steps = args.steps
-            sp.guidance_scale = args.guidance_scale
-            sp.guidance_scale_provided = True
-            if args.seed is not None:
-                sp.seed = args.seed
-            if args.modality == "text2img":
-                sp.height = args.height
-                sp.width = args.width
-        elif hasattr(sp, "stop_token_ids"):
-            sp.stop_token_ids = ar_stop_token_ids
+    _configure_sampling_params(
+        params_list,
+        modality=args.modality,
+        steps=args.steps,
+        guidance_scale=args.guidance_scale,
+        seed=args.seed,
+        height=args.height,
+        width=args.width,
+        ar_stop_token_ids=ar_stop_token_ids,
+    )
 
     print(f"\n{'=' * 60}")
     print("HunyuanImage-3.0 Generation Configuration:")
