@@ -162,10 +162,6 @@ def _resize_and_crop(
     return resized.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
 
 
-def _resize_and_crop_center(image: PILImage.Image, target_width: int, target_height: int) -> PILImage.Image:
-    return _resize_and_crop(image, target_width, target_height, crop_type="center")
-
-
 def _to_python_scalar(value: Any) -> Any:
     if isinstance(value, np.generic):
         return value.item()

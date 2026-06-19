@@ -815,10 +815,7 @@ class HunyuanImage3Processor:
     def __init__(self, tokenizer, hf_config, **kwargs: object):
         self.tokenizer = tokenizer
         self.hf_config = hf_config
-        infer_align_image_size = kwargs.pop("infer_align_image_size", False)
-        if isinstance(infer_align_image_size, str):
-            infer_align_image_size = infer_align_image_size.strip().lower() in {"1", "true", "yes", "on"}
-        self.infer_align_image_size = bool(infer_align_image_size)
+        self.infer_align_image_size = bool(kwargs.pop("infer_align_image_size", False))
         # `HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS` mirrors the official
         # `vae_reso_group` extras (image_processor.py:147-152). Build with
         # this processor's inner Resolution class so `data` stays
