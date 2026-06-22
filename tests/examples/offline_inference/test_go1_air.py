@@ -16,6 +16,7 @@ import torch
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.go1_air.config import Go1AirConfig
+from vllm_omni.diffusion.models.go1_air.model_go1_air import scaled_dot_product
 from vllm_omni.diffusion.models.go1_air.pipeline_go1_air import (
     build_go1_air_batch_inputs_from_robot_obs,
     get_go1_air_post_process_func,
@@ -127,3 +128,23 @@ def test_go1_air_openpi_obs_maps_to_actions_output() -> None:
     assert set(result) == {"actions", "video"}
     assert result["actions"] is actions
     assert result["video"] == []
+
+
+def test_go1_air_sdpa_attention_matches_eager_without_mask() -> None:
+    q = torch.tensor(
+        [[[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]]],
+        dtype=torch.float32,
+    )
+    k = torch.tensor(
+        [[[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]]],
+        dtype=torch.float32,
+    )
+    v = torch.tensor(
+        [[[[1.0, 0.0], [0.0, 2.0], [3.0, 4.0]]]],
+        dtype=torch.float32,
+    )
+
+    eager = scaled_dot_product(q, k, v, num_kv_groups=1, mask=None, implementation="eager")
+    sdpa = scaled_dot_product(q, k, v, num_kv_groups=1, mask=None, implementation="sdpa")
+
+    assert torch.allclose(sdpa, eager, atol=1e-6, rtol=1e-6)

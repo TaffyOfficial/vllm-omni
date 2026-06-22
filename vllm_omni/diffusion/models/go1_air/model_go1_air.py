@@ -215,7 +215,9 @@ def scaled_dot_product(
     k_full = repeat_kv(k, num_kv_groups)
     v_full = repeat_kv(v, num_kv_groups)
     if implementation == "sdpa":
-        return F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=mask, is_causal=mask is None)
+        # Callers own causal/layout masking; keep SDPA and eager semantics
+        # identical when no explicit additive mask is provided.
+        return F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=mask, is_causal=False)
     scale = 1.0 / math.sqrt(q.shape[-1])
     scores = torch.matmul(q, k_full.transpose(-2, -1)) * scale
     if mask is not None:
