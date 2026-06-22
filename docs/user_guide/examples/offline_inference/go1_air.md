@@ -11,6 +11,13 @@ with the Latent Planner disabled, so this integration covers the
 chunk is produced with the upstream squared-cosine diffusion schedule and
 5-step DPM-Solver sampling.
 
+## Requirements
+
+GO-1-Air offline inference should run on a CUDA GPU with at least 12 GiB of
+VRAM. In the validated BF16 single-observation smoke run, vLLM-Omni peaked at
+4.95 GiB CUDA allocated and 10.05 GiB CUDA reserved after model load and
+inference.
+
 ## Quick start
 
 ```bash
