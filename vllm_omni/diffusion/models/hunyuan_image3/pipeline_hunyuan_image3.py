@@ -18,9 +18,12 @@ from transformers.generation.utils import ALL_CACHE_NAMES, GenerationMixin
 from transformers.utils.generic import ModelOutput
 from vllm.config.vllm import get_current_vllm_config
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import get_config
+from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -66,6 +69,7 @@ _STEP_GENERATOR = "hunyuan_generator"
 _STEP_GUIDANCE_SCALE = "hunyuan_guidance_scale"
 _STEP_CFG_FACTOR = "hunyuan_cfg_factor"
 _STEP_OUTPUT_SIZE = "hunyuan_output_size"
+_STEP_IMAGE_TOKEN_SIZE = "hunyuan_image_token_size"
 _STEP_COT_TEXT_LIST = "hunyuan_cot_text_list"
 _STEP_AR_KV = "hunyuan_ar_kv"
 _STEP_PROMPT_KV = "hunyuan_prompt_kv"
@@ -498,6 +502,47 @@ class HunyuanImage3Pipeline(
             raise ValueError("HunyuanImage3 step execution does not support diffusion cache backends yet.")
         if getattr(self.od_config, "diffusion_kv_cache_skip_step_indices", None):
             raise ValueError("HunyuanImage3 step execution does not support diffusion KV cache step skips yet.")
+        if self._step_pipeline_parallel_size() > 1:
+            guidance_scale = self._step_guidance_scale(sampling)
+            if guidance_scale > 1.0:
+                raise ValueError(
+                    "HunyuanImage3 DiT pipeline parallel step execution supports no-CFG requests only. "
+                    "Set guidance_scale <= 1.0 when pipeline_parallel_size > 1."
+                )
+            if getattr(sampling, "past_key_values", None) is not None:
+                raise ValueError("HunyuanImage3 DiT pipeline parallel step execution does not support AR-KV reuse yet.")
+
+    @staticmethod
+    def _step_guidance_scale(sampling: Any) -> float:
+        guidance_scale = getattr(sampling, "guidance_scale", None)
+        return 5.0 if guidance_scale is None else float(guidance_scale)
+
+    @property
+    def _step_pp_send_work(self) -> list[torch.distributed.Work]:
+        if not hasattr(self, "_hunyuan_step_pp_send_work"):
+            self._hunyuan_step_pp_send_work: list[torch.distributed.Work] = []
+        return self._hunyuan_step_pp_send_work
+
+    @_step_pp_send_work.setter
+    def _step_pp_send_work(self, work: list[torch.distributed.Work]) -> None:
+        self._hunyuan_step_pp_send_work = work
+
+    def _sync_step_pp_send(self) -> None:
+        for handle in self._step_pp_send_work:
+            handle.wait()
+        self._step_pp_send_work = []
+
+    def _step_pipeline_parallel_size(self) -> int:
+        parallel_config = getattr(self.od_config, "parallel_config", None)
+        return int(getattr(parallel_config, "pipeline_parallel_size", 1))
+
+    @staticmethod
+    def _step_pp_last_group_rank(pp_group: Any) -> int:
+        ranks = getattr(pp_group, "ranks", None)
+        world_size = int(pp_group.world_size)
+        if ranks is not None:
+            return min(len(ranks) - 1, world_size - 1)
+        return world_size - 1
 
     @staticmethod
     def _normalize_single_stage_bot_task(bot_task: Any) -> str:
@@ -587,10 +632,19 @@ class HunyuanImage3Pipeline(
             allow_cond_image=False,
         )
 
+    def _iter_local_dit_layers(self):
+        for layer_idx, layer in enumerate(self.model.layers):
+            if not hasattr(layer, "self_attn"):
+                continue
+            yield layer_idx, layer
+
     def _snapshot_injected_ar_kv(self) -> list[list[tuple[torch.Tensor, torch.Tensor]] | None] | None:
         snapshot: list[list[tuple[torch.Tensor, torch.Tensor]] | None] = []
         found = False
         for layer in self.model.layers:
+            if not hasattr(layer, "self_attn"):
+                snapshot.append(None)
+                continue
             mgr = layer.self_attn.image_attn
             injected = mgr._injected_ar_kv
             if injected is None:
@@ -611,11 +665,11 @@ class HunyuanImage3Pipeline(
         if any(snapshot is None for snapshot in snapshots):
             if any(snapshot is not None for snapshot in snapshots):
                 raise ValueError("Cannot mix Hunyuan AR-KV reuse and non-reuse requests in one step batch yet.")
-            for layer in self.model.layers:
+            for _, layer in self._iter_local_dit_layers():
                 layer.self_attn.image_attn._injected_ar_kv = None
             return
 
-        for layer_idx, layer in enumerate(self.model.layers):
+        for layer_idx, layer in self._iter_local_dit_layers():
             injected_rows = []
             for state_idx, branch in zip(row_state_indexes, row_branches):
                 layer_snapshot = snapshots[state_idx][layer_idx]
@@ -762,7 +816,13 @@ class HunyuanImage3Pipeline(
                     f"Missing Hunyuan prompt KV cache for request {states[state_idx].request_id} "
                     "during later denoise step."
                 )
-            prefix_lens.append(int(prompt_kv[0]["lens"][branch].item()))
+            first_local_cache = next((cache for cache in prompt_kv if cache is not None), None)
+            if first_local_cache is None:
+                raise ValueError(
+                    f"Missing Hunyuan local prompt KV cache for request {states[state_idx].request_id} "
+                    "during later denoise step."
+                )
+            prefix_lens.append(int(first_local_cache["lens"][branch].item()))
         return prefix_lens
 
     def _merge_step_model_inputs(
@@ -826,16 +886,18 @@ class HunyuanImage3Pipeline(
         row_branches: list[int],
     ) -> None:
         if states[0].step_index == 0:
-            for layer in self.model.layers:
+            for _, layer in self._iter_local_dit_layers():
                 mgr = layer.self_attn.image_attn
                 mgr.image_kv_cache_map = None
                 mgr.image_kv_cache_lens = None
             return
 
-        for layer_idx, layer in enumerate(self.model.layers):
+        for layer_idx, layer in self._iter_local_dit_layers():
             rows_k, rows_v, lens = [], [], []
             for state_idx, branch in zip(row_state_indexes, row_branches):
                 cache = states[state_idx].extra[_STEP_PROMPT_KV][layer_idx]
+                if cache is None:
+                    raise ValueError("Hunyuan prompt KV cache is incomplete for grouped step execution.")
                 rows_k.append(cache["key"][branch : branch + 1])
                 rows_v.append(cache["value"][branch : branch + 1])
                 lens.append(cache["lens"][branch : branch + 1])
@@ -852,8 +914,10 @@ class HunyuanImage3Pipeline(
         row_state_indexes: list[int],
         row_branches: list[int],
     ) -> None:
-        by_state: dict[int, list[dict[str, torch.Tensor]]] = {i: [] for i in range(len(states))}
-        for layer in self.model.layers:
+        by_state: dict[int, list[dict[str, torch.Tensor] | None]] = {
+            i: [None] * len(self.model.layers) for i in range(len(states))
+        }
+        for layer_idx, layer in self._iter_local_dit_layers():
             mgr = layer.self_attn.image_attn
             if mgr.image_kv_cache_map is None or mgr.image_kv_cache_lens is None:
                 raise ValueError("Hunyuan first step did not produce prompt KV cache.")
@@ -865,13 +929,11 @@ class HunyuanImage3Pipeline(
                 ]
                 state_lens = lens[branch_rows]
                 max_len = int(state_lens.max().item())
-                by_state[state_idx].append(
-                    {
-                        "key": key[branch_rows, :max_len].detach().clone(),
-                        "value": value[branch_rows, :max_len].detach().clone(),
-                        "lens": state_lens.detach().clone(),
-                    }
-                )
+                by_state[state_idx][layer_idx] = {
+                    "key": key[branch_rows, :max_len].detach().clone(),
+                    "value": value[branch_rows, :max_len].detach().clone(),
+                    "lens": state_lens.detach().clone(),
+                }
         for state_idx, cache in by_state.items():
             states[state_idx].extra[_STEP_PROMPT_KV] = cache
 
@@ -1467,6 +1529,7 @@ class HunyuanImage3Pipeline(
                 "num_image_tokens": kwargs.get("num_image_tokens"),
                 "ar_kv_reuse_len": kwargs.get("ar_kv_reuse_len", 0),
                 "full_attn_spans": kwargs.get("full_attn_spans"),
+                "step_image_token_size": kwargs.get("step_image_token_size"),
             }
         )
         return model_inputs
@@ -1485,6 +1548,8 @@ class HunyuanImage3Pipeline(
             "custom_pos_emb": model_kwargs["custom_pos_emb"],
             "num_image_tokens": model_kwargs["num_image_tokens"],
         }
+        if "step_image_token_size" in model_kwargs:
+            updated_model_kwargs["step_image_token_size"] = model_kwargs["step_image_token_size"]
         if "full_attn_spans" in model_kwargs:
             updated_model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"]
 
@@ -1634,8 +1699,17 @@ class HunyuanImage3Pipeline(
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
-    ) -> tuple | CausalMMOutputWithPast:
+        step_image_token_size: tuple[int, int] | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> tuple | CausalMMOutputWithPast | IntermediateTensors:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        pp_group = get_pp_group() if self._step_pipeline_parallel_size() > 1 else None
+        is_pp_non_first = pp_group is not None and not pp_group.is_first_rank
+        if is_pp_non_first:
+            if intermediate_tensors is None:
+                raise RuntimeError("intermediate_tensors must be provided for non-first HunyuanImage3 PP stages.")
+            if mode != "gen_image" or uncond_cfg_prefill:
+                raise RuntimeError("HunyuanImage3 PP forward_call currently supports gen_image denoise steps only.")
         # Sanity Check of Inputs
         self._check_inputs(
             mode == "gen_image" and not uncond_cfg_prefill,
@@ -1672,7 +1746,9 @@ class HunyuanImage3Pipeline(
         )
         custom_pos_emb = self.get_pos_emb(custom_pos_emb, position_ids)
 
-        if input_ids is not None:
+        if is_pp_non_first:
+            inputs_embeds = None
+        elif input_ids is not None:
             inputs_embeds = self.model.embed_tokens(input_ids)
             bsz, seq_len, n_embd = inputs_embeds.shape
         else:
@@ -1682,7 +1758,11 @@ class HunyuanImage3Pipeline(
             n_embd = self.config.hidden_size
 
         # Instantiate placeholder tokens: <timestep>, <img> for the gen image
-        if mode == "gen_text":
+        if is_pp_non_first:
+            if step_image_token_size is None:
+                raise RuntimeError("step_image_token_size must be provided for non-first HunyuanImage3 PP stages.")
+            token_h, token_w = step_image_token_size
+        elif mode == "gen_text":
             # For gen_text, make sure gen_timestep_scatter_index is None
             gen_timestep_scatter_index = None
             token_h, token_w = None, None
@@ -1712,8 +1792,8 @@ class HunyuanImage3Pipeline(
             inputs_embeds = self.instantiate_vit_image_tokens(
                 inputs_embeds, cond_vit_images, cond_vit_image_mask, vit_kwargs
             )
-        assert inputs_embeds is not None
-        bsz, seq_len, n_embd = inputs_embeds.shape
+        if inputs_embeds is not None:
+            bsz, seq_len, n_embd = inputs_embeds.shape
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         from vllm.forward_context import set_forward_context
@@ -1739,7 +1819,10 @@ class HunyuanImage3Pipeline(
                 uncond_cfg_prefill=uncond_cfg_prefill,
                 ar_kv_reuse_len=ar_kv_reuse_len,
                 full_attn_spans=full_attn_spans,
+                intermediate_tensors=intermediate_tensors,
             )
+        if isinstance(outputs, IntermediateTensors):
+            return outputs
         hidden_states = outputs[0]
 
         if mode == "gen_text":
@@ -1752,11 +1835,14 @@ class HunyuanImage3Pipeline(
             diffusion_prediction = None
         else:
             logits = None
-            hidden_states = hidden_states.to(inputs_embeds.device)
-            assert hidden_states.numel() == bsz * seq_len * n_embd, (
-                f"Shape mismatch: {hidden_states.shape} cannot reshape to ({bsz}, {seq_len}, {n_embd})"
-            )
-            hidden_states = hidden_states.reshape(bsz, seq_len, n_embd)
+            if inputs_embeds is not None:
+                hidden_states = hidden_states.to(inputs_embeds.device)
+                assert hidden_states.numel() == bsz * seq_len * n_embd, (
+                    f"Shape mismatch: {hidden_states.shape} cannot reshape to ({bsz}, {seq_len}, {n_embd})"
+                )
+                hidden_states = hidden_states.reshape(bsz, seq_len, n_embd)
+            else:
+                bsz, seq_len, n_embd = hidden_states.shape
             diffusion_prediction = self.ragged_final_layer(
                 hidden_states, image_mask, timestep, token_h, token_w, first_step
             )
@@ -1784,8 +1870,7 @@ class HunyuanImage3Pipeline(
 
         Truncates to positive_reuse_len and sets image_kv_cache_map directly.
         """
-        for layer in self.model.layers:
-            layer_idx = layer.layer_idx
+        for layer_idx, layer in self._iter_local_dit_layers():
             if layer_idx not in ar_kv_data:
                 continue
             kv = ar_kv_data[layer_idx]
@@ -1855,7 +1940,7 @@ class HunyuanImage3Pipeline(
         width = sampling.width or 1024
         image_size = (height, width)
         num_inference_steps = sampling.num_inference_steps or 50
-        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 5.0
+        guidance_scale = self._step_guidance_scale(sampling)
         if guidance_scale <= 1.0:
             logger.info("HunyuanImage3.0 step execution runs without classifier-free guidance.")
         pipe._guidance_scale = guidance_scale
@@ -1881,12 +1966,18 @@ class HunyuanImage3Pipeline(
         image_info = batch_gen_image_info[0]
         target_height = int(_to_python_scalar(image_info.image_height))
         target_width = int(_to_python_scalar(image_info.image_width))
+        image_token_height = _to_python_scalar(image_info.token_height)
+        image_token_width = _to_python_scalar(image_info.token_width)
+        if image_token_height is None or image_token_width is None:
+            raise ValueError("HunyuanImage3 step execution requires image token height and width metadata.")
+        image_token_size = (int(image_token_height), int(image_token_width))
         num_image_tokens = (
             image_info.image_token_length
             + (1 if image_info.add_timestep_token else 0)
             + (1 if image_info.add_guidance_token else 0)
         )
         model_kwargs["num_image_tokens"] = num_image_tokens
+        model_kwargs["step_image_token_size"] = image_token_size
 
         timesteps, _ = retrieve_timesteps(
             self.scheduler,
@@ -1943,6 +2034,7 @@ class HunyuanImage3Pipeline(
             _STEP_GUIDANCE_SCALE: guidance_scale,
             _STEP_CFG_FACTOR: 1 + int(guidance_scale > 1.0),
             _STEP_OUTPUT_SIZE: (target_height, target_width),
+            _STEP_IMAGE_TOKEN_SIZE: image_token_size,
             _STEP_COT_TEXT_LIST: cot_text_list,
             _STEP_AR_KV: self._snapshot_injected_ar_kv(),
         }
@@ -1961,6 +2053,7 @@ class HunyuanImage3Pipeline(
             state.extra[_STEP_CFG_FACTOR],
             tuple(state.latents.shape[1:]),
             model_kwargs.get("num_image_tokens"),
+            state.extra.get(_STEP_IMAGE_TOKEN_SIZE),
             model_kwargs.get("ar_kv_reuse_len", 0),
             state.extra.get(_STEP_AR_KV) is not None,
         )
@@ -2057,12 +2150,18 @@ class HunyuanImage3Pipeline(
                     if cache is None:
                         next_kwargs[key] = value[state_rows]
                     else:
+                        first_local_cache = next((entry for entry in cache if entry is not None), None)
+                        if first_local_cache is None:
+                            raise ValueError(
+                                f"Missing Hunyuan local prompt KV cache for request {state.request_id} "
+                                "while splitting step state."
+                            )
                         compact_masks = []
                         for row_idx in state_rows:
                             branch = row_branches[row_idx]
                             row_mask = value[row_idx : row_idx + 1]
                             query_len = int(row_mask.shape[-2])
-                            prefix_len = int(cache[0]["lens"][branch].item())
+                            prefix_len = int(first_local_cache["lens"][branch].item())
                             max_prefix_len = int(row_mask.shape[-1]) - query_len
                             prefix_mask = row_mask[:, :, :, :prefix_len]
                             current_mask = row_mask[:, :, :, max_prefix_len : max_prefix_len + query_len]
@@ -2089,6 +2188,13 @@ class HunyuanImage3Pipeline(
 
     def _denoise_step_group(self, states: list["DiffusionRequestState"]) -> torch.Tensor:
         first_step, cfg_factor = self._validate_step_group_states(states)
+        pp_enabled = self._step_pipeline_parallel_size() > 1
+        pp_group = get_pp_group() if pp_enabled else None
+        if pp_enabled and cfg_factor > 1:
+            raise ValueError("HunyuanImage3 DiT pipeline parallel step execution supports no-CFG requests only.")
+        if pp_enabled:
+            self._sync_step_pp_send()
+            pp_last_group_rank = self._step_pp_last_group_rank(pp_group)
         row_state_indexes, row_branches = self._step_row_order(states, cfg_factor)
         latents = torch.cat([state.latents for state in states], dim=0)
         latent_model_input = torch.cat([latents] * cfg_factor, dim=0)
@@ -2124,8 +2230,28 @@ class HunyuanImage3Pipeline(
         set_forward_context_denoise_step_idx(context_step_index)
         try:
             with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
-                model_output = self.forward_call(**model_inputs, first_step=first_step)
-                pred = model_output["diffusion_prediction"]
+                intermediate_tensors = None
+                if pp_group is not None and not pp_group.is_first_rank:
+                    intermediate_tensors = AsyncIntermediateTensors(*pp_group.irecv_tensor_dict())
+                model_output = self.forward_call(
+                    **model_inputs,
+                    first_step=first_step,
+                    intermediate_tensors=intermediate_tensors,
+                )
+                if isinstance(model_output, IntermediateTensors):
+                    assert pp_group is not None
+                    self._step_pp_send_work = pp_group.isend_tensor_dict(model_output.tensors)
+                    self._sync_step_pp_send()
+                    broadcasted = pp_group.broadcast_tensor_dict(None, src=pp_last_group_rank)
+                    if broadcasted is None:
+                        raise RuntimeError("HunyuanImage3 PP prediction broadcast did not return a tensor dict.")
+                    pred = broadcasted["pred"]
+                    model_output_for_update = CausalMMOutputWithPast(logits=None, diffusion_prediction=None)
+                else:
+                    pred = model_output["diffusion_prediction"]
+                    model_output_for_update = model_output
+                    if pp_group is not None:
+                        pp_group.broadcast_tensor_dict({"pred": pred}, src=pp_last_group_rank)
         finally:
             set_forward_context_denoise_step_idx(None)
         pred = pred.to(dtype=torch.float32)
@@ -2147,7 +2273,7 @@ class HunyuanImage3Pipeline(
                 dim=0,
             )
 
-        updated_kwargs = self._update_model_kwargs_for_generation(model_output, model_kwargs)
+        updated_kwargs = self._update_model_kwargs_for_generation(model_output_for_update, model_kwargs)
         self._split_merged_kwargs_to_states(states, updated_kwargs, row_state_indexes, row_branches)
         return pred
 
@@ -2196,6 +2322,13 @@ class HunyuanImage3Pipeline(
         state: "DiffusionRequestState",
         **kwargs: Any,
     ) -> DiffusionOutput:
+        pp_group = get_pp_group() if self._step_pipeline_parallel_size() > 1 else None
+        if pp_group is not None and not pp_group.is_first_rank:
+            return DiffusionOutput(
+                output=None,
+                custom_output={},
+                stage_durations=getattr(self, "stage_durations", None),
+            )
         output_type = kwargs.get("output_type", "pil")
         generator = state.extra.get(_STEP_GENERATOR)
         latents = state.latents

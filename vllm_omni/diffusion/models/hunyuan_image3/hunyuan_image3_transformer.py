@@ -51,8 +51,10 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
     make_layers,
 )
+from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -2061,6 +2063,18 @@ class HunyuanImage3Model(nn.Module):
             ),
             prefix=f"{prefix}.layers" if prefix else "layers",
         )
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states"], config.hidden_size
+        )
+        pp_group = get_pp_group()
+        logger.info(
+            "HunyuanImage3 DiT PP rank %d/%d owns decoder layers [%d, %d) of %d",
+            pp_group.rank_in_group,
+            pp_group.world_size,
+            self.start_layer,
+            self.end_layer,
+            config.num_hidden_layers,
+        )
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -2338,15 +2352,16 @@ class HunyuanImage3Model(nn.Module):
                 if name is None:
                     continue
 
-                if is_pp_missing_parameter(name, self):
-                    continue
-
                 if "mlp.gate.wg." in name:
                     name = name.replace("wg.", "")
                 if name == "ln_f.weight":
                     name = "norm.weight"
                 if name == "wte.weight":
                     name = "embed_tokens.weight"
+
+                if is_pp_missing_parameter(name, self):
+                    continue
+
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
@@ -2379,7 +2394,8 @@ class HunyuanImage3Model(nn.Module):
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
-    ) -> tuple | BaseModelOutputWithPast:
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> tuple | BaseModelOutputWithPast | IntermediateTensors:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -2388,11 +2404,18 @@ class HunyuanImage3Model(nn.Module):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if inputs_embeds is None:
+        pp_group = get_pp_group()
+        if not pp_group.is_first_rank:
+            if intermediate_tensors is None:
+                raise RuntimeError("intermediate_tensors must be provided for non-first HunyuanImage3 PP stages.")
+            hidden_states = intermediate_tensors["hidden_states"]
+        elif inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = inputs_embeds
 
         # embed positions
-        hidden_states = inputs_embeds
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -2462,7 +2485,8 @@ class HunyuanImage3Model(nn.Module):
                 k_pad = attention_mask.new_zeros(B, H, Q + pad, pad)
                 attention_mask = torch.cat((attention_mask, k_pad), dim=3)
 
-        for layer_idx, decoder_layer in enumerate(self.layers):
+        for layer_idx in range(self.start_layer, self.end_layer):
+            decoder_layer = self.layers[layer_idx]
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -2494,6 +2518,9 @@ class HunyuanImage3Model(nn.Module):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+
+        if not pp_group.is_last_rank:
+            return IntermediateTensors({"hidden_states": hidden_states})
 
         # add hidden states from the last decoder layer
         if output_hidden_states:

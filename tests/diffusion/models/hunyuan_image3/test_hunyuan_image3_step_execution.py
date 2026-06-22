@@ -5,14 +5,16 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.sequence import IntermediateTensors
 
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, DiffusionOutput
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_AR_KV,
     _STEP_CFG_FACTOR,
     _STEP_GENERATOR,
     _STEP_GUIDANCE_SCALE,
+    _STEP_IMAGE_TOKEN_SIZE,
     _STEP_INPUT_IDS,
     _STEP_MODEL_KWARGS,
     _STEP_PROMPT_KV,
@@ -29,7 +31,7 @@ def _pipeline():
     pipeline._tkwrapper = SimpleNamespace(pad_token_id=0)
     pipeline.od_config = SimpleNamespace(
         diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA")),
-        parallel_config=SimpleNamespace(sequence_parallel_size=1, cfg_parallel_size=1),
+        parallel_config=SimpleNamespace(sequence_parallel_size=1, cfg_parallel_size=1, pipeline_parallel_size=1),
         cache_backend=None,
         diffusion_kv_cache_skip_step_indices=None,
     )
@@ -51,9 +53,11 @@ def _state(request_id: str, step_index: int) -> DiffusionRequestState:
         _STEP_AR_KV: None,
         _STEP_INPUT_IDS: None,
         _STEP_GUIDANCE_SCALE: 1.0,
+        _STEP_IMAGE_TOKEN_SIZE: (2, 2),
         _STEP_MODEL_KWARGS: {
             "num_image_tokens": 17,
             "ar_kv_reuse_len": 0,
+            "step_image_token_size": (2, 2),
         },
     }
     return state
@@ -72,6 +76,7 @@ def _sampling_params(**extra_args):
         guidance_scale_provided=True,
         guidance_rescale=0.0,
         generator=None,
+        past_key_values=None,
     )
 
 
@@ -192,6 +197,207 @@ def test_grouped_denoise_allows_sdpa_attention_backend():
     pipeline = _pipeline()
 
     pipeline._ensure_grouped_attention_backend_supported(2)
+
+
+def test_step_request_rejects_pipeline_parallel_default_cfg():
+    pipeline = _pipeline()
+    pipeline.od_config.parallel_config.pipeline_parallel_size = 2
+    sampling = _sampling_params()
+    sampling.guidance_scale = 5.0
+    sampling.guidance_scale_provided = False
+    state = DiffusionRequestState(request_id="req-pp-cfg", sampling=sampling, prompts=["prompt"])
+
+    with pytest.raises(ValueError, match="supports no-CFG requests only"):
+        pipeline._validate_step_request(state)
+
+
+def test_step_request_allows_pipeline_parallel_effective_no_cfg_without_provided_marker():
+    pipeline = _pipeline()
+    pipeline.od_config.parallel_config.pipeline_parallel_size = 2
+    sampling = _sampling_params()
+    sampling.guidance_scale = 1.0
+    sampling.guidance_scale_provided = False
+    state = DiffusionRequestState(request_id="req-pp-no-cfg", sampling=sampling, prompts=["prompt"])
+
+    pipeline._validate_step_request(state)
+
+
+def test_step_guidance_scale_uses_resolved_sampling_value_without_provided_marker():
+    sampling = _sampling_params()
+    sampling.guidance_scale = 1.0
+    sampling.guidance_scale_provided = False
+
+    assert HunyuanImage3Pipeline._step_guidance_scale(sampling) == 1.0
+
+
+def test_pipeline_parallel_prediction_broadcast_uses_group_local_last_rank():
+    pp_group = SimpleNamespace(world_size=2, ranks=[0, 1, 2])
+
+    assert HunyuanImage3Pipeline._step_pp_last_group_rank(pp_group) == 1
+
+
+def test_step_request_rejects_pipeline_parallel_ar_kv_reuse():
+    pipeline = _pipeline()
+    pipeline.od_config.parallel_config.pipeline_parallel_size = 2
+    sampling = _sampling_params()
+    sampling.past_key_values = object()
+    state = DiffusionRequestState(request_id="req-pp-ar-kv", sampling=sampling, prompts=["prompt"])
+
+    with pytest.raises(ValueError, match="does not support AR-KV reuse"):
+        pipeline._validate_step_request(state)
+
+
+def test_step_group_key_includes_image_token_size():
+    pipeline = _pipeline()
+    states = [_state("req-0", 1), _state("req-1", 1)]
+    states[1].extra[_STEP_IMAGE_TOKEN_SIZE] = (4, 4)
+
+    groups = pipeline._split_step_groups(states)
+
+    assert [[state.request_id for state in group] for group in groups] == [["req-0"], ["req-1"]]
+
+
+class _FakeImageAttn:
+    def __init__(self):
+        self._injected_ar_kv = None
+        self.image_kv_cache_map = None
+        self.image_kv_cache_lens = None
+
+
+class _FakeLayer:
+    def __init__(self):
+        self.self_attn = SimpleNamespace(image_attn=_FakeImageAttn())
+
+
+def test_pipeline_parallel_kv_state_skips_missing_layers():
+    pipeline = _pipeline()
+    local_layer = _FakeLayer()
+    other_local_layer = _FakeLayer()
+    pipeline.model = SimpleNamespace(layers=[object(), local_layer, other_local_layer])
+
+    local_layer.self_attn.image_attn._injected_ar_kv = [
+        (torch.ones(2, 1), torch.full((2, 1), 2.0)),
+    ]
+
+    snapshot = pipeline._snapshot_injected_ar_kv()
+
+    assert snapshot is not None
+    assert snapshot[0] is None
+    assert snapshot[1] is not None
+    assert snapshot[2] is None
+    assert local_layer.self_attn.image_attn._injected_ar_kv is None
+
+    key = torch.arange(4, dtype=torch.float32).reshape(1, 4, 1)
+    value = key + 10
+    lens = torch.tensor([4])
+    local_layer.self_attn.image_attn.image_kv_cache_map = (key, value)
+    local_layer.self_attn.image_attn.image_kv_cache_lens = lens
+    other_local_layer.self_attn.image_attn.image_kv_cache_map = (key + 20, value + 20)
+    other_local_layer.self_attn.image_attn.image_kv_cache_lens = lens
+    state = _state("req-pp-kv", 0)
+
+    pipeline._capture_prompt_kv_cache([state], [0], [0])
+
+    prompt_kv = state.extra[_STEP_PROMPT_KV]
+    assert prompt_kv[0] is None
+    assert prompt_kv[1] is not None
+    assert prompt_kv[2] is not None
+
+    state.step_index = 1
+    assert pipeline._prompt_kv_prefix_lens([state], [0], [0]) == [4]
+    local_layer.self_attn.image_attn.image_kv_cache_map = None
+    other_local_layer.self_attn.image_attn.image_kv_cache_map = None
+
+    pipeline._restore_prompt_kv_cache([state], [0], [0])
+
+    restored_key, restored_value = local_layer.self_attn.image_attn.image_kv_cache_map
+    torch.testing.assert_close(restored_key, key)
+    torch.testing.assert_close(restored_value, value)
+
+    merged_kwargs = {"attention_mask": torch.ones(1, 1, 2, 6, dtype=torch.bool)}
+    pipeline._split_merged_kwargs_to_states([state], merged_kwargs, [0], [0])
+
+    assert state.extra[_STEP_MODEL_KWARGS]["attention_mask"].shape == (1, 1, 2, 6)
+
+
+class _FakeWork:
+    def __init__(self):
+        self.waited = False
+
+    def wait(self):
+        self.waited = True
+
+
+class _FakePPGroup:
+    world_size = 2
+    is_first_rank = True
+    is_last_rank = False
+
+    def __init__(self, pred: torch.Tensor):
+        self.pred = pred
+        self.sent: dict[str, torch.Tensor] | None = None
+        self.work = _FakeWork()
+
+    def isend_tensor_dict(self, tensor_dict):
+        self.sent = dict(tensor_dict)
+        return [self.work]
+
+    def broadcast_tensor_dict(self, tensor_dict=None, src=0):
+        assert tensor_dict is None
+        assert src == 1
+        return {"pred": self.pred}
+
+
+def test_pipeline_parallel_non_last_rank_sends_intermediate_and_uses_broadcast_pred(monkeypatch):
+    pipeline = _pipeline()
+    pipeline.od_config.parallel_config.pipeline_parallel_size = 2
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
+    pp_group = _FakePPGroup(torch.tensor([[7.0]]))
+    monkeypatch.setattr(hy3_module, "get_pp_group", lambda: pp_group)
+
+    state = _state("req-pp", 1)
+    state.latents = torch.zeros(1, 1)
+    state.extra[_STEP_MODEL_KWARGS].update(
+        {
+            "mode": "gen_image",
+            "custom_pos_emb": (torch.zeros(1, 2, 1), torch.zeros(1, 2, 1)),
+            "position_ids": torch.tensor([[0, 1]]),
+            "attention_mask": torch.ones(1, 1, 2, 2, dtype=torch.bool),
+            "gen_timestep_scatter_index": torch.tensor([[0]]),
+            "full_attn_spans": [[(0, 2)]],
+        }
+    )
+    state.extra[_STEP_PROMPT_KV] = [{"lens": torch.tensor([0])}]
+
+    pipeline._restore_prompt_kv_cache = lambda *args, **kwargs: None
+    pipeline.prepare_inputs_for_generation = lambda input_ids, images, timestep, **model_kwargs: {
+        **model_kwargs,
+        "input_ids": input_ids,
+        "images": images,
+        "timestep": timestep,
+    }
+    pipeline.forward_call = lambda **kwargs: IntermediateTensors({"hidden_states": torch.ones(1, 2, 3)})
+
+    out = pipeline.denoise_step(InputBatch.make_batch([state]))
+
+    torch.testing.assert_close(out, torch.tensor([[7.0]]))
+    assert pp_group.sent is not None
+    torch.testing.assert_close(pp_group.sent["hidden_states"], torch.ones(1, 2, 3))
+    assert pp_group.work.waited
+
+
+def test_pipeline_parallel_non_first_rank_skips_post_decode(monkeypatch):
+    pipeline = _pipeline()
+    pipeline.od_config.parallel_config.pipeline_parallel_size = 2
+    state = _state("req-pp-decode", 1)
+
+    pp_group = SimpleNamespace(world_size=2, is_first_rank=False)
+    monkeypatch.setattr(hy3_module, "get_pp_group", lambda: pp_group)
+
+    output = pipeline.post_decode(state)
+
+    assert isinstance(output, DiffusionOutput)
+    assert output.output is None
 
 
 def test_step_scheduler_preserves_latent_dtype_for_mixed_progress_batches():

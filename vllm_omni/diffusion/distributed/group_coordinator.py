@@ -287,9 +287,10 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return obj
-        if self.shm_broadcaster is not None:
+        shm_broadcaster = getattr(self, "shm_broadcaster", None)
+        if shm_broadcaster is not None:
             assert src == 0, "Shared memory broadcaster only supports src=0"
-            return self.shm_broadcaster.broadcast_object(obj)
+            return shm_broadcaster.broadcast_object(obj)
         if self.rank_in_group == src:
             torch.distributed.broadcast_object_list([obj], src=self.ranks[src], group=self.cpu_group)
             return obj
@@ -378,6 +379,7 @@ class GroupCoordinator:
         group = self.device_group
         metadata_group = self.cpu_group
         assert src < self.world_size, f"Invalid src rank ({src})"
+        src_rank_in_group = src
         src = self.ranks[src]
 
         rank = self.rank
@@ -388,7 +390,7 @@ class GroupCoordinator:
             # `metadata_list` lives in CPU memory.
             # `broadcast_object_list` has serialization & deserialization,
             # all happening on CPU. Therefore, we can use the CPU group.
-            self.broadcast_object(metadata_list, src=src)
+            self.broadcast_object(metadata_list, src=src_rank_in_group)
             async_handles = []
             for tensor in tensor_list:
                 if tensor.numel() == 0:
@@ -405,7 +407,7 @@ class GroupCoordinator:
                 async_handle.wait()
 
         else:
-            metadata_list = self.broadcast_object(None, src=src)
+            metadata_list = self.broadcast_object(None, src=src_rank_in_group)
             tensor_dict = {}
             async_handles = []
             for key, value in metadata_list:
