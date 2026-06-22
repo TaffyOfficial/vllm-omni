@@ -13,7 +13,11 @@ from vllm.transformers_utils.repo_utils import file_or_path_exists
 
 from vllm_omni.config.stage_config import StageConfigFactory
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
-from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
+from vllm_omni.diffusion.utils.hf_utils import (
+    _looks_like_dreamzero,
+    _looks_like_public_mainecoon_report_repo,
+    _raise_public_mainecoon_artifact_error,
+)
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -281,6 +285,8 @@ def resolve_model_config_path(model: str) -> str:
             # YAML filenames before giving up.
             model_type = _try_resolve_omni_model_type(model)
             if model_type is None:
+                if _looks_like_public_mainecoon_report_repo(model):
+                    _raise_public_mainecoon_artifact_error(model)
                 raise ValueError(
                     f"Could not determine model_type for model: {model}. "
                     f"Model is not in standard transformers format and does not have model_index.json. "

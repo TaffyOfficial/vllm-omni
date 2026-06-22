@@ -313,6 +313,24 @@ class TestResolveModelConfigPath:
         assert result is not None
         assert "glm_image.yaml" in result
 
+    def test_mainecoon_report_repo_requires_runnable_artifacts(self, mocker: MockerFixture):
+        """Current public MaineCoon repo fails with an actionable artifact error."""
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.get_config",
+            side_effect=ValueError("missing config"),
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.file_or_path_exists",
+            return_value=False,
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils._try_resolve_omni_model_type",
+            return_value=None,
+        )
+
+        with pytest.raises(ValueError, match="MaineCoon report repository"):
+            resolve_model_config_path("catnip-ai-tech/MaineCoon")
+
 
 class TestLoadAndResolveStageConfigs:
     def test_load_and_resolve_with_kwargs(self):

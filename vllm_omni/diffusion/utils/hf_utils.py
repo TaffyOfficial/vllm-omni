@@ -8,6 +8,29 @@ from vllm.transformers_utils.config import get_hf_file_to_dict
 logger = init_logger(__name__)
 
 
+_MAINECOON_REPORT_REPO = "catnip-ai-tech/mainecoon"
+
+
+def _normalize_hf_repo_id(model_name: str) -> str:
+    return model_name.strip().replace("\\", "/").rstrip("/").lower()
+
+
+def _looks_like_public_mainecoon_report_repo(model_name: str) -> bool:
+    """Match the current public MaineCoon report-only repository."""
+    return _normalize_hf_repo_id(model_name) == _MAINECOON_REPORT_REPO
+
+
+def _raise_public_mainecoon_artifact_error(model_name: str) -> None:
+    raise ValueError(
+        f"{model_name!r} matches the public MaineCoon report repository, "
+        "which does not publish runnable vLLM-Omni artifacts yet. "
+        "The current repository is missing config.json, model_index.json, "
+        "tokenizer files, model weights, and an inference pipeline. "
+        "Use a runnable MaineCoon checkpoint/source release with a supported "
+        "model_type or model_index.json before loading it with vLLM-Omni."
+    )
+
+
 def load_diffusers_config(model_name) -> dict:
     from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 

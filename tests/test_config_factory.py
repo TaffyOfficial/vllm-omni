@@ -541,6 +541,21 @@ class TestPipelineDiscovery:
         )
         assert p.hf_architectures == ("SomeCollidingArch",)
 
+    def test_mainecoon_report_repo_requires_runnable_artifacts(self, mocker):
+        """Current public MaineCoon repo is a report/demo repo, not loadable artifacts."""
+
+        mocker.patch(
+            "vllm.transformers_utils.config.get_config",
+            side_effect=ValueError("missing config"),
+        )
+        mocker.patch(
+            "vllm.transformers_utils.config.get_hf_file_to_dict",
+            return_value=None,
+        )
+
+        with pytest.raises(ValueError, match="MaineCoon report repository"):
+            StageConfigFactory._auto_detect_model_type("catnip-ai-tech/MaineCoon")
+
 
 class TestStagePipelineConfig:
     def test_frozen(self):

@@ -1323,6 +1323,14 @@ class StageConfigFactory:
         except Exception as e:
             logger.debug(f"Failed to detect model type for diffusers-style models: {e}")
 
+        from vllm_omni.diffusion.utils.hf_utils import (
+            _looks_like_public_mainecoon_report_repo,
+            _raise_public_mainecoon_artifact_error,
+        )
+
+        if _looks_like_public_mainecoon_report_repo(model):
+            _raise_public_mainecoon_artifact_error(model)
+
         # Final fallback: some models (e.g. CosyVoice3) ship an empty
         # config.json and rely on naming conventions. Match the model path
         # basename against registered pipeline keys — longest match wins
