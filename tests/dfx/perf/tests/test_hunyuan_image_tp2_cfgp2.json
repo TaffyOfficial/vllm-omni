@@ -26,8 +26,8 @@
                 "baseline": {
                     "throughput_qps": 0.21,
                     "latency_p99": 4.7469,
-                    "peak_memory_mb_max": 101100,
-                    "peak_memory_mb_mean": 101100
+                    "peak_memory_mb_max": 104664.1,
+                    "peak_memory_mb_mean": 104664.1
                 }
             }
         ]
