@@ -26,6 +26,10 @@ stages:
     omni_kv_config:
       need_recv_cache: true
       recv_timeout: 30.0
+      allow_request_id_suffix_fallback: true
+      rank_mapping:
+        from_tp: 4
+        to_tp: 4
     input_connectors:
       from_stage_0: shared_memory_connector
     parallel_config:

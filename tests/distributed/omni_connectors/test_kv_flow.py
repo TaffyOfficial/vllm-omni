@@ -251,21 +251,7 @@ def test_receive_kv_cache_uses_exponential_backoff(monkeypatch):
     assert sleep_intervals == pytest.approx([0.01, 0.02, 0.04, 0.08, 0.16])
 
 
-def test_receive_kv_cache_falls_back_to_external_request_id_base():
-    config = OmniKVCacheConfig(
-        connector_config={"type": "mock"},
-        from_stage="0",
-        stage_id="1",
-        need_recv_cache=True,
-        recv_timeout=0.1,
-    )
-    manager = OmniKVTransferManager(config)
-    connector = MockConnector()
-    manager._connector = connector
-    manager.kv_recv_key_builder = lambda req_id, from_stage, to_stage: [
-        get_kv_connector_key(req_id=req_id, from_stage=from_stage, chunk_id=0, from_rank=0, to_rank=0)
-    ]
-
+def _put_external_base_request_payload(connector: MockConnector):
     key_cache = [torch.ones(2, 1, 3)]
     value_cache = [torch.full((2, 1, 3), 2.0)]
     payload = {
@@ -280,6 +266,47 @@ def test_receive_kv_cache_falls_back_to_external_request_id_base():
         to_rank=0,
     )
     connector.put("0", "1", fallback_key, payload)
+    return payload
+
+
+def test_receive_kv_cache_does_not_fallback_to_external_request_id_base_by_default():
+    config = OmniKVCacheConfig(
+        connector_config={"type": "mock"},
+        from_stage="0",
+        stage_id="1",
+        need_recv_cache=True,
+        recv_timeout=0.01,
+    )
+    manager = OmniKVTransferManager(config)
+    connector = MockConnector()
+    manager._connector = connector
+    manager.kv_recv_key_builder = lambda req_id, from_stage, to_stage: [
+        get_kv_connector_key(req_id=req_id, from_stage=from_stage, chunk_id=0, from_rank=0, to_rank=0)
+    ]
+    _put_external_base_request_payload(connector)
+
+    data, size = manager.receive_kv_cache_for_request("chatcmpl-bench-req-deadbeef")
+
+    assert data is None
+    assert size == 0
+
+
+def test_receive_kv_cache_falls_back_to_external_request_id_base_when_enabled():
+    config = OmniKVCacheConfig(
+        connector_config={"type": "mock"},
+        from_stage="0",
+        stage_id="1",
+        need_recv_cache=True,
+        recv_timeout=0.1,
+        allow_request_id_suffix_fallback=True,
+    )
+    manager = OmniKVTransferManager(config)
+    connector = MockConnector()
+    manager._connector = connector
+    manager.kv_recv_key_builder = lambda req_id, from_stage, to_stage: [
+        get_kv_connector_key(req_id=req_id, from_stage=from_stage, chunk_id=0, from_rank=0, to_rank=0)
+    ]
+    payload = _put_external_base_request_payload(connector)
 
     data, size = manager.receive_kv_cache_for_request("chatcmpl-bench-req-deadbeef")
 

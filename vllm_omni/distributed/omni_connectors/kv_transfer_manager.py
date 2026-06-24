@@ -76,6 +76,7 @@ class OmniKVCacheConfig:
     recv_timeout: float = 30.0
     from_tp: int = 1
     to_tp: int = 1
+    allow_request_id_suffix_fallback: bool = False
 
 
 @dataclass
@@ -344,9 +345,11 @@ class OmniKVTransferManager:
             except Exception as e:
                 logger.warning("Failed to eagerly initialize sender connector: %s", e)
 
-    @staticmethod
-    def _request_id_key_candidates(request_id: str) -> list[str]:
+    def _request_id_key_candidates(self, request_id: str) -> list[str]:
         candidates = [request_id]
+        if not self.config.allow_request_id_suffix_fallback:
+            return candidates
+
         base_request_id = re.sub(r"-[0-9a-fA-F]{8}$", "", request_id)
         if base_request_id != request_id:
             candidates.append(base_request_id)
@@ -378,6 +381,7 @@ class OmniKVTransferManager:
                 recv_timeout=cfg.get("recv_timeout", 30.0),
                 from_tp=int(rank_mapping.get("from_tp", 1)),
                 to_tp=int(rank_mapping.get("to_tp", 1)),
+                allow_request_id_suffix_fallback=cfg.get("allow_request_id_suffix_fallback", False),
             )
         )
 
