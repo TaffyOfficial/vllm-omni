@@ -115,10 +115,6 @@ _DEFAULT_SYNTHETIC_AR_TEXT = (
 )
 
 
-def attach_synthetic_ar_kv_request_context(req: RequestFuncInput, ar_generated_text: str) -> None:
-    req.extra_body.setdefault("ar_generated_text", ar_generated_text)
-
-
 class BaseDataset(ABC):
     def __init__(self, args, api_url: str, model: str):
         self.args = args
@@ -1199,7 +1195,7 @@ async def benchmark(args):
     if args.synthetic_ar_kv:
         if args.endpoint != "/v1/chat/completions":
             raise ValueError("--synthetic-ar-kv currently supports --endpoint /v1/chat/completions only.")
-        from kv_reuse import SyntheticARKVConfig, SyntheticARKVProducer
+        from kv_reuse import SyntheticARKVConfig, SyntheticARKVProducer, attach_synthetic_ar_kv_request_context
 
         synthetic_kv_config = SyntheticARKVConfig(
             num_layers=args.synthetic_ar_kv_layers,

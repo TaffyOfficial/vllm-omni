@@ -8,7 +8,6 @@ import torch
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import KVCacheTransferData
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import get_kv_connector_key
 
-
 _DTYPES = {
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
@@ -54,6 +53,10 @@ class SyntheticKVSendResult:
     request_id: str
     connector_keys: list[str]
     bytes_sent: int
+
+
+def attach_synthetic_ar_kv_request_context(req: Any, ar_generated_text: str) -> None:
+    req.extra_body.setdefault("ar_generated_text", ar_generated_text)
 
 
 class SyntheticARKVProducer:

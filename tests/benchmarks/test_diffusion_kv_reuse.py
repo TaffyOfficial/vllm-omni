@@ -2,8 +2,11 @@ import pytest
 import torch
 
 from benchmarks.diffusion.backends import RequestFuncInput
-from benchmarks.diffusion.diffusion_benchmark_serving import attach_synthetic_ar_kv_request_context
-from benchmarks.diffusion.kv_reuse import SyntheticARKVConfig, SyntheticARKVProducer
+from benchmarks.diffusion.kv_reuse import (
+    SyntheticARKVConfig,
+    SyntheticARKVProducer,
+    attach_synthetic_ar_kv_request_context,
+)
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import KVCacheTransferData
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
