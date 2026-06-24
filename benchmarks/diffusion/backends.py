@@ -191,6 +191,7 @@ async def async_request_chat_completions(
     payload = {
         "model": input.model,
         "messages": messages,
+        "request_id": input.request_id,
     }
     if extra_body:
         payload["extra_body"] = extra_body

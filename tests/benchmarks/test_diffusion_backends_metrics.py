@@ -29,8 +29,10 @@ class _MockResponse:
 class _MockSession:
     def __init__(self, payload: dict):
         self._payload = payload
+        self.posts = []
 
     def post(self, *args, **kwargs):
+        self.posts.append((args, kwargs))
         return _MockResponse(self._payload)
 
 
@@ -96,6 +98,28 @@ async def test_chat_completions_metrics_fallback_to_top_level():
     assert output.success is True
     assert output.stage_durations == {"diffusion": 1.25}
     assert output.peak_memory_mb == 4096.0
+
+
+@pytest.mark.core_model
+@pytest.mark.benchmark
+@pytest.mark.cpu
+@pytest.mark.asyncio
+async def test_chat_completions_payload_includes_request_id():
+    payload = {"choices": [{"message": {"content": []}}]}
+    session = _MockSession(payload)
+
+    output = await async_request_chat_completions(
+        RequestFuncInput(
+            prompt="draw a dog",
+            api_url="http://test.local/v1/chat/completions",
+            model="test-model",
+            request_id="bench-req-1",
+        ),
+        session=session,
+    )
+
+    assert output.success is True
+    assert session.posts[0][1]["json"]["request_id"] == "bench-req-1"
 
 
 @pytest.mark.core_model

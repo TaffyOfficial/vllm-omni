@@ -925,6 +925,7 @@ async def _run_warmups(
     args,
     session: aiohttp.ClientSession,
     request_func,
+    prepare_request=None,
 ) -> list[tuple[RequestFuncInput, RequestFuncOutput]]:
     if not args.warmup_requests or not requests_list:
         return []
@@ -943,6 +944,8 @@ async def _run_warmups(
         req: RequestFuncInput,
     ) -> RequestFuncOutput:
         async with warmup_semaphore:
+            if prepare_request is not None:
+                prepare_request(req)
             return await request_func(req, session, None)
 
     warmup_tasks = [asyncio.create_task(limited_warmup_request_func(req)) for req in warmup_requests]
@@ -1182,6 +1185,40 @@ async def benchmark(args):
         for req in requests_list:
             req.default_bot_task = args.bot_task
 
+    synthetic_kv_producer = None
+    synthetic_kv_bytes_sent = 0
+    synthetic_kv_payloads_sent = 0
+    if args.synthetic_ar_kv:
+        if args.endpoint != "/v1/chat/completions":
+            raise ValueError("--synthetic-ar-kv currently supports --endpoint /v1/chat/completions only.")
+        from kv_reuse import SyntheticARKVConfig, SyntheticARKVProducer
+
+        synthetic_kv_config = SyntheticARKVConfig(
+            num_layers=args.synthetic_ar_kv_layers,
+            seq_len=args.synthetic_ar_kv_seq_len,
+            num_heads=args.synthetic_ar_kv_num_heads,
+            head_dim=args.synthetic_ar_kv_head_dim,
+            dtype=args.synthetic_ar_kv_dtype,
+            device=args.synthetic_ar_kv_device,
+            from_stage=str(args.synthetic_ar_kv_from_stage),
+            to_stage=str(args.synthetic_ar_kv_to_stage),
+            from_tp=args.synthetic_ar_kv_from_tp,
+            to_tp=args.synthetic_ar_kv_to_tp,
+            request_id_prefix=args.synthetic_ar_kv_request_id_prefix,
+            shm_threshold_bytes=args.synthetic_ar_kv_shm_threshold_bytes,
+        )
+        synthetic_kv_producer = SyntheticARKVProducer(synthetic_kv_config)
+        print(f"Synthetic AR KV enabled: {synthetic_kv_config}")
+
+    def prepare_request(req: RequestFuncInput, *, record: bool = True) -> None:
+        nonlocal synthetic_kv_bytes_sent, synthetic_kv_payloads_sent
+        if synthetic_kv_producer is None:
+            return
+        result = synthetic_kv_producer.prepare(req.request_id)
+        if record:
+            synthetic_kv_bytes_sent += result.bytes_sent
+            synthetic_kv_payloads_sent += len(result.connector_keys)
+
     # Limit concurrency
     if args.max_concurrency is not None:
         semaphore = asyncio.Semaphore(args.max_concurrency)
@@ -1191,8 +1228,10 @@ async def benchmark(args):
     async def limited_request_func(req, session, pbar):
         if semaphore:
             async with semaphore:
+                prepare_request(req)
                 return await request_func(req, session, pbar)
         else:
+            prepare_request(req)
             return await request_func(req, session, pbar)
 
     # Run benchmark
@@ -1204,6 +1243,7 @@ async def benchmark(args):
             args=args,
             session=session,
             request_func=request_func,
+            prepare_request=lambda req: prepare_request(req, record=False),
         )
 
         if args.slo:
@@ -1235,6 +1275,11 @@ async def benchmark(args):
     metrics["task"] = args.task
     if args.endpoint == "/v1/images/edits":
         metrics["bot_task"] = args.bot_task
+    if synthetic_kv_producer is not None:
+        metrics["synthetic_ar_kv"] = {
+            "payloads_sent": synthetic_kv_payloads_sent,
+            "bytes_sent": synthetic_kv_bytes_sent,
+        }
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
 
@@ -1462,6 +1507,39 @@ if __name__ == "__main__":
         "--return-stage-metrics",
         action="store_true",
         help="Request stage duration metrics from endpoints that support return_stage_metrics.",
+    )
+    parser.add_argument(
+        "--synthetic-ar-kv",
+        action="store_true",
+        help="Write synthetic AR KV payloads before each chat/completions request for DiT-only pressure tests.",
+    )
+    parser.add_argument("--synthetic-ar-kv-layers", type=int, default=32, help="Synthetic KV layer count.")
+    parser.add_argument("--synthetic-ar-kv-seq-len", type=int, default=1024, help="Synthetic KV sequence length.")
+    parser.add_argument("--synthetic-ar-kv-num-heads", type=int, default=8, help="Synthetic KV heads per shard.")
+    parser.add_argument("--synthetic-ar-kv-head-dim", type=int, default=128, help="Synthetic KV head dimension.")
+    parser.add_argument(
+        "--synthetic-ar-kv-dtype",
+        type=str,
+        default="float16",
+        choices=["float16", "bfloat16", "float32"],
+        help="Synthetic KV tensor dtype.",
+    )
+    parser.add_argument("--synthetic-ar-kv-device", type=str, default="cpu", help="Device used to build KV tensors.")
+    parser.add_argument("--synthetic-ar-kv-from-stage", type=str, default="0", help="Synthetic KV source stage id.")
+    parser.add_argument("--synthetic-ar-kv-to-stage", type=str, default="0", help="Synthetic KV target stage id.")
+    parser.add_argument("--synthetic-ar-kv-from-tp", type=int, default=1, help="Synthetic AR/source TP size.")
+    parser.add_argument("--synthetic-ar-kv-to-tp", type=int, default=1, help="Synthetic DiT/target TP size.")
+    parser.add_argument(
+        "--synthetic-ar-kv-request-id-prefix",
+        type=str,
+        default="chatcmpl-",
+        help="Prefix serving_chat adds before the benchmark request_id. Use empty string for non-chat IDs.",
+    )
+    parser.add_argument(
+        "--synthetic-ar-kv-shm-threshold-bytes",
+        type=int,
+        default=0,
+        help="SharedMemoryConnector threshold for synthetic KV payloads.",
     )
 
     args = parser.parse_args()

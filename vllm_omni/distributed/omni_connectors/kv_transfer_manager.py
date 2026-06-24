@@ -3,6 +3,7 @@
 """Unified OmniConnector and KV cache transfer management."""
 
 import json
+import re
 import struct
 import time
 from collections.abc import Callable
@@ -342,6 +343,14 @@ class OmniKVTransferManager:
                 logger.info("Sender connector eagerly initialized")
             except Exception as e:
                 logger.warning("Failed to eagerly initialize sender connector: %s", e)
+
+    @staticmethod
+    def _request_id_key_candidates(request_id: str) -> list[str]:
+        candidates = [request_id]
+        base_request_id = re.sub(r"-[0-9a-fA-F]{8}$", "", request_id)
+        if base_request_id != request_id:
+            candidates.append(base_request_id)
+        return candidates
 
     # ------------------------------------------------------------------ #
     #  Factory helpers
@@ -1026,42 +1035,55 @@ class OmniKVTransferManager:
         max_poll_interval = 0.5
 
         topo = self._tp_topo
+        request_id_candidates = self._request_id_key_candidates(request_id)
         recv_key_pairs = build_rank_aware_recv_keys(
-            request_id, from_stage, to_stage, topo, hook=self.kv_recv_key_builder
+            request_id_candidates[0], from_stage, to_stage, topo, hook=self.kv_recv_key_builder
         )
-        pending_pairs = list(recv_key_pairs)
-        received_payloads: dict[str, tuple[dict[str, Any], int]] = {}
+        recv_key_options: list[list[tuple[str, int | None]]] = [[pair] for pair in recv_key_pairs]
+        for request_id_candidate in request_id_candidates[1:]:
+            candidate_pairs = build_rank_aware_recv_keys(
+                request_id_candidate, from_stage, to_stage, topo, hook=self.kv_recv_key_builder
+            )
+            if len(candidate_pairs) == len(recv_key_options):
+                for idx, pair in enumerate(candidate_pairs):
+                    recv_key_options[idx].append(pair)
+
+        pending_indexes = set(range(len(recv_key_options)))
+        received_payloads: dict[int, tuple[dict[str, Any], int]] = {}
 
         logger.info(
             "Wait for KV cache for request %s from stage %s to %s via %s key(s)...",
             request_id,
             from_stage,
             to_stage,
-            len(recv_key_pairs),
+            sum(len(options) for options in recv_key_options),
         )
 
         try:
             while True:
                 link_start = time.perf_counter()
-                for get_key, from_rank in list(pending_pairs):
-                    # Construct per-rank metadata so the connector queries
-                    # the correct sender endpoint (heterogeneous TP path).
-                    # When from_rank is None (TP<=1), metadata stays None
-                    # and the connector falls back to its default sender.
-                    rank_metadata: dict[str, Any] | None = None
-                    if from_rank is not None and self._sender_base_host and self._sender_base_zmq_port is not None:
-                        rank_metadata = {
-                            "source_host": self._sender_base_host,
-                            "source_port": self._sender_base_zmq_port + from_rank * KV_RANK_PORT_STRIDE,
-                        }
+                for option_index in list(pending_indexes):
+                    for get_key, from_rank in recv_key_options[option_index]:
+                        # Construct per-rank metadata so the connector queries
+                        # the correct sender endpoint (heterogeneous TP path).
+                        # When from_rank is None (TP<=1), metadata stays None
+                        # and the connector falls back to its default sender.
+                        rank_metadata: dict[str, Any] | None = None
+                        if from_rank is not None and self._sender_base_host and self._sender_base_zmq_port is not None:
+                            rank_metadata = {
+                                "source_host": self._sender_base_host,
+                                "source_port": self._sender_base_zmq_port + from_rank * KV_RANK_PORT_STRIDE,
+                            }
 
-                    result = self.connector.get(
-                        from_stage=from_stage,
-                        to_stage=to_stage,
-                        get_key=get_key,
-                        metadata=rank_metadata,
-                    )
-                    if not result:
+                        result = self.connector.get(
+                            from_stage=from_stage,
+                            to_stage=to_stage,
+                            get_key=get_key,
+                            metadata=rank_metadata,
+                        )
+                        if result:
+                            break
+                    else:
                         continue
 
                     raw_data, size = result
@@ -1095,14 +1117,14 @@ class OmniKVTransferManager:
                     else:
                         data = raw_data
 
-                    received_payloads[get_key] = (data, size)
-                    pending_pairs.remove((get_key, from_rank))
+                    received_payloads[option_index] = (data, size)
+                    pending_indexes.remove(option_index)
 
-                if not pending_pairs and received_payloads:
+                if not pending_indexes and received_payloads:
                     elapsed = time.time() - start_time
                     link_ms = (time.perf_counter() - link_start) * 1000
-                    ordered_payloads = [received_payloads[key][0] for key, _ in recv_key_pairs]
-                    total_size = sum(received_payloads[key][1] for key, _ in recv_key_pairs)
+                    ordered_payloads = [received_payloads[idx][0] for idx in range(len(recv_key_options))]
+                    total_size = sum(received_payloads[idx][1] for idx in range(len(recv_key_options)))
 
                     if len(ordered_payloads) == 1:
                         data = ordered_payloads[0]
@@ -1129,7 +1151,7 @@ class OmniKVTransferManager:
                         "Successfully received KV cache for %s, %s bytes across %s key(s), wait=%.3fs, link=%.1fms",
                         request_id,
                         total_size,
-                        len(recv_key_pairs),
+                        len(recv_key_options),
                         elapsed,
                         link_ms,
                     )

@@ -13,6 +13,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
 )
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import normalize_layer_kv
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import get_kv_connector_key
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.cache]
@@ -249,6 +250,42 @@ def test_receive_kv_cache_uses_exponential_backoff(monkeypatch):
 
     assert (data, size) == (None, 0)
     assert sleep_intervals == pytest.approx([0.01, 0.02, 0.04, 0.08, 0.16])
+
+
+def test_receive_kv_cache_falls_back_to_external_request_id_base():
+    config = OmniKVCacheConfig(
+        connector_config={"type": "mock"},
+        from_stage="0",
+        stage_id="1",
+        need_recv_cache=True,
+        recv_timeout=0.1,
+    )
+    manager = OmniKVTransferManager(config)
+    connector = MockConnector()
+    manager._connector = connector
+    manager.kv_recv_key_builder = lambda req_id, from_stage, to_stage: [
+        get_kv_connector_key(req_id=req_id, from_stage=from_stage, chunk_id=0, from_rank=0, to_rank=0)
+    ]
+
+    key_cache = [torch.ones(2, 1, 3)]
+    value_cache = [torch.full((2, 1, 3), 2.0)]
+    payload = {
+        "layer_blocks": {"key_cache": key_cache, "value_cache": value_cache},
+        "metadata": {"seq_len": 2},
+    }
+    fallback_key = get_kv_connector_key(
+        req_id="chatcmpl-bench-req",
+        from_stage="0",
+        chunk_id=0,
+        from_rank=0,
+        to_rank=0,
+    )
+    connector.put("0", "1", fallback_key, payload)
+
+    data, size = manager.receive_kv_cache_for_request("chatcmpl-bench-req-deadbeef")
+
+    assert size > 0
+    assert data is payload
 
 
 def test_manager_extraction_tuple_layout(kv_config, mock_connector, common_constants):
