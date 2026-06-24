@@ -21,7 +21,7 @@ class SyntheticARKVConfig:
     seq_len: int
     num_heads: int
     head_dim: int
-    dtype: str = "float16"
+    dtype: str = "bfloat16"
     device: str = "cpu"
     from_stage: str = "-1"
     to_stage: str = "0"

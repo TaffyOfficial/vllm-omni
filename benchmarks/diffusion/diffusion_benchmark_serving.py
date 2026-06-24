@@ -1525,7 +1525,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--synthetic-ar-kv-dtype",
         type=str,
-        default="float16",
+        default="bfloat16",
         choices=["float16", "bfloat16", "float32"],
         help="Synthetic KV tensor dtype.",
     )

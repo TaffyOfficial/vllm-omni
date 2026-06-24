@@ -36,6 +36,7 @@ def test_synthetic_ar_kv_producer_writes_rank_aware_payloads():
             seq_len=4,
             num_heads=3,
             head_dim=5,
+            dtype="float16",
             from_stage="0",
             to_stage="0",
             from_tp=1,
