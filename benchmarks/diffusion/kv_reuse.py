@@ -23,7 +23,7 @@ class SyntheticARKVConfig:
     head_dim: int
     dtype: str = "float16"
     device: str = "cpu"
-    from_stage: str = "0"
+    from_stage: str = "-1"
     to_stage: str = "0"
     from_tp: int = 1
     to_tp: int = 1

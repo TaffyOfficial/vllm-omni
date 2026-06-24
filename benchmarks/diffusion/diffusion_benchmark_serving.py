@@ -1530,7 +1530,12 @@ if __name__ == "__main__":
         help="Synthetic KV tensor dtype.",
     )
     parser.add_argument("--synthetic-ar-kv-device", type=str, default="cpu", help="Device used to build KV tensors.")
-    parser.add_argument("--synthetic-ar-kv-from-stage", type=str, default="0", help="Synthetic KV source stage id.")
+    parser.add_argument(
+        "--synthetic-ar-kv-from-stage",
+        type=str,
+        default="-1",
+        help="Synthetic KV source stage id. Use -1 for external AR producers.",
+    )
     parser.add_argument("--synthetic-ar-kv-to-stage", type=str, default="0", help="Synthetic KV target stage id.")
     parser.add_argument("--synthetic-ar-kv-from-tp", type=int, default=1, help="Synthetic AR/source TP size.")
     parser.add_argument("--synthetic-ar-kv-to-tp", type=int, default=1, help="Synthetic DiT/target TP size.")
