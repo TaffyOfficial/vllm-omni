@@ -7,6 +7,7 @@ from benchmarks.diffusion.kv_reuse import (
     SyntheticARKVProducer,
     attach_synthetic_ar_kv_request_context,
 )
+from benchmarks.diffusion.kv_reuse_benchmark_serving import create_arg_parser
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import KVCacheTransferData
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
@@ -97,3 +98,18 @@ def test_synthetic_ar_kv_request_context_adds_default_ar_text():
     attach_synthetic_ar_kv_request_context(req, "<think>synthetic</think><recaption>caption</recaption>")
 
     assert req.extra_body["ar_generated_text"] == "<think>synthetic</think><recaption>caption</recaption>"
+
+
+def test_kv_reuse_benchmark_parser_enables_synthetic_kv_defaults():
+    args = create_arg_parser().parse_args(["--base-url", "http://test.local", "--model", "hy3-dit"])
+
+    assert args.endpoint == "/v1/chat/completions"
+    assert args.dataset == "random"
+    assert args.task == "t2i"
+    assert args.synthetic_ar_kv is True
+    assert args.return_stage_metrics is True
+    assert args.synthetic_ar_kv_from_stage == "-1"
+    assert args.synthetic_ar_kv_to_stage == "0"
+    assert args.synthetic_ar_kv_from_tp == 4
+    assert args.synthetic_ar_kv_to_tp == 4
+    assert args.synthetic_ar_kv_dtype == "bfloat16"

@@ -9,6 +9,13 @@ The main entrypoint is:
 
 - `benchmarks/diffusion/diffusion_benchmark_serving.py`
 
+For HunyuanImage3 DiT-only KV reuse pressure tests, use the preset wrapper:
+
+- `benchmarks/diffusion/kv_reuse_benchmark_serving.py`
+
+It reuses the same benchmark runner, but defaults to `/v1/chat/completions`,
+`random` t2i requests, synthetic AR KV payloads, and stage metrics.
+
 ## 1. Quick Start
 
 1. Start the server:
@@ -32,6 +39,33 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
 
 - By default, image tasks talk to `http://<host>:<port>/v1/chat/completions`; video tasks talk to `/v1/videos`.
 - If you run the server on another host or port, pass `--base-url` accordingly.
+
+### HunyuanImage3 DiT KV reuse pressure
+
+Start a DiT-only HunyuanImage3 service with `hunyuan_image3_dit_kv_reuse.yaml`
+or an equivalent config that enables `omni_kv_config.need_recv_cache` and
+sets `rank_mapping` to the AR/source TP and DiT/target TP sizes.
+
+Then run:
+
+```bash
+python3 benchmarks/diffusion/kv_reuse_benchmark_serving.py \
+	--base-url http://localhost:8099 \
+	--model HunyuanImage3-DiT \
+	--num-prompts 16 \
+	--width 512 --height 512 \
+	--num-inference-steps 1 \
+	--request-rate inf \
+	--max-concurrency 1 \
+	--synthetic-ar-kv-from-tp 4 \
+	--synthetic-ar-kv-to-tp 4
+```
+
+Override `--synthetic-ar-kv-num-heads`, `--synthetic-ar-kv-head-dim`,
+`--synthetic-ar-kv-seq-len`, and `--synthetic-ar-kv-dtype` to match the target
+AR KV layout. For TP2 experiments, update both the DiT deploy config
+`rank_mapping` and the benchmark `--synthetic-ar-kv-from-tp/--synthetic-ar-kv-to-tp`
+arguments.
 
 ## 2. Supported Datasets
 

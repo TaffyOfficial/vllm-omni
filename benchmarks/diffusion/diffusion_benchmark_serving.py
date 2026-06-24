@@ -96,12 +96,21 @@ from typing import Any
 import aiohttp
 import numpy as np
 import requests
-from backends import (
-    RequestFuncInput,
-    RequestFuncOutput,
-    backends_function_mapping,
-    normalize_endpoint,
-)
+
+if __package__:
+    from benchmarks.diffusion.backends import (
+        RequestFuncInput,
+        RequestFuncOutput,
+        backends_function_mapping,
+        normalize_endpoint,
+    )
+else:
+    from backends import (
+        RequestFuncInput,
+        RequestFuncOutput,
+        backends_function_mapping,
+        normalize_endpoint,
+    )
 from PIL import Image
 from tqdm.asyncio import tqdm
 
@@ -1194,7 +1203,14 @@ async def benchmark(args):
     if args.synthetic_ar_kv:
         if args.endpoint != "/v1/chat/completions":
             raise ValueError("--synthetic-ar-kv currently supports --endpoint /v1/chat/completions only.")
-        from kv_reuse import SyntheticARKVConfig, SyntheticARKVProducer, attach_synthetic_ar_kv_request_context
+        if __package__:
+            from benchmarks.diffusion.kv_reuse import (
+                SyntheticARKVConfig,
+                SyntheticARKVProducer,
+                attach_synthetic_ar_kv_request_context,
+            )
+        else:
+            from kv_reuse import SyntheticARKVConfig, SyntheticARKVProducer, attach_synthetic_ar_kv_request_context
 
         synthetic_kv_config = SyntheticARKVConfig(
             num_layers=args.synthetic_ar_kv_layers,
@@ -1343,8 +1359,8 @@ async def benchmark(args):
         print(f"Metrics saved to {args.output_file}")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark serving for diffusion models.")
+def create_arg_parser(description: str = "Benchmark serving for diffusion models.") -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--base-url",
         type=str,
@@ -1557,5 +1573,14 @@ if __name__ == "__main__":
         help="SharedMemoryConnector threshold for synthetic KV payloads.",
     )
 
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = create_arg_parser()
+    args = parser.parse_args(argv)
     asyncio.run(benchmark(args))
+
+
+if __name__ == "__main__":
+    main()
