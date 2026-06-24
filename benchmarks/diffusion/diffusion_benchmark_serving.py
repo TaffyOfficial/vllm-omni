@@ -110,8 +110,7 @@ logger = logging.getLogger(__name__)
 _STAGE_METRICS_ENDPOINTS = {"/v1/chat/completions"}
 _RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
 _DEFAULT_SYNTHETIC_AR_TEXT = (
-    "<think>synthetic ar kv reuse prefix</think>"
-    "<recaption>synthetic caption for DiT KV reuse pressure</recaption>"
+    "<think>synthetic ar kv reuse prefix</think><recaption>synthetic caption for DiT KV reuse pressure</recaption>"
 )
 
 

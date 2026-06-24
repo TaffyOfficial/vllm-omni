@@ -12,8 +12,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVCacheConfig,
     OmniKVTransferManager,
 )
-from vllm_omni.distributed.omni_connectors.utils.kv_utils import normalize_layer_kv
-from vllm_omni.distributed.omni_connectors.utils.kv_utils import get_kv_connector_key
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import get_kv_connector_key, normalize_layer_kv
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.cache]
