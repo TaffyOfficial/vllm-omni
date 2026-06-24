@@ -1,9 +1,10 @@
 import pytest
 import torch
 
+from benchmarks.diffusion.backends import RequestFuncInput
+from benchmarks.diffusion.diffusion_benchmark_serving import attach_synthetic_ar_kv_request_context
 from benchmarks.diffusion.kv_reuse import SyntheticARKVConfig, SyntheticARKVProducer
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import KVCacheTransferData
-
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
@@ -67,3 +68,28 @@ def test_synthetic_ar_kv_config_rejects_non_divisible_tp():
             from_tp=3,
             to_tp=2,
         ).validate()
+
+
+def test_synthetic_ar_kv_request_context_preserves_existing_trace_value():
+    req = RequestFuncInput(
+        prompt="draw a dog",
+        api_url="http://test.local/v1/chat/completions",
+        model="test-model",
+        extra_body={"ar_generated_text": "<think>trace</think><recaption>caption</recaption>"},
+    )
+
+    attach_synthetic_ar_kv_request_context(req, "<think>synthetic</think><recaption>fallback</recaption>")
+
+    assert req.extra_body["ar_generated_text"] == "<think>trace</think><recaption>caption</recaption>"
+
+
+def test_synthetic_ar_kv_request_context_adds_default_ar_text():
+    req = RequestFuncInput(
+        prompt="draw a dog",
+        api_url="http://test.local/v1/chat/completions",
+        model="test-model",
+    )
+
+    attach_synthetic_ar_kv_request_context(req, "<think>synthetic</think><recaption>caption</recaption>")
+
+    assert req.extra_body["ar_generated_text"] == "<think>synthetic</think><recaption>caption</recaption>"

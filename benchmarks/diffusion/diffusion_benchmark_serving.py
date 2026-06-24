@@ -109,6 +109,14 @@ logger = logging.getLogger(__name__)
 
 _STAGE_METRICS_ENDPOINTS = {"/v1/chat/completions"}
 _RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
+_DEFAULT_SYNTHETIC_AR_TEXT = (
+    "<think>synthetic ar kv reuse prefix</think>"
+    "<recaption>synthetic caption for DiT KV reuse pressure</recaption>"
+)
+
+
+def attach_synthetic_ar_kv_request_context(req: RequestFuncInput, ar_generated_text: str) -> None:
+    req.extra_body.setdefault("ar_generated_text", ar_generated_text)
 
 
 class BaseDataset(ABC):
@@ -1214,6 +1222,7 @@ async def benchmark(args):
         nonlocal synthetic_kv_bytes_sent, synthetic_kv_payloads_sent
         if synthetic_kv_producer is None:
             return
+        attach_synthetic_ar_kv_request_context(req, args.synthetic_ar_kv_ar_generated_text)
         result = synthetic_kv_producer.prepare(req.request_id)
         if record:
             synthetic_kv_bytes_sent += result.bytes_sent
@@ -1534,6 +1543,12 @@ if __name__ == "__main__":
         type=str,
         default="chatcmpl-",
         help="Prefix serving_chat adds before the benchmark request_id. Use empty string for non-chat IDs.",
+    )
+    parser.add_argument(
+        "--synthetic-ar-kv-ar-generated-text",
+        type=str,
+        default=_DEFAULT_SYNTHETIC_AR_TEXT,
+        help="Synthetic AR text forwarded through extra_body so Hunyuan DiT can compute the KV reuse span.",
     )
     parser.add_argument(
         "--synthetic-ar-kv-shm-threshold-bytes",

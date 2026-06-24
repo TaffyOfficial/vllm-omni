@@ -3215,7 +3215,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             ChatCompletionResponse with generated images or ErrorResponse
         """
         try:
-            request_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
+            request_id = f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
             created_time = int(time.time())
 
             # Convert messages to dict format
@@ -3296,6 +3296,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 "negative_prompt": negative_prompt,
                 "modalities": ["image"],
             }
+            ar_generated_text = extra_body.get("ar_generated_text")
+            if isinstance(ar_generated_text, str) and ar_generated_text:
+                gen_prompt["extra"] = {"ar_generated_text": ar_generated_text}
             gen_params = OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
