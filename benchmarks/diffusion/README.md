@@ -42,9 +42,31 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
 
 ### HunyuanImage3 DiT KV reuse pressure
 
-Start a DiT-only HunyuanImage3 service with `hunyuan_image3_dit_kv_reuse.yaml`
-or an equivalent config that enables `omni_kv_config.need_recv_cache` and
-sets `rank_mapping` to the AR/source TP and DiT/target TP sizes.
+Start from a local copy of `vllm_omni/deploy/hunyuan_image3_dit.yaml` and add
+the receiver-side KV connector fields required by the benchmark:
+
+```yaml
+connectors:
+  shared_memory_connector:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+
+stages:
+  - stage_id: 0
+    omni_kv_config:
+      need_recv_cache: true
+      recv_timeout: 30.0
+      allow_request_id_suffix_fallback: true
+      rank_mapping:
+        from_tp: 4
+        to_tp: 4
+    input_connectors:
+      from_stage_0: shared_memory_connector
+```
+
+Keep `rank_mapping.from_tp` aligned with the synthetic AR/source TP and
+`rank_mapping.to_tp` aligned with the DiT/target TP size.
 
 Then run:
 
@@ -63,7 +85,7 @@ python3 benchmarks/diffusion/kv_reuse_benchmark_serving.py \
 
 Override `--synthetic-ar-kv-num-heads`, `--synthetic-ar-kv-head-dim`,
 `--synthetic-ar-kv-seq-len`, and `--synthetic-ar-kv-dtype` to match the target
-AR KV layout. For TP2 experiments, update both the DiT deploy config
+AR KV layout. For TP2 experiments, update both the local DiT deploy config
 `rank_mapping` and the benchmark `--synthetic-ar-kv-from-tp/--synthetic-ar-kv-to-tp`
 arguments.
 
