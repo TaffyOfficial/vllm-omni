@@ -126,6 +126,7 @@ class DiffusionRequestState:
     req: OmniDiffusionRequest
     sampling_params_key: SamplingParamsKey | RequestBatchSamplingParamsKey | None = None
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
+    arrival_time: float = 0.0
     error: str | None = None
 
     def is_finished(self) -> bool:

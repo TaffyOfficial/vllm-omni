@@ -8,6 +8,7 @@ from dataclasses import fields
 
 from vllm.logger import init_logger
 
+from vllm_omni.determinism import deterministic_request_key, is_batch_invariant_enabled
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -63,6 +64,7 @@ class _BaseScheduler(SchedulerInterface):
         self._finished_req_ids: set[str] = set()
         self.max_num_running_reqs: int = 1
         self._prefetch_enabled: bool = False
+        self._arrival_seq: int = 0
 
     def initialize(self, od_config: OmniDiffusionConfig) -> None:
         self.od_config = od_config
@@ -72,10 +74,13 @@ class _BaseScheduler(SchedulerInterface):
         self._running.clear()
         self._running_sampling_params_key = None
         self._finished_req_ids.clear()
+        self._arrival_seq = 0
         max_num_seqs = getattr(od_config, "max_num_seqs", 1)
         try:
             self.max_num_running_reqs = max(1, int(max_num_seqs))
         except (TypeError, ValueError):
+            self.max_num_running_reqs = 1
+        if is_batch_invariant_enabled():
             self.max_num_running_reqs = 1
         omni_kv = getattr(od_config, "omni_kv_config", None) or {}
         self._prefetch_enabled = bool(omni_kv.get("enable_kv_async_prefetch", False))
@@ -88,6 +93,8 @@ class _BaseScheduler(SchedulerInterface):
         if request_id in self._request_states:
             raise ValueError(f"request_id {request_id!r} is already active.")
         state = self._make_request_state(request_id, request)
+        state.arrival_time = float(self._arrival_seq)
+        self._arrival_seq += 1
         self._request_states[request_id] = state
         self._waiting.append(request_id)
         logger.debug("%s add_request: %s (waiting=%d)", self.__class__.__name__, request_id, len(self._waiting))
@@ -102,6 +109,8 @@ class _BaseScheduler(SchedulerInterface):
             state = self._request_states.get(request_id)
             if state is not None:
                 scheduled_cached_request_ids.append(request_id)
+
+        self._order_waiting_for_batch_invariance()
 
         # Second, schedule WAITING requests while capacity remains.
         while self._waiting and len(self._running) < self.max_num_running_reqs:
@@ -287,3 +296,15 @@ class _BaseScheduler(SchedulerInterface):
         self, request: OmniDiffusionRequest
     ) -> SamplingParamsKey | RequestBatchSamplingParamsKey | None:
         return get_sampling_params_key(request)
+
+    def _order_waiting_for_batch_invariance(self) -> None:
+        if not is_batch_invariant_enabled() or len(self._waiting) < 2:
+            return
+
+        def key(request_id: str) -> tuple[int, float, str]:
+            state = self._request_states.get(request_id)
+            if state is None:
+                return (0, 0.0, request_id)
+            return deterministic_request_key(state.req, arrival_time=state.arrival_time)
+
+        self._waiting = deque(sorted(self._waiting, key=key))
