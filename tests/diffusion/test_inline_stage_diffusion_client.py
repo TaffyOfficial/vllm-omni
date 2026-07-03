@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from vllm.v1.engine.exceptions import EngineDeadError
@@ -104,6 +104,27 @@ def test_inline_shutdown(client, mock_engine):
 
 def test_inline_registers_executor_failure_callback(client, mock_engine):
     mock_engine.executor.register_failure_callback.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_inline_dispatch_preserves_priority(client, mock_engine):
+    captured = {}
+
+    async def step(request):
+        captured["request"] = request
+        return [OmniRequestOutput.from_diffusion(request_id=request.request_id, images=[])]
+
+    mock_engine.step = AsyncMock(side_effect=step)
+
+    await client._dispatch_request(
+        "req-priority",
+        "A test prompt",
+        OmniDiffusionSamplingParams(seed=1),
+        priority=5,
+    )
+
+    assert captured["request"].priority == 5
+    assert client.get_diffusion_output_nowait().request_id == "req-priority"
 
 
 def test_inline_executor_failure_marks_engine_dead(client, mock_engine):

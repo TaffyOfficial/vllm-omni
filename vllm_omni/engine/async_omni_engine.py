@@ -1457,6 +1457,7 @@ class AsyncOmniEngine:
             final_stage_id=final_stage_id,
             preprocess_ms=_preprocess_ms,
             enqueue_ts=time.perf_counter(),
+            priority=priority,
         )
 
     def _enqueue_cfg_companions(
@@ -1465,6 +1466,7 @@ class AsyncOmniEngine:
         original_prompt: Any,
         stage0_params: Any,
         sampling_params_list: list[Any],
+        priority: int,
     ) -> None:
         """Expand prompt into CFG companions, process through InputProcessor, and enqueue."""
         try:
@@ -1490,6 +1492,7 @@ class AsyncOmniEngine:
                 prompt=companion_prompt,
                 params=companion_params,
                 supported_tasks=self.supported_tasks,
+                priority=priority,
             )
             request.external_req_id = cid
 
@@ -1504,6 +1507,7 @@ class AsyncOmniEngine:
                     prompt=request,
                     companion_prompt_text=companion_prompt,
                     sampling_params_list=companion_spl,
+                    priority=priority,
                 )
             )
 
@@ -1959,7 +1963,7 @@ class AsyncOmniEngine:
             effective_spl = msg.sampling_params_list
             stage0_params = effective_spl[0] if effective_spl else None
             if stage0_params is not None:
-                self._enqueue_cfg_companions(request_id, original_prompt, stage0_params, effective_spl)
+                self._enqueue_cfg_companions(request_id, original_prompt, stage0_params, effective_spl, priority)
 
     async def add_request_async(
         self,

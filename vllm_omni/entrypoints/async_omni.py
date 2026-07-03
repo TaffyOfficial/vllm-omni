@@ -321,6 +321,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     input_stream=prompt,
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id_for_e2e,
+                    priority=priority,
                 )
             else:
                 await self.engine.add_request_async(
@@ -328,6 +329,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     prompt=prompt,
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id_for_e2e,
+                    priority=priority,
                 )
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
@@ -368,6 +370,7 @@ class AsyncOmni(EngineClient, OmniBase):
         input_stream: AsyncGenerator[StreamingInput, None],
         sampling_params_list: Sequence[OmniSamplingParams],
         final_stage_id: int,
+        priority: int = 0,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
         if not sampling_params_list:
@@ -403,6 +406,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             prompt_text=prompt_text,
                             sampling_params_list=chunk_sampling_params_list,
                             final_stage_id=final_stage_id,
+                            priority=priority,
                             resumable=True,
                         )
                         has_submitted_first_chunk = True
@@ -448,6 +452,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             prompt_text=None,
                             sampling_params_list=final_sampling_params_list,
                             final_stage_id=final_stage_id,
+                            priority=priority,
                             resumable=False,
                         )
 

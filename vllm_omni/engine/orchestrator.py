@@ -50,6 +50,7 @@ def build_engine_core_request_from_tokens(
     model_config: ModelConfig | None = None,
     resumable: bool = False,
     mm_features: list | None = None,
+    priority: int = 0,
 ) -> OmniEngineCoreRequest:
     """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt."""
     if arrival_time is None:
@@ -83,6 +84,7 @@ def build_engine_core_request_from_tokens(
         cache_salt=None,
         data_parallel_rank=None,
         prompt_embeds=prompt_embeds,
+        priority=priority,
         resumable=resumable,
         additional_information=additional_info_payload,
     )
@@ -96,6 +98,7 @@ class OrchestratorRequestState:
     prompt: Any = None
     sampling_params_list: list[Any] = field(default_factory=list)
     final_stage_id: int = -1
+    priority: int = 0
 
     # Metrics: timestamp when request was submitted to each stage.
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
@@ -269,6 +272,7 @@ class Orchestrator:
             prompt=original_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            priority=msg.priority,
             mm_features=getattr(prompt, "mm_features", None),
         )
         self.request_states[request_id] = req_state
@@ -312,6 +316,7 @@ class Orchestrator:
                 final_stage_id=msg.final_stage_id,
                 preprocess_ms=msg.preprocess_ms,
                 enqueue_ts=msg.enqueue_ts,
+                priority=msg.priority,
             )
             await self._handle_add_request(fallback_msg)
             return
@@ -353,6 +358,7 @@ class Orchestrator:
             prompt=companion_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=0,
+            priority=msg.priority,
         )
         self.request_states[companion_id] = companion_state
         companion_state.stage_submit_ts[0] = _time.time()
@@ -906,6 +912,7 @@ class Orchestrator:
                     model_config=next_pool.stage_vllm_config.model_config,
                     mm_features=req_state.mm_features,
                     resumable=next_stage_resumable,
+                    priority=req_state.priority,
                 )
                 request.external_req_id = request.request_id
                 if already_submitted:
@@ -949,6 +956,7 @@ class Orchestrator:
                 model_config=next_pool.stage_vllm_config.model_config,
                 mm_features=mm_features,
                 resumable=next_stage_resumable,
+                priority=req_state.priority,
             )
 
             request.external_req_id = request.request_id
@@ -1020,6 +1028,7 @@ class Orchestrator:
                     prompt=base_input,
                     params=params,
                     model_config=next_pool.stage_vllm_config.model_config,
+                    priority=req_state.priority,
                 )
                 request.external_req_id = request.request_id
                 await next_pool.submit_initial(request_id, req_state, request, prompt_text=None)

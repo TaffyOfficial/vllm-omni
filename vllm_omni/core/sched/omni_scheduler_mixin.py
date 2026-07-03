@@ -1,11 +1,43 @@
 from __future__ import annotations
 
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+
+from vllm_omni.determinism import deterministic_request_key, is_batch_invariant_enabled
 
 
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
+
+    def _apply_batch_invariant_limits(self) -> None:
+        """Serialize scheduling when batch-invariant mode is requested."""
+        if is_batch_invariant_enabled():
+            self.max_num_running_reqs = 1
+            self.policy = SchedulingPolicy.FCFS
+            waiting = getattr(self, "waiting", None)
+            if waiting is not None:
+                fcfs_waiting = create_request_queue(SchedulingPolicy.FCFS)
+                for request in waiting:
+                    fcfs_waiting.add_request(request)
+                self.waiting = fcfs_waiting
+
+    def _order_waiting_for_batch_invariance(self) -> None:
+        """Reorder waiting requests by stable request priority when enabled."""
+        if not is_batch_invariant_enabled():
+            return
+        waiting = getattr(self, "waiting", None)
+        if waiting is None:
+            return
+        requests = list(waiting)
+        if len(requests) < 2:
+            return
+        ordered = sorted(requests, key=deterministic_request_key)
+        if ordered == requests:
+            return
+        waiting.remove_requests(requests)
+        for request in ordered:
+            waiting.add_request(request)
 
     def _free_input_coordinator_request(self, request_id: str) -> None:
         """Prune full-payload coordinator state for a completed request."""

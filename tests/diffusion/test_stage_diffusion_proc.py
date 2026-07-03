@@ -62,6 +62,7 @@ def test_process_batch_request_preserves_parent_request_id_and_kv_sender_info():
                 prompts=["hello", "world"],
                 sampling_params_dict=asdict(OmniDiffusionSamplingParams()),
                 kv_sender_info={0: {"host": "10.0.0.2", "zmq_port": 50151}},
+                priority=11,
             )
         finally:
             proc._executor.shutdown(wait=True)
@@ -70,8 +71,35 @@ def test_process_batch_request_preserves_parent_request_id_and_kv_sender_info():
         assert request.request_id == "req-parent"
         assert request.request_ids == ["req-parent-0", "req-parent-1"]
         assert request.kv_sender_info == {0: {"host": "10.0.0.2", "zmq_port": 50151}}
+        assert request.priority == 11
         assert result.request_id == "req-parent"
         assert result.images == ["img-1", "img-2"]
+
+    asyncio.run(run_test())
+
+
+def test_process_request_preserves_priority():
+    async def run_test():
+        captured = {}
+
+        async def step(request):
+            captured["request"] = request
+            return [MockOmniRequestOutput(request_id=request.request_id)]
+
+        proc = object.__new__(StageDiffusionProc)
+        proc._engine = SimpleNamespace(step=step)
+
+        result = await proc._process_request(
+            request_id="req-single",
+            prompt="hello",
+            sampling_params_dict=asdict(OmniDiffusionSamplingParams()),
+            priority=7,
+        )
+
+        request = captured["request"]
+        assert request.request_id == "req-single"
+        assert request.priority == 7
+        assert result.request_id == "req-single"
 
     asyncio.run(run_test())
 

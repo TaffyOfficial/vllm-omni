@@ -349,7 +349,7 @@ class vLLMOmniHttpServerLocal:
         image_data: list[Any] | None = None,
         video_data: list[Any] | None = None,
         negative_prompt_ids: list[int] | None = None,
-        priority: int = 0,  # noqa: ARG002 (signature parity)
+        priority: int = 0,
     ) -> DiffusionOutput:
         # Verbatim copy of ``vLLMOmniHttpServer._generate_diffusion`` minus
         # the LoRA branch (the test does not enable ``lora_as_adapter``).
@@ -381,6 +381,7 @@ class vLLMOmniHttpServerLocal:
             prompt=custom_prompt,
             request_id=request_id,
             sampling_params_list=[diffusion_sampling_params],
+            priority=priority,
         )
 
         final_res: OmniRequestOutput | None = None

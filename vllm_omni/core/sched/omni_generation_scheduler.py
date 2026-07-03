@@ -40,6 +40,7 @@ logger = init_logger(__name__)
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._apply_batch_invariant_limits()
         model_config = self.vllm_config.model_config
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
@@ -96,6 +97,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             )
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+        self._order_waiting_for_batch_invariance()
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled

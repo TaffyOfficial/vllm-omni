@@ -100,6 +100,7 @@ class InlineStageDiffusionClient(StageClientBase):
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        priority: int = 0,
     ) -> None:
         logger.debug(
             "[InlineStageDiffusionClient] stage-%s [rep-%s] add request: %s",
@@ -113,6 +114,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 prompt,
                 sampling_params,
                 kv_sender_info,
+                priority,
             )
         )
         self._tasks[request_id] = task
@@ -123,6 +125,7 @@ class InlineStageDiffusionClient(StageClientBase):
         prompt: Any,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[str, Any] | None = None,
+        priority: int = 0,
     ) -> None:
         try:
             request = OmniDiffusionRequest(
@@ -131,6 +134,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 request_ids=[request_id],
                 request_id=request_id,
                 kv_sender_info=kv_sender_info,
+                priority=priority,
             )
 
             results = await self._engine.step(request)
@@ -158,6 +162,7 @@ class InlineStageDiffusionClient(StageClientBase):
         prompts: list[OmniPromptType],
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        priority: int = 0,
     ) -> None:
         logger.debug(
             "[InlineStageDiffusionClient] stage-%s [rep-%s] add batch request: %s (%d prompts)",
@@ -172,6 +177,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 prompts,
                 sampling_params,
                 kv_sender_info,
+                priority,
             )
         )
         self._tasks[request_id] = task
@@ -182,6 +188,7 @@ class InlineStageDiffusionClient(StageClientBase):
         prompts: list[Any],
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[str, Any] | None = None,
+        priority: int = 0,
     ) -> None:
         try:
             request = OmniDiffusionRequest(
@@ -190,6 +197,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 request_ids=[f"{request_id}-{i}" for i in range(len(prompts))],
                 request_id=request_id,
                 kv_sender_info=kv_sender_info,
+                priority=priority,
             )
 
             results = await self._engine.step(request)

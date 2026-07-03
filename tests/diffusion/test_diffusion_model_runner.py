@@ -31,15 +31,22 @@ class _DummyPipeline:
         return self._output
 
 
-def _make_request(skip_cache_refresh: bool = True):
+def _make_request(
+    skip_cache_refresh: bool = True,
+    *,
+    prompts: list[str] | None = None,
+    request_ids: list[str] | None = None,
+    seed: int | None = None,
+):
     sampling_params = SimpleNamespace(
         generator=None,
-        seed=None,
+        seed=seed,
         generator_device=None,
         num_inference_steps=4,
     )
     return SimpleNamespace(
-        prompts=["a prompt"],
+        prompts=prompts or ["a prompt"],
+        request_ids=request_ids or ["req-0"],
         sampling_params=sampling_params,
         skip_cache_refresh=skip_cache_refresh,
     )
@@ -110,6 +117,52 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
 
     assert output.output == "ok"
     assert cache_summary_calls == [(runner.pipeline, True)]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_derives_per_sample_generators_in_batch_invariant_mode(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name="cache_dit")
+    req = _make_request(
+        prompts=["first", "second"],
+        request_ids=["req-b", "req-a"],
+        seed=123,
+        skip_cache_refresh=True,
+    )
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+    DiffusionModelRunner.execute_model(runner, req)
+
+    generators = req.sampling_params.generator
+    assert isinstance(generators, list)
+    assert len(generators) == 2
+    assert [generator.initial_seed() for generator in generators] == [
+        model_runner_module.deterministic_sample_seed(123, "req-b"),
+        model_runner_module.deterministic_sample_seed(123, "req-a"),
+    ]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_keeps_single_generator_by_default(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name="cache_dit")
+    req = _make_request(
+        prompts=["first", "second"],
+        request_ids=["req-b", "req-a"],
+        seed=123,
+        skip_cache_refresh=True,
+    )
+
+    monkeypatch.delenv("VLLM_BATCH_INVARIANT", raising=False)
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+    DiffusionModelRunner.execute_model(runner, req)
+
+    generator = req.sampling_params.generator
+    assert isinstance(generator, torch.Generator)
+    assert generator.initial_seed() == 123
 
 
 @pytest.mark.core_model

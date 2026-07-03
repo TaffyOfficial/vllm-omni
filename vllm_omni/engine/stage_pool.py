@@ -206,6 +206,7 @@ class StagePool:
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         submit_kwargs = dict(submit_kwargs or {})
         if self.stage_type == "diffusion":
+            submit_kwargs.setdefault("priority", req_state.priority)
             replica_id = self.select_replica_id(
                 request_id,
                 affinity_request_id=affinity_request_id,
@@ -266,7 +267,12 @@ class StagePool:
             replica_id = self.select_replica_id(request_id)
 
         if self.stage_type == "diffusion":
-            await self._diffusion_client(replica_id).add_request_async(request_id, request, params)
+            await self._diffusion_client(replica_id).add_request_async(
+                request_id,
+                request,
+                params,
+                priority=req_state.priority,
+            )
         else:
             # Refresh the shared output-processor state before yielding to the
             # stage client so streaming segments are merged against the latest

@@ -22,6 +22,7 @@ from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
+from vllm_omni.determinism import deterministic_sample_seed, is_batch_invariant_enabled
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
@@ -36,6 +37,7 @@ from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -252,13 +254,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             )
 
             if req.sampling_params.generator is None and req.sampling_params.seed is not None:
-                if req.sampling_params.generator_device is not None:
-                    gen_device = req.sampling_params.generator_device
-                elif self.device.type == "cpu":
-                    gen_device = "cpu"
-                else:
-                    gen_device = self.device
-                req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
+                self._ensure_sampling_generator(
+                    req.sampling_params,
+                    batch_size=len(req.prompts),
+                    request_ids=req.request_ids,
+                )
 
             # Refresh cache context if needed
             if (
@@ -345,6 +345,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     req_id=req_id,
                     sampling=copy.deepcopy(req.sampling_params),
                     prompts=req.prompts,
+                    request_ids=request_ids,
                 )
                 self.state_cache[req_id] = new_state
                 resolved.append(new_state)
@@ -368,13 +369,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if state.req_id in new_request_ids:
                 # set generator
                 if state.sampling.generator is None and state.sampling.seed is not None:
-                    if state.sampling.generator_device is not None:
-                        gen_device = state.sampling.generator_device
-                    elif self.device.type == "cpu":
-                        gen_device = "cpu"
-                    else:
-                        gen_device = self.device
-                    state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
+                    self._ensure_sampling_generator(
+                        state.sampling,
+                        batch_size=len(state.prompts or []),
+                        request_ids=state.request_ids,
+                    )
                 # encode
                 self.pipeline.prepare_encode(state)
 
@@ -384,6 +383,47 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         )
         self.input_batch = input_batch
         return input_batch
+
+    def _generator_device(self, sampling: OmniDiffusionSamplingParams) -> str | torch.device:
+        if sampling.generator_device is not None:
+            return sampling.generator_device
+        if self.device.type == "cpu":
+            return "cpu"
+        return self.device
+
+    def _ensure_sampling_generator(
+        self,
+        sampling: OmniDiffusionSamplingParams,
+        *,
+        batch_size: int,
+        request_ids: list[str],
+    ) -> None:
+        if sampling.generator is not None:
+            if (
+                is_batch_invariant_enabled()
+                and isinstance(sampling.generator, list)
+                and len(sampling.generator) != batch_size
+            ):
+                raise ValueError(
+                    "Diffusion generator list length must match prompt batch size when VLLM_BATCH_INVARIANT=1."
+                )
+            return
+        if sampling.seed is None:
+            return
+
+        gen_device = self._generator_device(sampling)
+        if is_batch_invariant_enabled() and batch_size > 1:
+            if len(request_ids) != batch_size:
+                raise ValueError(
+                    "Diffusion request_ids length must match prompt batch size when deriving per-sample generators."
+                )
+            sampling.generator = [
+                torch.Generator(device=gen_device).manual_seed(deterministic_sample_seed(sampling.seed, request_id))
+                for request_id in request_ids
+            ]
+            return
+
+        sampling.generator = torch.Generator(device=gen_device).manual_seed(sampling.seed)
 
     def _update_states_after(
         self,

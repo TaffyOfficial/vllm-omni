@@ -8,6 +8,7 @@ from dataclasses import fields
 
 from vllm.logger import init_logger
 
+from vllm_omni.determinism import deterministic_request_key, is_batch_invariant_enabled
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -62,6 +63,8 @@ class _BaseScheduler(SchedulerInterface):
             self.max_num_running_reqs = max(1, int(max_num_seqs))
         except (TypeError, ValueError):
             self.max_num_running_reqs = 1
+        if is_batch_invariant_enabled():
+            self.max_num_running_reqs = 1
         self._reset_scheduler_state()
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
@@ -86,6 +89,8 @@ class _BaseScheduler(SchedulerInterface):
             state = self._request_states.get(sched_req_id)
             if state is not None:
                 scheduled_cached_req_ids.append(sched_req_id)
+
+        self._order_waiting_for_batch_invariance()
 
         # Second, schedule WAITING requests while capacity remains.
         while self._waiting and len(self._running) < self.max_num_running_reqs:
@@ -252,6 +257,18 @@ class _BaseScheduler(SchedulerInterface):
         state = self._request_states.get(self._running[0])
         self._running_sampling_params_key = None if state is None else state.sampling_params_key
         return self._running_sampling_params_key
+
+    def _order_waiting_for_batch_invariance(self) -> None:
+        if not is_batch_invariant_enabled() or len(self._waiting) < 2:
+            return
+
+        def key(sched_req_id: str) -> tuple[int, str]:
+            state = self._request_states.get(sched_req_id)
+            if state is None:
+                return (0, sched_req_id)
+            return deterministic_request_key(state.req)
+
+        self._waiting = deque(sorted(self._waiting, key=key))
 
     def _register_request_ids(self, request_ids: list[str], sched_req_id: str) -> None:
         unique_request_ids = list(dict.fromkeys(request_ids))

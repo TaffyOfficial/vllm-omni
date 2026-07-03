@@ -53,6 +53,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._apply_batch_invariant_limits()
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -226,6 +227,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+        self._order_waiting_for_batch_invariance()
 
         try:
             scheduler_output = super().schedule()

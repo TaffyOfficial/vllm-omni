@@ -41,6 +41,7 @@ class DiffusionRequestState:
     req_id: str
     sampling: OmniDiffusionSamplingParams
     prompts: list[OmniPromptType] | None = None
+    request_ids: list[str] = field(default_factory=list)
 
     # ── Encoded prompts (set once by prepare_encode) ──
     prompt_embeds: torch.Tensor | None = None

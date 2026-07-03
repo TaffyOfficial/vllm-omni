@@ -91,6 +91,7 @@ class StageDiffusionProc:
         prompt: Any,
         sampling_params_dict: dict,
         kv_sender_info: dict[str, Any] | None = None,
+        priority: int = 0,
     ) -> OmniRequestOutput:
         """Build a diffusion request and run DiffusionEngine.step()."""
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
@@ -101,6 +102,7 @@ class StageDiffusionProc:
             request_ids=[request_id],
             request_id=request_id,
             kv_sender_info=kv_sender_info,
+            priority=priority,
         )
 
         results = await self._engine.step(request)
@@ -115,6 +117,7 @@ class StageDiffusionProc:
         prompts: list[Any],
         sampling_params_dict: dict,
         kv_sender_info: dict[str, Any] | None = None,
+        priority: int = 0,
     ) -> OmniRequestOutput:
         """Build a batched diffusion request and run DiffusionEngine.step().
 
@@ -131,6 +134,7 @@ class StageDiffusionProc:
             request_ids=[f"{request_id}-{i}" for i in range(len(prompts))],
             request_id=request_id,
             kv_sender_info=kv_sender_info,
+            priority=priority,
         )
 
         results = await self._engine.step(request)
@@ -315,6 +319,7 @@ class StageDiffusionProc:
             prompt: Any,
             sampling_params_dict: dict,
             kv_sender_info: dict[str, Any] | None = None,
+            priority: int = 0,
         ) -> None:
             """Process a single diffusion request and send the response."""
             try:
@@ -323,6 +328,7 @@ class StageDiffusionProc:
                     prompt,
                     sampling_params_dict,
                     kv_sender_info=kv_sender_info,
+                    priority=priority,
                 )
                 await response_socket.send(encoder.encode({"type": "result", "output": result}))
             except DiffusionRequestAbortedError as e:
@@ -359,6 +365,7 @@ class StageDiffusionProc:
                             msg["prompt"],
                             msg["sampling_params"],
                             msg.get("kv_sender_info"),
+                            msg.get("priority", 0),
                         )
                     )
                     tasks[request_id] = task
@@ -371,6 +378,7 @@ class StageDiffusionProc:
                         prompts: list,
                         sp_dict: dict,
                         kv_sender_info: dict[str, Any] | None = None,
+                        priority: int = 0,
                     ) -> None:
                         try:
                             result = await self._process_batch_request(
@@ -378,6 +386,7 @@ class StageDiffusionProc:
                                 prompts,
                                 sp_dict,
                                 kv_sender_info=kv_sender_info,
+                                priority=priority,
                             )
                             await response_socket.send(encoder.encode({"type": "result", "output": result}))
                         except DiffusionRequestAbortedError as e:
@@ -406,6 +415,7 @@ class StageDiffusionProc:
                             msg["prompts"],
                             msg["sampling_params"],
                             msg.get("kv_sender_info"),
+                            msg.get("priority", 0),
                         )
                     )
                     tasks[request_id] = task

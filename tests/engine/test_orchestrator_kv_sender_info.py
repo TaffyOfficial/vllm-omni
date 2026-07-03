@@ -34,13 +34,14 @@ class _DummyDiffusionStage:
         self.engine_input_source = engine_input_source or [0]
         self.calls = []
 
-    async def add_request_async(self, request_id, prompt, sampling_params, kv_sender_info=None):
+    async def add_request_async(self, request_id, prompt, sampling_params, kv_sender_info=None, priority=0):
         self.calls.append(
             {
                 "request_id": request_id,
                 "prompt": prompt,
                 "sampling_params": sampling_params,
                 "kv_sender_info": kv_sender_info,
+                "priority": priority,
             }
         )
 
@@ -151,6 +152,7 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
         prompt={"prompt": "hello"},
         sampling_params_list=[SamplingParams(max_tokens=4), params],
         final_stage_id=1,
+        priority=7,
     )
 
     output = SimpleNamespace(request_id="req-1", finished=True)
@@ -160,6 +162,7 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
     assert diffusion_stage.calls[0]["kv_sender_info"] == {
         0: {"host": "10.0.0.2", "zmq_port": 50151},
     }
+    assert diffusion_stage.calls[0]["priority"] == 7
     assert req_state.stage_submit_ts[1] > 0
 
 
@@ -249,6 +252,7 @@ def test_prewarm_diffusion_attaches_kv_sender_info():
         prompt={"prompt": "hello"},
         sampling_params_list=[SamplingParams(max_tokens=4), OmniDiffusionSamplingParams()],
         final_stage_id=1,
+        priority=3,
     )
 
     stage0_request = SimpleNamespace(prompt_token_ids=[1, 2, 3])
@@ -258,4 +262,5 @@ def test_prewarm_diffusion_attaches_kv_sender_info():
     assert diffusion_stage.calls[0]["kv_sender_info"] == {
         0: {"host": "10.0.0.3", "zmq_port": 50151},
     }
+    assert diffusion_stage.calls[0]["priority"] == 3
     assert req_state.stage_submit_ts[1] > 0

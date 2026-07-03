@@ -132,3 +132,25 @@ def test_output_kind_is_preserved_with_explicit_sampling_params(output_kind):
 
     asyncio.run(run())
     assert captured_params[0].output_kind == output_kind
+
+
+def test_generate_forwards_priority_to_engine():
+    captured_kwargs = {}
+
+    async def capturing_add_request(*, request_id, prompt, sampling_params_list, final_stage_id, **kwargs):
+        del request_id, prompt, sampling_params_list, final_stage_id
+        captured_kwargs.update(kwargs)
+
+    async def run():
+        omni = get_async_omni_instance(fake_add_request=capturing_add_request)
+        async for _ in omni.generate(
+            prompt={"prompt": "test"},
+            request_id="priority-req",
+            sampling_params_list=[SamplingParams()],
+            output_modalities=["text"],
+            priority=17,
+        ):
+            pass
+
+    asyncio.run(run())
+    assert captured_kwargs["priority"] == 17
