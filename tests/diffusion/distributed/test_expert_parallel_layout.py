@@ -20,6 +20,9 @@ class _FakeGroup:
         self.parallel_mode = parallel_mode
         self.device_group = object()
         self.device_communicator = kwargs.get("device_communicator")
+        reduce_scatter = kwargs.get("reduce_scatter")
+        if reduce_scatter is not None:
+            self.reduce_scatter = reduce_scatter
         self.ulysses_group = kwargs.get("ulysses_group")
         self.ring_group = kwargs.get("ring_group")
         self.local_group = next(group for group in group_ranks if local_rank in group)
@@ -68,6 +71,7 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
             local_rank,
             f"vllm_{group_name}",
             device_communicator=object(),
+            reduce_scatter=lambda tensor, **kwargs: tensor,
         )
         created_groups.append(group)
         return group
@@ -117,6 +121,9 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
     assert parallel_state.vllm_parallel_state._PCP.device_communicator is not None
     assert parallel_state.vllm_parallel_state._DP.device_communicator is not None
     assert parallel_state.vllm_parallel_state._EP.device_communicator is not None
+    assert hasattr(parallel_state.vllm_parallel_state._PCP, "reduce_scatter")
+    assert hasattr(parallel_state.vllm_parallel_state._DP, "reduce_scatter")
+    assert hasattr(parallel_state.vllm_parallel_state._EP, "reduce_scatter")
 
     assert parallel_state.vllm_parallel_state._PCP.local_group == [0, 2]
     assert parallel_state.vllm_parallel_state._DP.local_group == [0, 8, 16, 24]
