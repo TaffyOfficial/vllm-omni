@@ -1030,6 +1030,7 @@ class Orchestrator:
                 model_config=next_pool.stage_vllm_config.model_config,
                 mm_features=mm_features,
                 resumable=resumable,
+                arrival_time=req_state.request_timestamp if req_state is not None else None,
                 priority=priority,
             )
             request.external_req_id = request.request_id
@@ -1041,7 +1042,7 @@ class Orchestrator:
             prompt=next_input,
             params=params,
             supported_tasks=("generate",),
-            arrival_time=_time.time(),
+            arrival_time=req_state.request_timestamp if req_state is not None else _time.time(),
             priority=priority,
             resumable=resumable,
         )
@@ -1358,6 +1359,7 @@ class Orchestrator:
                     model_config=next_pool.stage_vllm_config.model_config,
                     mm_features=req_state.mm_features,
                     resumable=next_stage_resumable,
+                    arrival_time=req_state.request_timestamp,
                     priority=req_state.priority,
                 )
                 request.external_req_id = request.request_id
@@ -1535,6 +1537,7 @@ class Orchestrator:
                     params=params,
                     model_config=next_pool.stage_vllm_config.model_config,
                     resumable=downstream_resumable,
+                    arrival_time=req_state.request_timestamp,
                     priority=req_state.priority,
                 )
                 request.external_req_id = request.request_id

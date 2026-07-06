@@ -155,6 +155,7 @@ class StageDiffusionProc:
         sampling_params_dict: dict,
         kv_sender_info: dict[str, Any] | None = None,
         priority: int = 0,
+        arrival_time: float | None = None,
     ) -> OmniRequestOutput:
         """Build a diffusion request and run DiffusionEngine.step()."""
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
@@ -165,6 +166,7 @@ class StageDiffusionProc:
             request_id=request_id,
             kv_sender_info=kv_sender_info,
             priority=priority,
+            arrival_time=arrival_time,
         )
 
         results = await self._engine.step(request)
@@ -180,6 +182,7 @@ class StageDiffusionProc:
         sampling_params_dict: dict,
         kv_sender_info: dict[str, Any] | None = None,
         priority: int = 0,
+        arrival_time: float | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Process a streaming diffusion request and yield the results from DiffusionEngine.step_streaming()."""
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
@@ -190,6 +193,7 @@ class StageDiffusionProc:
             request_id=request_id,
             kv_sender_info=kv_sender_info,
             priority=priority,
+            arrival_time=arrival_time,
         )
 
         async for results in self._engine.step_streaming(request):  # pyright: ignore[reportOptionalMemberAccess]
@@ -336,6 +340,7 @@ class StageDiffusionProc:
             sampling_params_dict: dict,
             kv_sender_info: dict[str, Any] | None = None,
             priority: int = 0,
+            arrival_time: float | None = None,
         ) -> None:
             """Process a single diffusion request and send the response."""
             try:
@@ -346,6 +351,7 @@ class StageDiffusionProc:
                         sampling_params_dict,
                         kv_sender_info=kv_sender_info,
                         priority=priority,
+                        arrival_time=arrival_time,
                     )
                     await response_socket.send(encoder.encode({"type": "result", "output": result}))
                 else:
@@ -355,6 +361,7 @@ class StageDiffusionProc:
                         sampling_params_dict,
                         kv_sender_info=kv_sender_info,
                         priority=priority,
+                        arrival_time=arrival_time,
                     ):
                         await response_socket.send(encoder.encode({"type": "result", "output": result}))
             except DiffusionRequestAbortedError as e:
@@ -423,6 +430,7 @@ class StageDiffusionProc:
                             msg["sampling_params"],
                             msg.get("kv_sender_info"),
                             msg.get("priority", 0),
+                            msg.get("arrival_time"),
                         )
                     )
                     tasks[request_id] = task

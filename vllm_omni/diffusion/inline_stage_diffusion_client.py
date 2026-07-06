@@ -101,6 +101,7 @@ class InlineStageDiffusionClient(StageClientBase):
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
         priority: int = 0,
+        arrival_time: float | None = None,
     ) -> None:
         logger.debug(
             "[InlineStageDiffusionClient] stage-%s [rep-%s] add request: %s",
@@ -115,6 +116,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 sampling_params,
                 kv_sender_info,
                 priority,
+                arrival_time,
             )
         )
         self._tasks[request_id] = task
@@ -126,6 +128,7 @@ class InlineStageDiffusionClient(StageClientBase):
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[str, Any] | None = None,
         priority: int = 0,
+        arrival_time: float | None = None,
     ) -> None:
         try:
             request = OmniDiffusionRequest(
@@ -134,6 +137,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 request_id=request_id,
                 kv_sender_info=kv_sender_info,
                 priority=priority,
+                arrival_time=arrival_time,
             )
 
             if self.od_config.streaming_output:

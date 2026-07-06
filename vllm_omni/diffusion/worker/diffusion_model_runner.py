@@ -22,7 +22,7 @@ from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
-from vllm_omni.determinism import deterministic_sample_seed, is_batch_invariant_enabled
+from vllm_omni.determinism import is_batch_invariant_enabled
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
     install_prompt_embed_cache,
@@ -110,6 +110,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """
         self.vllm_config = vllm_config
         self.od_config = od_config
+        if is_batch_invariant_enabled() and not getattr(self.od_config, "enforce_eager", False):
+            logger.warning(
+                "VLLM_BATCH_INVARIANT=1 forces diffusion enforce_eager=True; "
+                "compile/graph paths are disabled for deterministic rollout."
+            )
+            self.od_config.enforce_eager = True
         self.device = device
         self.pipeline = None
         self.cache_backend = None
@@ -374,11 +380,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return
         gen_device = self._sampling_generator_device(sampling_params)
         if is_batch_invariant_enabled() and request_ids:
-            seeds = [deterministic_sample_seed(sampling_params.seed, request_id) for request_id in request_ids]
-            if len(seeds) == 1:
-                sampling_params.generator = torch.Generator(device=gen_device).manual_seed(seeds[0])
+            if len(request_ids) == 1:
+                sampling_params.generator = torch.Generator(device=gen_device).manual_seed(sampling_params.seed)
                 return
-            sampling_params.generator = [torch.Generator(device=gen_device).manual_seed(seed) for seed in seeds]
+            sampling_params.generator = [
+                torch.Generator(device=gen_device).manual_seed(sampling_params.seed) for _ in request_ids
+            ]
             return
         sampling_params.generator = torch.Generator(device=gen_device).manual_seed(sampling_params.seed)
 

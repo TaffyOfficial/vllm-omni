@@ -959,6 +959,7 @@ class StagePool:
             )
             client = self._diffusion_client(replica_id)
             submit_kwargs.setdefault("priority", req_state.priority)
+            submit_kwargs.setdefault("arrival_time", req_state.request_timestamp)
             await client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
 
@@ -1030,6 +1031,7 @@ class StagePool:
                 request,
                 params,
                 priority=req_state.priority,
+                arrival_time=req_state.request_timestamp,
             )
         else:
             # Refresh the shared output-processor state before yielding to the

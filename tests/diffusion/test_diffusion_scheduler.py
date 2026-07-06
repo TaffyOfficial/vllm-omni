@@ -27,12 +27,19 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-def _make_request(req_id: str, *, priority: int = 0, seed: int | None = None) -> OmniDiffusionRequest:
+def _make_request(
+    req_id: str,
+    *,
+    priority: int = 0,
+    seed: int | None = None,
+    arrival_time: float | None = None,
+) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
         prompt=f"prompt_{req_id}",
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1, seed=seed),
         request_id=req_id,
         priority=priority,
+        arrival_time=arrival_time,
     )
 
 
@@ -409,9 +416,9 @@ class TestRequestScheduler:
         scheduler = RequestScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=3))
 
-        scheduler.add_request(_make_request("b", priority=20, seed=1))
-        scheduler.add_request(_make_request("c", priority=10, seed=2))
-        scheduler.add_request(_make_request("a", priority=10, seed=3))
+        scheduler.add_request(_make_request("b", priority=20, seed=1, arrival_time=1.0))
+        scheduler.add_request(_make_request("a", priority=10, seed=2, arrival_time=2.0))
+        scheduler.add_request(_make_request("c", priority=10, seed=3, arrival_time=1.0))
 
         first = scheduler.schedule()
         assert _new_ids(first) == ["c"]

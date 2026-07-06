@@ -91,3 +91,14 @@ def test_batch_invariant_mode_accepts_explicit_diffusion_seed(monkeypatch):
     )
 
     assert request.sampling_params.seed == 42
+
+
+def test_request_preserves_explicit_arrival_time():
+    request = OmniDiffusionRequest(
+        prompt={"prompt": "a cup of coffee on a table"},
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        request_id="arrival-request",
+        arrival_time=123.5,
+    )
+
+    assert request.arrival_time == 123.5

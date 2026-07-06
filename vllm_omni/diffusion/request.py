@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
+import time
 from dataclasses import dataclass
 
 from vllm_omni.determinism import is_batch_invariant_enabled
@@ -31,11 +32,14 @@ class OmniDiffusionRequest:
     request_id: str
     kv_sender_info: dict | None = None
     priority: int = 0
+    arrival_time: float | None = None
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
         if not isinstance(self.request_id, str) or not self.request_id:
             raise ValueError("OmniDiffusionRequest.request_id must be a non-empty string.")
+        if self.arrival_time is None:
+            self.arrival_time = time.time()
 
         # When neither a generator nor a seed is provided, assign a random seed
         # so that all ranks derive the same generator state.

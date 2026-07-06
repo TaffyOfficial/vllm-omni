@@ -470,13 +470,13 @@ def test_execute_model_batch_outputs_are_request_stable_in_batch_invariant_mode(
 
     assert canonical["req-a"] == shuffled["req-a"] == with_neighbor["req-a"]
     assert canonical["req-b"] == shuffled["req-b"] == with_neighbor["req-b"]
-    assert canonical["req-a"][0] == model_runner_module.deterministic_sample_seed(123, "req-a")
-    assert canonical["req-b"][0] == model_runner_module.deterministic_sample_seed(123, "req-b")
+    assert canonical["req-a"][0] == 123
+    assert canonical["req-b"][0] == 123
 
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_sampling_generator_derives_per_request_generators_in_batch_invariant_mode(monkeypatch):
+def test_sampling_generator_uses_explicit_seed_per_request_in_batch_invariant_mode(monkeypatch):
     runner = _make_runner(cache_backend=None, cache_backend_name="cache_dit")
     sampling_params = SimpleNamespace(generator=None, seed=123, generator_device=None)
 
@@ -487,15 +487,12 @@ def test_sampling_generator_derives_per_request_generators_in_batch_invariant_mo
     generators = sampling_params.generator
     assert isinstance(generators, list)
     assert len(generators) == 2
-    assert [generator.initial_seed() for generator in generators] == [
-        model_runner_module.deterministic_sample_seed(123, "req-b"),
-        model_runner_module.deterministic_sample_seed(123, "req-a"),
-    ]
+    assert [generator.initial_seed() for generator in generators] == [123, 123]
 
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_sampling_generator_derives_single_request_generator_in_batch_invariant_mode(monkeypatch):
+def test_sampling_generator_uses_explicit_seed_for_single_request_in_batch_invariant_mode(monkeypatch):
     runner = _make_runner(cache_backend=None, cache_backend_name="cache_dit")
     sampling_params = SimpleNamespace(generator=None, seed=123, generator_device=None)
 
@@ -505,7 +502,31 @@ def test_sampling_generator_derives_single_request_generator_in_batch_invariant_
 
     generator = sampling_params.generator
     assert isinstance(generator, torch.Generator)
-    assert generator.initial_seed() == model_runner_module.deterministic_sample_seed(123, "req-a")
+    assert generator.initial_seed() == 123
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_batch_invariant_mode_forces_diffusion_eager(monkeypatch):
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    od_config = SimpleNamespace(
+        enforce_eager=False,
+        cfg_kv_collect_func=None,
+    )
+    kv_config = SimpleNamespace(enable_kv_async_prefetch=False, need_recv_cache=False)
+    monkeypatch.setattr(
+        model_runner_module.OmniKVTransferManager,
+        "from_od_config",
+        lambda _od_config: SimpleNamespace(config=kv_config),
+    )
+
+    runner = DiffusionModelRunner(
+        vllm_config=object(),
+        od_config=od_config,
+        device=torch.device("cpu"),
+    )
+
+    assert runner.od_config.enforce_eager is True
 
 
 @pytest.mark.core_model

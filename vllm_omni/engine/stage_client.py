@@ -99,6 +99,7 @@ class StagePoolDiffusionClient(StagePoolClient, Protocol):
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
         priority: int = 0,
+        arrival_time: float | None = None,
     ) -> None: ...
 
     def get_diffusion_output_nowait(self) -> OmniRequestOutput | None: ...

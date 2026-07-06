@@ -335,6 +335,7 @@ class StageDiffusionClient(StageClientBase):
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
         priority: int = 0,
+        arrival_time: float | None = None,
     ) -> None:
         if self._engine_dead:
             raise EngineDeadError()
@@ -353,6 +354,7 @@ class StageDiffusionClient(StageClientBase):
                     "sampling_params": self._sampling_params_to_dict(sampling_params),
                     "kv_sender_info": kv_sender_info,
                     "priority": priority,
+                    "arrival_time": arrival_time,
                 }
             )
         )

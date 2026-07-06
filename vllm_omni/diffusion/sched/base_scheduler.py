@@ -93,7 +93,8 @@ class _BaseScheduler(SchedulerInterface):
         if request_id in self._request_states:
             raise ValueError(f"request_id {request_id!r} is already active.")
         state = self._make_request_state(request_id, request)
-        state.arrival_time = float(self._arrival_seq)
+        request_arrival_time = getattr(request, "arrival_time", None)
+        state.arrival_time = float(request_arrival_time if request_arrival_time is not None else self._arrival_seq)
         self._arrival_seq += 1
         self._request_states[request_id] = state
         self._waiting.append(request_id)

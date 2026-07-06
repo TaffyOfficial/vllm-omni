@@ -79,7 +79,7 @@ def test_waiting_order_matches_vllm_priority_arrival_request_id(monkeypatch):
 
     scheduler._order_waiting_for_batch_invariance()
 
-    assert [request.request_id for request in scheduler.waiting] == ["a", "c", "b"]
+    assert [request.request_id for request in scheduler.waiting] == ["c", "a", "b"]
     assert scheduler.waiting.add_requests_called is True
 
 

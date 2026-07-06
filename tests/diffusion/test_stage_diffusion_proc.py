@@ -98,6 +98,29 @@ async def test_process_request_preserves_priority():
 
 
 @pytest.mark.asyncio
+async def test_process_request_preserves_arrival_time():
+    captured = {}
+
+    class _Engine:
+        async def step(self, request):
+            captured["request"] = request
+            return [MockOmniRequestOutput(request_id=request.request_id)]
+
+    stage_proc = object.__new__(StageDiffusionProc)
+    stage_proc._engine = _Engine()
+
+    result = await stage_proc._process_request(
+        request_id="req-arrival",
+        prompt="prompt",
+        sampling_params_dict=asdict(OmniDiffusionSamplingParams()),
+        arrival_time=789.0,
+    )
+
+    assert result.request_id == "req-arrival"
+    assert captured["request"].arrival_time == 789.0
+
+
+@pytest.mark.asyncio
 async def test_proc_process_request_with_batching_async_output():
     stage_proc = object.__new__(StageDiffusionProc)
     stage_proc._engine = MockDiffusionEngine()

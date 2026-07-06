@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from typing import Any
 
 from vllm import envs
@@ -28,10 +27,3 @@ def deterministic_request_key(request: Any, *, arrival_time: float | None = None
         float(arrival_time or 0.0),
         str(request_id or ""),
     )
-
-
-def deterministic_sample_seed(base_seed: int, sample_id: str) -> int:
-    """Derive a stable per-sample seed from a request seed and sample id."""
-    payload = f"{int(base_seed)}:{sample_id}".encode()
-    digest = hashlib.blake2b(payload, digest_size=8).digest()
-    return int.from_bytes(digest, byteorder="big", signed=False) % (2**63)
