@@ -547,6 +547,8 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
     # `ir_op_priority_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are defined and mapped using `_DIFFUSION_MODELS` via the `arch` key.
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_ir_op_priority_func",
+    "LTX23Pipeline": "get_ltx23_ir_op_priority_func",
+    "LTX23ImageToVideoPipeline": "get_ltx23_ir_op_priority_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {

@@ -19,7 +19,7 @@ import json
 import os
 from collections.abc import Iterable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any, ClassVar
 
 import numpy as np
@@ -61,6 +61,21 @@ from .pipeline_ltx2 import (
 )
 
 logger = init_logger(__name__)
+
+
+def get_ltx23_ir_op_priority_func(od_config: OmniDiffusionConfig):
+    del od_config
+
+    def ir_op_priority_func(ir_op_priority, vllm_config=None):
+        del vllm_config
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        priority_kwargs = {field.name: list(getattr(ir_op_priority, field.name)) for field in fields(ir_op_priority)}
+        priority_kwargs["rms_norm"] = ["vllm_c", "native"]
+        priority_kwargs["fused_add_rms_norm"] = ["vllm_c", "native"]
+        return IrOpPriorityConfig(**priority_kwargs)
+
+    return ir_op_priority_func
 
 
 def _get_audio_latents_from_sampling(sampling: Any) -> torch.Tensor | None:

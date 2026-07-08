@@ -140,3 +140,30 @@ class TestWorkerUsesHook:
         mock_platform.get_default_ir_op_priority.assert_called_once_with(vllm_config)
         mock_get_hook.assert_called_once_with(od_config)
         hook.assert_called_once_with(default_priority, vllm_config=vllm_config)
+
+    @pytest.mark.parametrize("model_class_name", ["LTX23Pipeline", "LTX23ImageToVideoPipeline"])
+    @patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
+    def test_ltx23_ir_op_priority_prefers_vllm_c_rms_norm(
+        self,
+        mock_platform: Mock,
+        model_class_name: str,
+    ) -> None:
+        """Test LTX-2.3 resolves native-only platform RMSNorm defaults back to vllm_c."""
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        from vllm_omni.diffusion.worker.diffusion_worker import _resolve_ir_op_priority
+
+        default_priority = IrOpPriorityConfig.with_default(
+            ["native"],
+            rms_norm=["native"],
+            fused_add_rms_norm=["native"],
+        )
+        mock_platform.get_default_ir_op_priority.return_value = default_priority
+
+        merged = _resolve_ir_op_priority(
+            SimpleNamespace(model_class_name=model_class_name),
+            SimpleNamespace(),
+        )
+
+        assert merged.rms_norm == ["vllm_c", "native"]
+        assert merged.fused_add_rms_norm == ["vllm_c", "native"]

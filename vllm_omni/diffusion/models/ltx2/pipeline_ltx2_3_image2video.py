@@ -23,6 +23,7 @@ from .pipeline_ltx2_3 import (
     _LTX23PromptContext,
     _LTX23RequestInputs,
     get_ltx2_post_process_func,
+    get_ltx23_ir_op_priority_func,
 )
 from .pipeline_ltx2_image2video import LTX2ImageToVideoPipeline, _I2VVideoAudioScheduler
 
@@ -450,5 +451,6 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
 
 __all__ = [
     "LTX23ImageToVideoPipeline",
+    "get_ltx23_ir_op_priority_func",
     "get_ltx2_post_process_func",
 ]
