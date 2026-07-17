@@ -50,6 +50,7 @@ _QuantizationConfigType: TypeAlias = QuantizationConfig | str | Mapping[str, Any
 
 
 class _QuantizationEngineOverrides(TypedDict, total=False):
+    diffusion_quantization_config: _QuantizationConfigType
     quantization_config: _QuantizationConfigType
     quantization: str
 
@@ -113,6 +114,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     ulysses_mode: str
     cfg_parallel_size: int
     vae_patch_parallel_size: int
+    vae_parallel_mode: str
     use_hsdp: bool
     mask_sp_padding: bool
     hsdp_shard_size: int
@@ -136,6 +138,7 @@ class _StageEngineValues:
     runtime: _RuntimeEngineOverrides
     parallel: _ParallelEngineOverrides
     diffusion: _DiffusionEngineOverrides
+    unclaimed: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -427,7 +430,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             self.world_size = other_parallel_world_size
 
 
-@config(config=ConfigDict(arbitrary_types_allowed=True))
+@config(config=ConfigDict(arbitrary_types_allowed=True, extra="forbid"))
 class _DiffusionConfigProjection:
     """Diffusion-specific per-stage settings.
 
@@ -445,9 +448,12 @@ class _DiffusionConfigProjection:
     trust_remote_code: bool = False
     revision: str | None = None
     distributed_executor_backend: str = "mp"
+    engine_backend: str = "default"
+    diffusion_model_runner_cls: str | None = None
     dist_timeout: int | None = None
     nccl_port: int | None = None
     master_port: int | None = None
+    scheduler_port: int = 5555
     host: str | None = None
     port: int | None = None
     model_config: dict[str, Any] = field(default_factory=dict)
@@ -489,6 +495,8 @@ class _DiffusionConfigProjection:
     force_cutlass_fp8: bool = False
     enable_diffusion_pipeline_profiler: bool = False
     step_execution: bool = False
+    streaming_output: bool = False
+    request_batch_max_wait_ms: float = Field(default=0.0, ge=0.0)
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     model_paths: dict[str, str] = field(default_factory=dict)
@@ -512,8 +520,7 @@ class _DiffusionConfigProjection:
         from vllm_omni.diffusion.data import normalize_omni_diffusion_kwargs
 
         normalized_kwargs = normalize_omni_diffusion_kwargs(kwargs)
-        valid_fields = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in normalized_kwargs.items() if k in valid_fields})
+        return cls(**normalized_kwargs)
 
     def __post_init__(self) -> None:
         # Keep diffusion imports lazy so importing vllm_omni.config does not
@@ -713,11 +720,18 @@ _STAGE_DEPLOY_ENGINE_FIELDS: tuple[str, ...] = tuple(_STAGE_DEPLOY_FIELDS)
 
 _DIFFUSION_BACKCOMPAT_ENGINE_FIELDS = frozenset(
     {
+        "auxiliary_text_encoder",
         "diffusion_attention_backend",
         "kv_cache_dtype",
         "kv_cache_skip_layers",
         "kv_cache_skip_steps",
         "static_lora_scale",
+    }
+)
+_DIFFUSION_SERVICE_ENGINE_FIELDS = frozenset(
+    {
+        "max_generated_image_size",
+        "tts_max_instructions_length",
     }
 )
 _DIFFUSION_STAGE_ENGINE_FIELDS = (_DIFFUSION_CONFIG_FIELDS | _DIFFUSION_BACKCOMPAT_ENGINE_FIELDS) - {
@@ -733,6 +747,17 @@ _SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
 _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
 _PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(_ParallelConfigEngineOverrides.__annotations__)
 _PARALLEL_ENGINE_FIELDS = _PARALLEL_CONFIG_ENGINE_FIELDS | {"parallel_config"}
+_KNOWN_STAGE_ENGINE_FIELDS = (
+    _QUANTIZATION_ENGINE_FIELDS
+    | _MODEL_ENGINE_FIELDS
+    | _LOAD_ENGINE_FIELDS
+    | _CACHE_ENGINE_FIELDS
+    | _SCHEDULER_ENGINE_FIELDS
+    | _RUNTIME_ENGINE_FIELDS
+    | _PARALLEL_ENGINE_FIELDS
+    | _DIFFUSION_STAGE_ENGINE_FIELDS
+    | _DIFFUSION_SERVICE_ENGINE_FIELDS
+)
 
 
 def _global_stage_cli_fields() -> frozenset[str]:
@@ -770,11 +795,18 @@ def _stage_engine_overrides(stage_deploy: StageDeployConfig | None) -> dict[str,
 
 def _stage_engine_values(
     stage_deploy: StageDeployConfig | None,
+    execution_type: StageExecutionType,
     stage_cli_overrides: Mapping[str, Any] | None = None,
 ) -> _StageEngineValues:
     engine = _stage_engine_overrides(stage_deploy)
     if stage_cli_overrides:
         engine.update(_copy_value(stage_cli_overrides))
+
+    unclaimed: dict[str, Any] = {}
+    if execution_type == StageExecutionType.DIFFUSION:
+        unclaimed_names = set(engine) - _KNOWN_STAGE_ENGINE_FIELDS
+        unclaimed = {name: _copy_value(engine[name]) for name in sorted(unclaimed_names)}
+
     return _StageEngineValues(
         quantization=cast(
             _QuantizationEngineOverrides,
@@ -790,6 +822,7 @@ def _stage_engine_values(
         runtime=cast(_RuntimeEngineOverrides, _select_engine_overrides(engine, _RUNTIME_ENGINE_FIELDS)),
         parallel=cast(_ParallelEngineOverrides, _select_engine_overrides(engine, _PARALLEL_ENGINE_FIELDS)),
         diffusion=_DiffusionEngineOverrides.from_engine(engine),
+        unclaimed=unclaimed,
     )
 
 
@@ -1042,6 +1075,10 @@ def _build_diffusion_stage_config(
     *,
     model: str | None,
 ) -> VllmOmniDiffusionStageConfig:
+    if engine.unclaimed:
+        unknown_fields = ", ".join(repr(name) for name in engine.unclaimed)
+        raise ValueError(f"Unknown diffusion config field(s) for stage {topology.stage_id}: {unknown_fields}")
+
     common_kwargs, input_proc, next_stage_proc = _build_common_stage_config_kwargs(
         deploy,
         topology,
@@ -1102,6 +1139,7 @@ def _build_quantization_config(
     engine: _QuantizationEngineOverrides,
 ) -> _QuantizationConfigType:
     return _first_defined(
+        engine.get("diffusion_quantization_config"),
         engine.get("quantization_config"),
         engine.get("quantization"),
         deploy.quantization,
@@ -1205,6 +1243,11 @@ def _build_diffusion_config_projection(
     quantization_config: _QuantizationConfigType,
 ) -> _DiffusionConfigProjection:
     diffusion_kwargs = engine.to_kwargs()
+    auxiliary_text_encoder = diffusion_kwargs.pop("auxiliary_text_encoder", None)
+    if auxiliary_text_encoder is not None:
+        extras = dict(_mapping_or_empty(diffusion_kwargs.get("extras")))
+        extras.setdefault("auxiliary_text_encoder", auxiliary_text_encoder)
+        diffusion_kwargs["extras"] = extras
     diffusion_kwargs["stage_id"] = topology.stage_id
     diffusion_kwargs["model_arch"] = _first_defined(
         diffusion_kwargs.get("model_arch"),
@@ -1279,6 +1322,7 @@ class VllmOmniConfig:
                 deploy_by_id.get(topology.stage_id),
                 _stage_engine_values(
                     deploy_by_id.get(topology.stage_id),
+                    topology.execution_type,
                     _stage_cli_overrides(topology.stage_id, cli_overrides),
                 ),
                 model=model,

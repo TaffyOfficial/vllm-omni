@@ -4,6 +4,7 @@
 import copy
 import os
 import random
+import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
 from enum import Enum
@@ -34,16 +35,34 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _normalize_deprecated_diffusion_alias(
+    normalized: dict[str, Any],
+    legacy_name: str,
+    canonical_name: str,
+) -> None:
+    if legacy_name not in normalized:
+        return
+
+    if canonical_name in normalized:
+        raise ValueError(f"Diffusion config fields {legacy_name!r} and {canonical_name!r} cannot be provided together.")
+
+    legacy_value = normalized.pop(legacy_name)
+    if legacy_value is None:
+        return
+
+    warnings.warn(
+        f"Diffusion config field {legacy_name!r} is deprecated; use {canonical_name!r} instead.",
+        FutureWarning,
+        stacklevel=3,
+    )
+    normalized[canonical_name] = legacy_value
+
+
 def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize legacy diffusion kwargs before config construction."""
     normalized = dict(kwargs)
 
-    # Backwards-compatibility: older callers may use a diffusion-specific
-    # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale".
-    if "static_lora_scale" in normalized:
-        if "lora_scale" not in normalized:
-            normalized["lora_scale"] = normalized["static_lora_scale"]
-        normalized.pop("static_lora_scale", None)
+    _normalize_deprecated_diffusion_alias(normalized, "static_lora_scale", "lora_scale")
 
     # Backwards-compatibility: map "quantization" to "quantization_config"
     # so callers using the old field name still work.
@@ -53,18 +72,17 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
         normalized.pop("quantization", None)
 
     # Renamed from kv_cache_* to avoid clashing with vLLM's --kv-cache-dtype.
-    if normalized.get("diffusion_kv_cache_dtype") is None and "kv_cache_dtype" in normalized:
-        normalized["diffusion_kv_cache_dtype"] = normalized.pop("kv_cache_dtype")
-    else:
-        normalized.pop("kv_cache_dtype", None)
-    if normalized.get("diffusion_kv_cache_skip_steps") is None and "kv_cache_skip_steps" in normalized:
-        normalized["diffusion_kv_cache_skip_steps"] = normalized.pop("kv_cache_skip_steps")
-    else:
-        normalized.pop("kv_cache_skip_steps", None)
-    if normalized.get("diffusion_kv_cache_skip_layers") is None and "kv_cache_skip_layers" in normalized:
-        normalized["diffusion_kv_cache_skip_layers"] = normalized.pop("kv_cache_skip_layers")
-    else:
-        normalized.pop("kv_cache_skip_layers", None)
+    _normalize_deprecated_diffusion_alias(normalized, "kv_cache_dtype", "diffusion_kv_cache_dtype")
+    _normalize_deprecated_diffusion_alias(
+        normalized,
+        "kv_cache_skip_steps",
+        "diffusion_kv_cache_skip_steps",
+    )
+    _normalize_deprecated_diffusion_alias(
+        normalized,
+        "kv_cache_skip_layers",
+        "diffusion_kv_cache_skip_layers",
+    )
 
     # Handle "diffusion_attention_backend" shorthand: merge into
     # diffusion_attention_config before field filtering.
