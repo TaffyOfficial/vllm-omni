@@ -12,6 +12,7 @@ from tests.model_tests.diffusion.task_runners import (
     run_and_validate_text_to_image_determinism,
     run_and_validate_text_to_image_multi_output,
     run_and_validate_text_to_image_request,
+    run_and_validate_text_to_video_request,
 )
 
 # NOTE : Hardware marks are added dynamically based on test requirements
@@ -41,9 +42,12 @@ def test_pipeline_on_supported_tasks(
     # since starting the server can take 10+ seconds, even for tiny models.
     #
     # NOTE: Be sure to install pytest-subtests if you're running on pytest < 9
+    # The setting key is the vLLM-Omni pipeline under test; compatible
+    # Diffusers model indexes may advertise a different class.
     omni = build_omni_from_diff_accelerations(
         accelerations=accelerations,
         model=tiny_model_paths[model_name],
+        model_class_name=model_name,
         enforce_eager=True,
     )
     try:
@@ -53,6 +57,8 @@ def test_pipeline_on_supported_tasks(
                     run_and_validate_text_to_image_request(omni)
                 elif task_type == DiffusionTasks.IMAGE_TO_IMAGE:
                     run_and_validate_image_to_image_request(omni)
+                elif task_type == DiffusionTasks.TEXT_TO_VIDEO:
+                    run_and_validate_text_to_video_request(omni)
                 else:
                     raise ValueError(f"Task type {task_type} is not yet supported")
 

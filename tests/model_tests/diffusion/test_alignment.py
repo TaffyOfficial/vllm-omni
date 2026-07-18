@@ -36,7 +36,6 @@ EXCLUDED_MODELS = [
     "LTX2ImageToVideoTwoStagesPipeline",
     "LTX2T2VDMD2Pipeline",
     "LTX2I2VDMD2Pipeline",
-    "LTX23Pipeline",
     "LTX23ImageToVideoPipeline",
     "StableAudioPipeline",
     "WanImageToVideoPipeline",

@@ -2,11 +2,19 @@ import os
 import tempfile
 
 import torch
+from diffusers import (
+    AutoencoderKLLTX2Audio,
+    AutoencoderKLLTX2Video,
+    FlowMatchEulerDiscreteScheduler,
+    LTX2Pipeline,
+    LTX2VideoTransformer3DModel,
+)
 from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
 from diffusers.models.transformers.transformer_flux2 import Flux2Transformer2DModel
 from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinPipeline
-from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
-from transformers import AutoTokenizer, Qwen3Config, Qwen3ForCausalLM
+from diffusers.pipelines.ltx2 import LTX2TextConnectors
+from diffusers.pipelines.ltx2.vocoder import LTX2VocoderWithBWE
+from transformers import AutoTokenizer, Gemma3ForConditionalGeneration, Qwen3Config, Qwen3ForCausalLM
 
 TINY_MODEL_DIR = os.path.join(tempfile.gettempdir(), "vllm-omni-tiny-models")
 
@@ -59,5 +67,153 @@ def tiny_flux2_klein_builder() -> str:
         ),
     )
     # Need dtypes to be consistent; for now we just put it on bfloat16
+    pipe.to(torch.bfloat16).save_pretrained(model_dir)
+    return model_dir
+
+
+def tiny_ltx23_builder() -> str:
+    """Build a tiny LTX-2.3 text-to-video model."""
+    model_dir = _get_tiny_model_path("LTX23Pipeline")
+    text_encoder_id = "hf-internal-testing/tiny-gemma3"
+    tokenizer = AutoTokenizer.from_pretrained(text_encoder_id)
+    tokenizer.model_max_length = 16
+    text_encoder = Gemma3ForConditionalGeneration.from_pretrained(text_encoder_id)
+    caption_channels = text_encoder.config.text_config.hidden_size
+
+    torch.manual_seed(0)
+    transformer = LTX2VideoTransformer3DModel(
+        in_channels=4,
+        out_channels=4,
+        patch_size=1,
+        patch_size_t=1,
+        num_attention_heads=2,
+        attention_head_dim=8,
+        cross_attention_dim=16,
+        audio_in_channels=4,
+        audio_out_channels=4,
+        audio_num_attention_heads=2,
+        audio_attention_head_dim=4,
+        audio_cross_attention_dim=8,
+        num_layers=2,
+        qk_norm="rms_norm_across_heads",
+        caption_channels=caption_channels,
+        rope_double_precision=False,
+        rope_type="split",
+        use_prompt_embeddings=False,
+        perturbed_attn=True,
+        gated_attn=True,
+        cross_attn_mod=True,
+        audio_gated_attn=True,
+        audio_cross_attn_mod=True,
+    )
+    torch.manual_seed(0)
+    connectors = LTX2TextConnectors(
+        caption_channels=caption_channels,
+        text_proj_in_factor=text_encoder.config.text_config.num_hidden_layers + 1,
+        video_connector_num_attention_heads=2,
+        video_connector_attention_head_dim=8,
+        video_connector_num_layers=1,
+        video_connector_num_learnable_registers=None,
+        video_gated_attn=True,
+        audio_connector_num_attention_heads=2,
+        audio_connector_attention_head_dim=4,
+        audio_connector_num_layers=1,
+        audio_connector_num_learnable_registers=None,
+        audio_gated_attn=True,
+        connector_rope_base_seq_len=32,
+        rope_theta=10000.0,
+        rope_double_precision=False,
+        causal_temporal_positioning=False,
+        rope_type="split",
+        per_modality_projections=True,
+        video_hidden_dim=16,
+        audio_hidden_dim=8,
+        proj_bias=True,
+    )
+    torch.manual_seed(0)
+    vae = AutoencoderKLLTX2Video(
+        in_channels=3,
+        out_channels=3,
+        latent_channels=4,
+        block_out_channels=(8,),
+        decoder_block_out_channels=(8,),
+        layers_per_block=(1,),
+        decoder_layers_per_block=(1, 1),
+        spatio_temporal_scaling=(True,),
+        decoder_spatio_temporal_scaling=(True,),
+        decoder_inject_noise=(False, False),
+        downsample_type=("spatial",),
+        upsample_residual=(False,),
+        upsample_factor=(1,),
+        timestep_conditioning=False,
+        patch_size=1,
+        patch_size_t=1,
+        encoder_causal=True,
+        decoder_causal=False,
+    )
+    vae.use_framewise_encoding = False
+    vae.use_framewise_decoding = False
+    torch.manual_seed(0)
+    audio_vae = AutoencoderKLLTX2Audio(
+        base_channels=4,
+        output_channels=2,
+        ch_mult=(1,),
+        num_res_blocks=1,
+        attn_resolutions=None,
+        in_channels=2,
+        resolution=32,
+        latent_channels=2,
+        norm_type="pixel",
+        causality_axis="height",
+        dropout=0.0,
+        mid_block_add_attention=False,
+        sample_rate=16000,
+        mel_hop_length=160,
+        is_causal=True,
+        mel_bins=8,
+    )
+    torch.manual_seed(0)
+    vocoder = LTX2VocoderWithBWE(
+        in_channels=audio_vae.config.output_channels * audio_vae.config.mel_bins,
+        hidden_channels=64,
+        out_channels=2,
+        upsample_kernel_sizes=[11, 4, 4, 4, 4, 4],
+        upsample_factors=[5, 2, 2, 2, 2, 2],
+        resnet_kernel_sizes=[3],
+        resnet_dilations=[[1, 3, 5]],
+        act_fn="leaky_relu",
+        leaky_relu_negative_slope=0.1,
+        antialias=False,
+        final_act_fn="tanh",
+        final_bias=True,
+        bwe_in_channels=audio_vae.config.output_channels * audio_vae.config.mel_bins,
+        bwe_hidden_channels=32,
+        bwe_out_channels=2,
+        bwe_upsample_kernel_sizes=[12, 11, 4, 4, 4],
+        bwe_upsample_factors=[6, 5, 2, 2, 2],
+        bwe_resnet_kernel_sizes=[3],
+        bwe_resnet_dilations=[[1, 3, 5]],
+        bwe_act_fn="leaky_relu",
+        bwe_antialias=False,
+        bwe_final_act_fn="tanh",
+        bwe_final_bias=True,
+        filter_length=512,
+        hop_length=80,
+        window_length=512,
+        num_mel_channels=audio_vae.config.mel_bins,
+        input_sampling_rate=16000,
+        output_sampling_rate=48000,
+    )
+    pipe = LTX2Pipeline(
+        scheduler=FlowMatchEulerDiscreteScheduler(),
+        vae=vae,
+        audio_vae=audio_vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        connectors=connectors,
+        transformer=transformer,
+        vocoder=vocoder,
+        processor=None,
+    )
     pipe.to(torch.bfloat16).save_pretrained(model_dir)
     return model_dir

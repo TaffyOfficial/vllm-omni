@@ -38,5 +38,12 @@ DIFFUSION_TEST_SETTINGS = {
             [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
             [DiffusionAccs.CFG_PARALLEL, DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CPU_OFFLOAD],
         ],
-    )
+    ),
+    "LTX23Pipeline": DiffusionModelTestOpts(
+        model="dg845/LTX-2.3-Diffusers",
+        builder=diff_model_builders.tiny_ltx23_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_VIDEO],
+        check_multi_output=False,
+        check_determinism=False,
+    ),
 }

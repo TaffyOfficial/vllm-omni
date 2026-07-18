@@ -19,6 +19,7 @@ from tests.model_tests.diffusion.task_runners import (
     run_and_validate_online_text_to_image_determinism,
     run_and_validate_online_text_to_image_multi_output,
     run_and_validate_online_text_to_image_request,
+    run_and_validate_online_text_to_video_request,
 )
 
 # NOTE : Hardware marks are added dynamically based on test requirements
@@ -42,6 +43,9 @@ def test_online_on_supported_tasks(
     """Smoke test: start a tiny model server and run each supported task via the API."""
     model_path = tiny_model_paths[model_name]
     server_args = build_server_args_from_diff_accelerations(accelerations)
+    # Keep server-side class selection aligned with the setting key even when
+    # a compatible Diffusers model index advertises a different class.
+    server_args.extend(["--model-class-name", model_name])
     server_args.append("--enforce-eager")
 
     with OmniServer(model_path, server_args) as server:
@@ -61,6 +65,8 @@ def test_online_on_supported_tasks(
                     run_and_validate_online_text_to_image_request(server, client)
                 elif task_type == DiffusionTasks.IMAGE_TO_IMAGE:
                     run_and_validate_online_image_to_image_request(server, client)
+                elif task_type == DiffusionTasks.TEXT_TO_VIDEO:
+                    run_and_validate_online_text_to_video_request(server, client)
                 else:
                     raise ValueError(f"Task type {task_type} is not yet supported")
 

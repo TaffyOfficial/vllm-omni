@@ -16,9 +16,14 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 PROMPT = "Dummy prompt"
+NEGATIVE_PROMPT = "blurry, distorted, low quality"
 IMAGE_DIMS = (512, 512)
 HEIGHT, WIDTH = IMAGE_DIMS
 INPUT_IMAGE = Image.new("RGB", IMAGE_DIMS)
+VIDEO_DIMS = (32, 32)
+VIDEO_HEIGHT, VIDEO_WIDTH = VIDEO_DIMS
+VIDEO_NUM_FRAMES = 5
+VIDEO_FPS = 8
 
 # Offline sampling params
 IMAGE_GEN_SAMPLING_PARAMS = OmniDiffusionSamplingParams(
@@ -35,6 +40,18 @@ IMAGE_GEN_EXTRA_BODY = {
     "num_inference_steps": 4,
     "seed": 42,
 }
+
+VIDEO_GEN_SAMPLING_PARAMS = OmniDiffusionSamplingParams(
+    num_inference_steps=2,
+    height=VIDEO_HEIGHT,
+    width=VIDEO_WIDTH,
+    num_frames=VIDEO_NUM_FRAMES,
+    fps=VIDEO_FPS,
+    guidance_scale=4.0,
+    max_sequence_length=16,
+    output_type="pil",
+    seed=42,
+)
 
 
 ### Shared validation
@@ -55,6 +72,17 @@ def _validate_image_gen_determinism(images_a: list[Image.Image], images_b: list[
     assert np.array_equal(np.array(images_a[0]), np.array(images_b[0]))
 
 
+def _validate_videos(videos: list[list[Image.Image]], expected_n: int = 1):
+    """Validate decoded videos returned by the offline path."""
+    assert len(videos) == expected_n
+    for frames in videos:
+        assert len(frames) == VIDEO_NUM_FRAMES
+        for frame in frames:
+            assert isinstance(frame, Image.Image)
+            assert frame.size == VIDEO_DIMS
+    return videos
+
+
 ### Output extractor utils for offline / online paths respectively
 def _get_offline_images(outputs: list[OmniRequestOutput]) -> list[Image.Image]:
     """Extract the images from an Omni .generate() call."""
@@ -70,6 +98,15 @@ def _get_online_images(responses: list[DiffusionResponse]) -> list[Image.Image]:
     return images
 
 
+def _get_online_videos(responses: list[DiffusionResponse]) -> list[bytes]:
+    """Extract encoded videos from a server response."""
+    assert len(responses) == 1
+    videos = responses[0].videos
+    assert videos is not None
+    assert all(isinstance(video, bytes) and video for video in videos)
+    return videos
+
+
 ### Offline helpers
 def _run_offline_t2i(omni: Omni, params: OmniDiffusionSamplingParams = IMAGE_GEN_SAMPLING_PARAMS):
     return omni.generate({"prompt": PROMPT}, params)
@@ -79,6 +116,13 @@ def _run_offline_i2i(omni: Omni):
     return omni.generate(
         {"prompt": PROMPT, "multi_modal_data": {"image": INPUT_IMAGE}},
         IMAGE_GEN_SAMPLING_PARAMS,
+    )
+
+
+def _run_offline_t2v(omni: Omni):
+    return omni.generate(
+        {"prompt": PROMPT, "negative_prompt": NEGATIVE_PROMPT},
+        VIDEO_GEN_SAMPLING_PARAMS,
     )
 
 
@@ -119,6 +163,25 @@ def _run_online_i2i(server: OmniServer, client: OpenAIClientHandler) -> list[Dif
     return client.send_diffusion_request(request_config)
 
 
+def _run_online_t2v(server: OmniServer, client: OpenAIClientHandler) -> list[DiffusionResponse]:
+    """Run a text-to-video request through the native video API."""
+    request_config = {
+        "model": server.model,
+        "form_data": {
+            "prompt": PROMPT,
+            "negative_prompt": NEGATIVE_PROMPT,
+            "height": VIDEO_HEIGHT,
+            "width": VIDEO_WIDTH,
+            "num_frames": VIDEO_NUM_FRAMES,
+            "fps": VIDEO_FPS,
+            "num_inference_steps": 2,
+            "guidance_scale": 4.0,
+            "seed": 42,
+        },
+    }
+    return client.send_video_diffusion_request(request_config)
+
+
 ### Offline task runners
 def run_and_validate_text_to_image_request(omni: Omni):
     """Run and validate a text to image request."""
@@ -128,6 +191,13 @@ def run_and_validate_text_to_image_request(omni: Omni):
 def run_and_validate_image_to_image_request(omni: Omni):
     """Run and validate an image to image request."""
     _validate_images(_get_offline_images(_run_offline_i2i(omni)))
+
+
+def run_and_validate_text_to_video_request(omni: Omni):
+    """Run and validate a text-to-video request."""
+    outputs = _run_offline_t2v(omni)
+    assert len(outputs) == 1
+    _validate_videos(outputs[0].images)
 
 
 def run_and_validate_text_to_image_determinism(omni: Omni):
@@ -153,6 +223,12 @@ def run_and_validate_online_text_to_image_request(server: OmniServer, client: Op
 def run_and_validate_online_image_to_image_request(server: OmniServer, client: OpenAIClientHandler):
     """Run and validate an image to image request through the server."""
     _validate_images(_get_online_images(_run_online_i2i(server, client)))
+
+
+def run_and_validate_online_text_to_video_request(server: OmniServer, client: OpenAIClientHandler):
+    """Run and validate a text-to-video request through the server."""
+    videos = _get_online_videos(_run_online_t2v(server, client))
+    assert len(videos) == 1
 
 
 def run_and_validate_online_text_to_image_determinism(server: OmniServer, client: OpenAIClientHandler):
