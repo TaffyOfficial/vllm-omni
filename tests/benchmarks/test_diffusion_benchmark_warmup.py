@@ -8,7 +8,7 @@ import pytest
 
 from benchmarks.diffusion.backends import RequestFuncInput
 
-sys.path.insert(0, str(Path(__file__).parents[4] / "benchmarks" / "diffusion"))
+sys.path.insert(0, str(Path(__file__).parents[2] / "benchmarks" / "diffusion"))
 from benchmarks.diffusion.diffusion_benchmark_serving import (  # noqa: E402
     CustomDataset,
     _make_warmup_request,
