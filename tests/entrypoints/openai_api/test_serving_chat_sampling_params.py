@@ -6,6 +6,7 @@ Tests that standard OpenAI API parameters (max_tokens, temperature, etc.)
 are correctly applied to the comprehension stage while preserving YAML defaults.
 """
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -132,6 +133,50 @@ def test_openai_sampling_fields_contains_expected_fields():
         "presence_penalty",
     }
     assert OmniOpenAIServingChat._OPENAI_SAMPLING_FIELDS == expected_fields
+
+
+def test_diffusion_request_extra_args_reach_sampling_params(serving_chat):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    serving_chat._diffusion_extra_body_params = frozenset({"cfg_text_scale"})
+    request = SimpleNamespace(model_fields_set={"seed"})
+    sampling_params = OmniDiffusionSamplingParams(extra_args={"stage_default": True})
+
+    serving_chat._apply_diffusion_request_extra_args(
+        sampling_params,
+        request,
+        {
+            "cfg_text_scale": 7.0,
+            "extra_args": {"sample_solver": "euler"},
+        },
+    )
+
+    assert sampling_params.extra_args == {
+        "stage_default": True,
+        "cfg_text_scale": 7.0,
+        "sample_solver": "euler",
+    }
+
+
+def test_diffusion_chat_returns_bad_request_for_duplicate_parameter(serving_chat, mocker: MockerFixture):
+    serving_chat._diffusion_mode = True
+    serving_chat._diffusion_extra_body_params = frozenset({"flow_shift"})
+    serving_chat._extract_diffusion_prompt_and_media = mocker.Mock(return_value=("prompt", [], [], []))
+    request = SimpleNamespace(
+        messages=[],
+        model_fields_set=set(),
+        model_extra={
+            "flow_shift": 1.0,
+            "extra_args": {"flow_shift": 2.0},
+        },
+    )
+
+    response = asyncio.run(serving_chat._create_diffusion_chat_completion(request))
+
+    assert response.error.code == 400
+    assert response.error.message == (
+        'Parameter "flow_shift" was provided more than once: request.flow_shift, request.extra_args.flow_shift.'
+    )
 
 
 # =============================================================================

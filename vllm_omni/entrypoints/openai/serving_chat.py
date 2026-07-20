@@ -25,6 +25,7 @@ from vllm.entrypoints.chat_utils import (
 
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.diffusion_request_utils import normalize_diffusion_request_extra_args
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -152,6 +153,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     _supported_speakers: set[str] | None = None
     _diffusion_extra_body_params: frozenset[str] | None = None
     _diffusion_extra_output_params: frozenset[str] | None = None
+    _diffusion_sampling_fields = frozenset(field.name for field in fields(OmniDiffusionSamplingParams))
 
     # Harmony flag (always False for vllm-omni models)
     use_harmony: bool = False
@@ -290,6 +292,34 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         self._diffusion_extra_body_params = params
         return params
+
+    def _apply_diffusion_request_extra_args(
+        self,
+        sampling_params: OmniDiffusionSamplingParams,
+        request: ChatCompletionRequest,
+        extra_body: dict[str, Any],
+    ) -> None:
+        explicit_fields = getattr(request, "model_fields_set", None)
+        if explicit_fields is None:
+            explicit_fields = getattr(request, "__fields_set__", set())
+        provided_root_fields = set(extra_body)
+        provided_root_fields.update(set(explicit_fields) & self._diffusion_sampling_fields)
+
+        normalized = normalize_diffusion_request_extra_args(
+            provided_root_fields=provided_root_fields,
+            extra_args=extra_body.get("extra_args"),
+            extra_params=extra_body.get("extra_params"),
+        )
+        apply_declared_extra_args(
+            sampling_params,
+            self._get_diffusion_extra_body_params(),
+            extra_body,
+        )
+        if normalized:
+            sampling_params.extra_args = {
+                **(sampling_params.extra_args or {}),
+                **normalized,
+            }
 
     def _get_diffusion_extra_output_params(
         self,
@@ -530,7 +560,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 return audio_format_check
 
         num_inference_steps = None
-        extra_body: dict[str, Any] = {}
+        # The OpenAI client flattens ``extra_body`` into request extras, while
+        # raw HTTP callers may send the nested compatibility form.
+        extra_body = getattr(request, "extra_body", None) or request.model_extra or {}
         # Omni multistage image generation: Stage-0 (AR) should receive a clean
         # text prompt (and optional conditioning image/size) so the model's own
         # processor can construct the correct inputs.
@@ -543,12 +575,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
                 if not extracted_prompt:
                     return self.create_error_response("No text prompt found in messages")
-
-                # [NOTE] When sending request via openai client Python library,
-                #   `extra_body` is flattented and merged into the payload's root.
-                #   These extra fields are accessible via `model_extra` property (from Pydantic base class).
-                #   When sending raw request with curl, no flattening happens. Directly read the `extra_body` dict.
-                extra_body = getattr(request, "extra_body", None) or request.model_extra or {}
 
                 height, width = self._resolve_height_width_from_extra_body(extra_body)
 
@@ -676,7 +702,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         sp.width = _image_gen_width
                     if hasattr(sp, "num_inference_steps") and num_inference_steps is not None:
                         sp.num_inference_steps = num_inference_steps
-                    apply_declared_extra_args(sp, self._get_diffusion_extra_body_params(), extra_body)
+                    if isinstance(sp, OmniDiffusionSamplingParams):
+                        self._apply_diffusion_request_extra_args(sp, request, extra_body)
+                    else:
+                        apply_declared_extra_args(sp, self._get_diffusion_extra_body_params(), extra_body)
 
                 self._log_inputs(
                     request_id,
@@ -3473,7 +3502,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 gen_params.guidance_scale = guidance_scale
             if true_cfg_scale is not None:
                 gen_params.true_cfg_scale = true_cfg_scale
-            apply_declared_extra_args(gen_params, self._get_diffusion_extra_body_params(), extra_body)
+            try:
+                self._apply_diffusion_request_extra_args(gen_params, request, extra_body)
+            except ValueError as e:
+                return self._create_error_response(str(e), status_code=400)
             if num_frames is not None:
                 gen_params.num_frames = num_frames
             if guidance_scale_2 is not None:
@@ -3482,14 +3514,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 gen_params.layers = layers
             if resolution is not None:
                 gen_params.resolution = resolution
-
-            # Pipeline-agnostic escape hatch (mirrors ``extra_params`` on the /v1/videos
-            # endpoint in ``serving_video.py``): a single reserved ``extra_args`` dict in
-            # ``extra_body`` flows straight into ``gen_params.extra_args``, with no keys
-            # hardcoded here.
-            extra_args_body = extra_body.get("extra_args")
-            if isinstance(extra_args_body, dict):
-                gen_params.extra_args.update(extra_args_body)
 
             # Parse per-request LoRA.
             if lora_body and isinstance(lora_body, dict):
