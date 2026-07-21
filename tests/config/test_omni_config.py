@@ -924,6 +924,17 @@ def test_omni_diffusion_config_from_kwargs_normalizes_compatibility_fields(monke
     assert cfg.extras["auxiliary_text_encoder"] == "example/encoder"
 
 
+def test_omni_diffusion_config_from_kwargs_rejects_quantization_alias_conflict():
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    with pytest.raises(ValueError, match=r"quantization.*quantization_config"):
+        OmniDiffusionConfig.from_kwargs(
+            model="test",
+            quantization="fp8",
+            quantization_config={"method": "fp8", "activation_scheme": "static"},
+        )
+
+
 @pytest.mark.parametrize(
     ("legacy_name", "canonical_name", "value"),
     [

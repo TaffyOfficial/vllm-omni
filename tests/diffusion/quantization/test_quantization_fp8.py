@@ -413,21 +413,6 @@ def test_quantization_key_maps_to_quantization_config():
 
 
 @hardware_test(res={"cuda": "L4"})
-def test_quantization_config_key_takes_priority():
-    """When both 'quantization' and 'quantization_config' are set,
-    'quantization_config' takes priority."""
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-
-    config = OmniDiffusionConfig.from_kwargs(
-        model="test",
-        quantization="fp8",
-        quantization_config={"method": "fp8", "activation_scheme": "static"},
-    )
-    assert config.quantization_config is not None
-    assert config.quantization_config.activation_scheme == "static"
-
-
-@hardware_test(res={"cuda": "L4"})
 def test_single_stage_quantization_config_key():
     """Single-stage model using quantization_config (dict) key generates images."""
     images, _ = _generate_single_stage_image(
