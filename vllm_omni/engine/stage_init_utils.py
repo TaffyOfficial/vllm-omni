@@ -25,7 +25,7 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig, normalize_omni_diffusion_kwargs
+from vllm_omni.diffusion.data import OmniDiffusionConfig, normalize_omni_diffusion_engine_kwargs
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
@@ -1076,7 +1076,7 @@ def get_stage_connector_spec(
     return {}
 
 
-_DIFFUSION_STARTUP_SERVICE_FIELDS = frozenset(
+_DIFFUSION_SERVICE_ONLY_FIELDS = frozenset(
     {
         "max_generated_image_size",
         "tts_max_instructions_length",
@@ -1086,24 +1086,14 @@ _DIFFUSION_STARTUP_SERVICE_FIELDS = frozenset(
 
 def _strict_diffusion_config_kwargs(engine_args: dict[str, Any]) -> dict[str, Any]:
     """Return the diffusion-owned startup payload and reject unowned keys."""
-    normalized = normalize_omni_diffusion_kwargs(engine_args)
+    normalized = normalize_omni_diffusion_engine_kwargs(engine_args)
     normalized = {key: value for key, value in normalized.items() if value is not None}
 
-    diffusion_quantization = normalized.pop("diffusion_quantization_config", None)
-    if diffusion_quantization is not None:
-        normalized["quantization_config"] = diffusion_quantization
-
-    auxiliary_text_encoder = normalized.pop("auxiliary_text_encoder", None)
-    if auxiliary_text_encoder is not None:
-        extras = dict(normalized.get("extras") or {})
-        extras.setdefault("auxiliary_text_encoder", auxiliary_text_encoder)
-        normalized["extras"] = extras
-
     diffusion_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
-    shared_engine_fields = frozenset(config_field.name for config_field in fields(OmniEngineArgs))
-    unknown_fields = sorted(
-        set(normalized) - diffusion_fields - shared_engine_fields - _DIFFUSION_STARTUP_SERVICE_FIELDS
+    shared_engine_fields = frozenset(config_field.name for config_field in fields(OmniEngineArgs)) - (
+        _DIFFUSION_SERVICE_ONLY_FIELDS
     )
+    unknown_fields = sorted(set(normalized) - diffusion_fields - shared_engine_fields)
     if unknown_fields:
         stage_id = normalized.get("stage_id", "unknown")
         names = ", ".join(repr(name) for name in unknown_fields)
@@ -1120,7 +1110,7 @@ def build_diffusion_config(
     """Build diffusion config for a stage."""
 
     engine_args_dict = build_engine_args_dict(stage_cfg, model)
-    od_config = OmniDiffusionConfig(**_strict_diffusion_config_kwargs(engine_args_dict))
+    od_config = OmniDiffusionConfig.from_kwargs(**_strict_diffusion_config_kwargs(engine_args_dict))
 
     num_devices_per_stage = od_config.parallel_config.world_size
     device_control_env = current_omni_platform.device_control_env_var

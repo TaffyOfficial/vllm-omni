@@ -50,7 +50,6 @@ _QuantizationConfigType: TypeAlias = QuantizationConfig | str | Mapping[str, Any
 
 
 class _QuantizationEngineOverrides(TypedDict, total=False):
-    diffusion_quantization_config: _QuantizationConfigType
     quantization_config: _QuantizationConfigType
     quantization: str
 
@@ -453,7 +452,6 @@ class _DiffusionConfigProjection:
     dist_timeout: int | None = None
     nccl_port: int | None = None
     master_port: int | None = None
-    scheduler_port: int = 5555
     host: str | None = None
     port: int | None = None
     model_config: dict[str, Any] = field(default_factory=dict)
@@ -718,23 +716,7 @@ _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
 
 _STAGE_DEPLOY_ENGINE_FIELDS: tuple[str, ...] = tuple(_STAGE_DEPLOY_FIELDS)
 
-_DIFFUSION_BACKCOMPAT_ENGINE_FIELDS = frozenset(
-    {
-        "auxiliary_text_encoder",
-        "diffusion_attention_backend",
-        "kv_cache_dtype",
-        "kv_cache_skip_layers",
-        "kv_cache_skip_steps",
-        "static_lora_scale",
-    }
-)
-_DIFFUSION_SERVICE_ENGINE_FIELDS = frozenset(
-    {
-        "max_generated_image_size",
-        "tts_max_instructions_length",
-    }
-)
-_DIFFUSION_STAGE_ENGINE_FIELDS = (_DIFFUSION_CONFIG_FIELDS | _DIFFUSION_BACKCOMPAT_ENGINE_FIELDS) - {
+_DIFFUSION_STAGE_ENGINE_FIELDS = _DIFFUSION_CONFIG_FIELDS - {
     "model",
     "stage_id",
 }
@@ -756,7 +738,6 @@ _KNOWN_STAGE_ENGINE_FIELDS = (
     | _RUNTIME_ENGINE_FIELDS
     | _PARALLEL_ENGINE_FIELDS
     | _DIFFUSION_STAGE_ENGINE_FIELDS
-    | _DIFFUSION_SERVICE_ENGINE_FIELDS
 )
 
 
@@ -804,6 +785,9 @@ def _stage_engine_values(
 
     unclaimed: dict[str, Any] = {}
     if execution_type == StageExecutionType.DIFFUSION:
+        from vllm_omni.diffusion.data import normalize_omni_diffusion_engine_kwargs
+
+        engine = normalize_omni_diffusion_engine_kwargs(engine)
         unclaimed_names = set(engine) - _KNOWN_STAGE_ENGINE_FIELDS
         unclaimed = {name: _copy_value(engine[name]) for name in sorted(unclaimed_names)}
 
@@ -1139,7 +1123,6 @@ def _build_quantization_config(
     engine: _QuantizationEngineOverrides,
 ) -> _QuantizationConfigType:
     return _first_defined(
-        engine.get("diffusion_quantization_config"),
         engine.get("quantization_config"),
         engine.get("quantization"),
         deploy.quantization,
@@ -1243,11 +1226,6 @@ def _build_diffusion_config_projection(
     quantization_config: _QuantizationConfigType,
 ) -> _DiffusionConfigProjection:
     diffusion_kwargs = engine.to_kwargs()
-    auxiliary_text_encoder = diffusion_kwargs.pop("auxiliary_text_encoder", None)
-    if auxiliary_text_encoder is not None:
-        extras = dict(_mapping_or_empty(diffusion_kwargs.get("extras")))
-        extras.setdefault("auxiliary_text_encoder", auxiliary_text_encoder)
-        diffusion_kwargs["extras"] = extras
     diffusion_kwargs["stage_id"] = topology.stage_id
     diffusion_kwargs["model_arch"] = _first_defined(
         diffusion_kwargs.get("model_arch"),

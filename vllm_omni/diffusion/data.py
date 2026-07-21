@@ -63,13 +63,7 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
     normalized = dict(kwargs)
 
     _normalize_deprecated_diffusion_alias(normalized, "static_lora_scale", "lora_scale")
-
-    # Backwards-compatibility: map "quantization" to "quantization_config"
-    # so callers using the old field name still work.
-    if "quantization" in normalized and normalized.get("quantization_config", None) is None:
-        normalized["quantization_config"] = normalized.pop("quantization")
-    else:
-        normalized.pop("quantization", None)
+    _normalize_deprecated_diffusion_alias(normalized, "quantization", "quantization_config")
 
     # Renamed from kv_cache_* to avoid clashing with vLLM's --kv-cache-dtype.
     _normalize_deprecated_diffusion_alias(normalized, "kv_cache_dtype", "diffusion_kv_cache_dtype")
@@ -104,6 +98,41 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
     for key in ("diffusers_load_kwargs", "diffusers_call_kwargs"):
         if key in normalized and normalized[key] is None:
             normalized[key] = {}
+
+    return normalized
+
+
+def normalize_omni_diffusion_engine_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize legacy engine ingress before diffusion config construction."""
+    engine_kwargs = dict(kwargs)
+    quantization = engine_kwargs.pop("quantization", None)
+    normalized = normalize_omni_diffusion_kwargs(engine_kwargs)
+
+    diffusion_quantization = normalized.pop("diffusion_quantization_config", None)
+    engine_quantization = diffusion_quantization if diffusion_quantization is not None else quantization
+    engine_quantization_name = "diffusion_quantization_config" if diffusion_quantization is not None else "quantization"
+    if diffusion_quantization is not None and quantization is not None:
+        raise ValueError(
+            "Diffusion engine fields 'diffusion_quantization_config' and 'quantization' cannot be provided together."
+        )
+    if engine_quantization is not None:
+        if normalized.get("quantization_config") is not None:
+            raise ValueError(
+                f"Diffusion engine fields {engine_quantization_name!r} and "
+                "'quantization_config' cannot be provided together."
+            )
+        normalized["quantization_config"] = engine_quantization
+
+    auxiliary_text_encoder = normalized.pop("auxiliary_text_encoder", None)
+    if auxiliary_text_encoder is not None:
+        extras = dict(normalized.get("extras") or {})
+        if "auxiliary_text_encoder" in extras:
+            raise ValueError(
+                "Diffusion engine field 'auxiliary_text_encoder' cannot be provided "
+                "both at the top level and in 'extras'."
+            )
+        extras["auxiliary_text_encoder"] = auxiliary_text_encoder
+        normalized["extras"] = extras
 
     return normalized
 
@@ -1255,12 +1284,14 @@ class OmniDiffusionConfig:
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
         kwargs = normalize_omni_diffusion_kwargs(kwargs)
 
-        # Filter kwargs to only include valid fields
         valid_fields = {f.name for f in fields(cls)}
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
+        unknown_fields = sorted(set(kwargs) - valid_fields)
+        if unknown_fields:
+            stage_id = kwargs.get("stage_id", "unknown")
+            names = ", ".join(repr(name) for name in unknown_fields)
+            raise ValueError(f"Unknown diffusion config field(s) for stage {stage_id}: {names}")
 
-        instance = cls(**filtered_kwargs)
-        return instance
+        return cls(**kwargs)
 
 
 @dataclass

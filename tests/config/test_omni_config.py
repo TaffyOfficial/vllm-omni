@@ -880,6 +880,41 @@ def test_diffusion_config_projection_rejects_unknown_field():
         omni_config_module._DiffusionConfigProjection.from_kwargs(enable_sleep_mod=True)
 
 
+def test_omni_diffusion_config_from_kwargs_rejects_unknown_field():
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    with pytest.raises(ValueError, match=r"stage unknown.*enable_sleep_mod"):
+        OmniDiffusionConfig.from_kwargs(enable_sleep_mod=True)
+
+
+@pytest.mark.parametrize("field_name", ["diffusion_quantization_config", "auxiliary_text_encoder"])
+def test_omni_diffusion_config_from_kwargs_rejects_engine_only_field(field_name):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    with pytest.raises(ValueError, match=field_name):
+        OmniDiffusionConfig.from_kwargs(**{field_name: "example"})
+
+
+def test_diffusion_config_projection_rejects_engine_only_field():
+    with pytest.raises(ValidationError, match="auxiliary_text_encoder"):
+        omni_config_module._DiffusionConfigProjection.from_kwargs(auxiliary_text_encoder="example/encoder")
+
+
+def test_omni_diffusion_config_from_kwargs_normalizes_compatibility_fields(monkeypatch):
+    from vllm_omni.diffusion import data as diffusion_data
+
+    monkeypatch.setattr(diffusion_data, "build_quant_config", lambda config: config)
+
+    with pytest.warns(FutureWarning, match=r"quantization.*quantization_config"):
+        cfg = diffusion_data.OmniDiffusionConfig.from_kwargs(
+            quantization={"method": "example_quant"},
+            extras={"auxiliary_text_encoder": "example/encoder"},
+        )
+
+    assert cfg.quantization_config == {"method": "example_quant"}
+    assert cfg.extras["auxiliary_text_encoder"] == "example/encoder"
+
+
 @pytest.mark.parametrize(
     ("legacy_name", "canonical_name", "value"),
     [
@@ -887,6 +922,7 @@ def test_diffusion_config_projection_rejects_unknown_field():
         ("kv_cache_dtype", "diffusion_kv_cache_dtype", "fp8"),
         ("kv_cache_skip_steps", "diffusion_kv_cache_skip_steps", "0-1"),
         ("kv_cache_skip_layers", "diffusion_kv_cache_skip_layers", "2-3"),
+        ("quantization", "quantization_config", "fp8"),
     ],
 )
 def test_diffusion_config_projection_rejects_alias_conflict(legacy_name, canonical_name, value):
@@ -936,16 +972,39 @@ def test_startup_diffusion_payload_normalizes_compatibility_fields():
     payload = _strict_diffusion_config_kwargs(
         {
             "stage_id": 2,
-            "quantization_config": {"method": "fallback_quant"},
             "diffusion_quantization_config": {"method": "example_quant"},
             "auxiliary_text_encoder": "example/encoder",
-            "max_generated_image_size": 1024 * 1024,
         }
     )
 
     assert payload["quantization_config"] == {"method": "example_quant"}
     assert payload["extras"]["auxiliary_text_encoder"] == "example/encoder"
-    assert "max_generated_image_size" not in payload
+
+
+def test_startup_diffusion_payload_rejects_quantization_source_conflict():
+    with pytest.raises(ValueError, match=r"diffusion_quantization_config.*quantization_config"):
+        _strict_diffusion_config_kwargs(
+            {
+                "diffusion_quantization_config": {"method": "example_quant"},
+                "quantization_config": {"method": "fallback_quant"},
+            }
+        )
+
+
+@pytest.mark.parametrize("field_name", ["max_generated_image_size", "tts_max_instructions_length"])
+def test_startup_diffusion_payload_rejects_service_only_field(field_name):
+    with pytest.raises(ValueError, match=field_name):
+        _strict_diffusion_config_kwargs({"stage_id": 2, field_name: 1000})
+
+
+def test_startup_diffusion_payload_rejects_auxiliary_text_encoder_conflict():
+    with pytest.raises(ValueError, match=r"auxiliary_text_encoder.*top level.*extras"):
+        _strict_diffusion_config_kwargs(
+            {
+                "auxiliary_text_encoder": "top-level/encoder",
+                "extras": {"auxiliary_text_encoder": "extras/encoder"},
+            }
+        )
 
 
 def test_diffusion_attention_backend_keeps_per_role_config():
@@ -1030,11 +1089,9 @@ def test_from_pipeline_config_partitions_known_diffusion_stage_fields(tmp_path):
                 "    engine_backend: custom.engine.Backend",
                 "    model_config:",
                 "      default_robot_embodiment: test",
-                "    diffusion_quantization_config:",
+                "    quantization_config:",
                 "      method: example_quant",
                 "    auxiliary_text_encoder: example/encoder",
-                "    max_generated_image_size: 1048576",
-                "    tts_max_instructions_length: 1000",
             ]
         )
     )
@@ -1053,6 +1110,74 @@ def test_from_pipeline_config_partitions_known_diffusion_stage_fields(tmp_path):
     assert stage.diffusion_config.extras["auxiliary_text_encoder"] == "example/encoder"
 
 
+@pytest.mark.parametrize(
+    ("field_name", "yaml_value"),
+    [
+        ("max_generated_image_size", "1048576"),
+        ("tts_max_instructions_length", "1000"),
+    ],
+)
+def test_from_pipeline_config_rejects_noncanonical_diffusion_stage_field(tmp_path, field_name, yaml_value):
+    deploy_path = tmp_path / f"dreamzero_{field_name}.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                f"    {field_name}: {yaml_value}",
+            ]
+        )
+    )
+
+    with pytest.raises(ValueError, match=field_name):
+        _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path))
+
+
+def test_from_pipeline_config_rejects_auxiliary_text_encoder_conflict(tmp_path):
+    deploy_path = tmp_path / "dreamzero_auxiliary_text_encoder_conflict.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    auxiliary_text_encoder: top-level/encoder",
+                "    engine_extras:",
+                "      extras:",
+                "        auxiliary_text_encoder: extras/encoder",
+            ]
+        )
+    )
+
+    with pytest.raises(ValueError, match=r"auxiliary_text_encoder.*top level.*extras"):
+        _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path))
+
+
+def test_from_pipeline_config_rejects_quantization_source_conflict(tmp_path):
+    deploy_path = tmp_path / "dreamzero_quantization_conflict.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    diffusion_quantization_config:",
+                "      method: example_quant",
+                "    engine_extras:",
+                "      quantization_config:",
+                "        method: fallback_quant",
+            ]
+        )
+    )
+
+    with pytest.raises(ValueError, match=r"diffusion_quantization_config.*quantization_config"):
+        _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path))
+
+
 def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_args(tmp_path):
     deploy_path = tmp_path / "dreamzero_diffusion_aliases.yaml"
     deploy_path.write_text(
@@ -1063,6 +1188,9 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
                 "stages:",
                 "  - stage_id: 0",
                 "    diffusion_attention_backend: flash_attn",
+                "    diffusion_quantization_config:",
+                "      method: example_quant",
+                "    auxiliary_text_encoder: example/encoder",
             ]
         )
     )
@@ -1074,6 +1202,8 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
 
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.diffusion_config.diffusion_attention_config.default.backend == "flash_attn"
+    assert stage.diffusion_config.quantization_config == {"method": "example_quant"}
+    assert stage.diffusion_config.extras["auxiliary_text_encoder"] == "example/encoder"
 
 
 def test_diffusion_config_field_classification_covers_current_fields():
