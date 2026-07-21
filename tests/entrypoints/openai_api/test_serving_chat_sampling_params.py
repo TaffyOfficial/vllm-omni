@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from pytest_mock import MockerFixture
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.sampling_params import SamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -139,7 +140,7 @@ def test_diffusion_request_extra_args_reach_sampling_params(serving_chat):
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     serving_chat._diffusion_extra_body_params = frozenset({"cfg_text_scale"})
-    request = SimpleNamespace(model_fields_set={"seed"})
+    request = ChatCompletionRequest(model="test", messages=[], seed=1)
     sampling_params = OmniDiffusionSamplingParams(extra_args={"stage_default": True})
 
     serving_chat._apply_diffusion_request_extra_args(
@@ -158,17 +159,34 @@ def test_diffusion_request_extra_args_reach_sampling_params(serving_chat):
     }
 
 
+def test_unknown_root_extra_does_not_conflict_with_canonical_extra_args(serving_chat):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    serving_chat._diffusion_extra_body_params = frozenset()
+    request = ChatCompletionRequest(model="test", messages=[])
+    sampling_params = OmniDiffusionSamplingParams()
+
+    serving_chat._apply_diffusion_request_extra_args(
+        sampling_params,
+        request,
+        {
+            "model_specific_option": "ignored-root-value",
+            "extra_args": {"model_specific_option": "canonical-value"},
+        },
+    )
+
+    assert sampling_params.extra_args == {"model_specific_option": "canonical-value"}
+
+
 def test_diffusion_chat_returns_bad_request_for_duplicate_parameter(serving_chat, mocker: MockerFixture):
     serving_chat._diffusion_mode = True
     serving_chat._diffusion_extra_body_params = frozenset({"flow_shift"})
     serving_chat._extract_diffusion_prompt_and_media = mocker.Mock(return_value=("prompt", [], [], []))
-    request = SimpleNamespace(
+    request = ChatCompletionRequest(
+        model="test",
         messages=[],
-        model_fields_set=set(),
-        model_extra={
-            "flow_shift": 1.0,
-            "extra_args": {"flow_shift": 2.0},
-        },
+        flow_shift=1.0,
+        extra_args={"flow_shift": 2.0},
     )
 
     response = asyncio.run(serving_chat._create_diffusion_chat_completion(request))
