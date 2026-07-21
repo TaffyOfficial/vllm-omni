@@ -25,6 +25,7 @@ def normalize_diffusion_request_extra_args(
     nested_provided_root_fields: Collection[str] = (),
     nested_extra_args: object | None = None,
     nested_extra_params: object | None = None,
+    root_field_aliases: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Normalize model-specific diffusion request arguments without overwrites.
 
@@ -41,13 +42,14 @@ def normalize_diffusion_request_extra_args(
     nested_canonical = _copy_request_mapping("extra_body.extra_args", nested_extra_args)
     nested_legacy = _copy_request_mapping("extra_body.extra_params", nested_extra_params)
 
+    aliases = root_field_aliases or {}
     sources_by_key: dict[str, list[str]] = {}
     root_fields = set(provided_root_fields) - {"extra_args", "extra_params"}
-    for key in root_fields:
-        sources_by_key.setdefault(key, []).append(f"request.{key}")
+    for key in sorted(root_fields):
+        sources_by_key.setdefault(aliases.get(key, key), []).append(f"request.{key}")
     nested_root_fields = set(nested_provided_root_fields) - {"extra_args", "extra_params"}
-    for key in nested_root_fields:
-        sources_by_key.setdefault(key, []).append(f"request.extra_body.{key}")
+    for key in sorted(nested_root_fields):
+        sources_by_key.setdefault(aliases.get(key, key), []).append(f"request.extra_body.{key}")
     for key in canonical:
         sources_by_key.setdefault(key, []).append(f"request.extra_args.{key}")
     for key in legacy:

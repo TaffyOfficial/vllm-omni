@@ -136,23 +136,26 @@ def test_openai_sampling_fields_contains_expected_fields():
     assert OmniOpenAIServingChat._OPENAI_SAMPLING_FIELDS == expected_fields
 
 
-def test_diffusion_request_extra_args_reach_sampling_params(serving_chat):
+def test_diffusion_request_overrides_reach_sampling_params(serving_chat):
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     serving_chat._diffusion_extra_body_params = frozenset({"cfg_text_scale"})
     request = ChatCompletionRequest(model="test", messages=[], seed=1)
     sampling_params = OmniDiffusionSamplingParams(extra_args={"stage_default": True})
 
-    serving_chat._apply_diffusion_request_extra_args(
+    serving_chat._apply_diffusion_request_overrides(
         sampling_params,
         request,
         {
             "cfg_text_scale": 7.0,
+            "guidance_scale": 6.0,
             "extra_args": {"sample_solver": "euler"},
         },
         {},
     )
 
+    assert sampling_params.seed == 1
+    assert sampling_params.guidance_scale == 6.0
     assert sampling_params.extra_args == {
         "stage_default": True,
         "cfg_text_scale": 7.0,
@@ -167,7 +170,7 @@ def test_unknown_root_extra_does_not_conflict_with_canonical_extra_args(serving_
     request = ChatCompletionRequest(model="test", messages=[])
     sampling_params = OmniDiffusionSamplingParams()
 
-    serving_chat._apply_diffusion_request_extra_args(
+    serving_chat._apply_diffusion_request_overrides(
         sampling_params,
         request,
         {
@@ -178,6 +181,50 @@ def test_unknown_root_extra_does_not_conflict_with_canonical_extra_args(serving_
     )
 
     assert sampling_params.extra_args == {"model_specific_option": "canonical-value"}
+
+
+def test_internal_sampling_state_is_not_a_public_root_field(serving_chat):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    serving_chat._diffusion_extra_body_params = frozenset()
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        latents="ignored-root-value",
+        extra_args={"latents": "model-specific-value"},
+    )
+    sampling_params = OmniDiffusionSamplingParams()
+
+    root_extra_body, nested_extra_body = serving_chat._split_diffusion_request_extra_body(request)
+    serving_chat._apply_diffusion_request_overrides(
+        sampling_params,
+        request,
+        root_extra_body,
+        nested_extra_body,
+    )
+
+    assert sampling_params.latents is None
+    assert sampling_params.extra_args == {"latents": "model-specific-value"}
+
+
+def test_diffusion_chat_rejects_flattened_nested_control_conflict(serving_chat, mocker: MockerFixture):
+    serving_chat._diffusion_mode = True
+    serving_chat._diffusion_extra_body_params = frozenset()
+    serving_chat._extract_diffusion_prompt_and_media = mocker.Mock(return_value=("prompt", [], [], []))
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        negative_prompt="root",
+        extra_body={"negative_prompt": "nested"},
+    )
+
+    response = asyncio.run(serving_chat._create_diffusion_chat_completion(request))
+
+    assert response.error.code == 400
+    assert response.error.message == (
+        'Parameter "negative_prompt" was provided more than once: '
+        "request.negative_prompt, request.extra_body.negative_prompt."
+    )
 
 
 def test_diffusion_chat_returns_bad_request_for_duplicate_parameter(serving_chat, mocker: MockerFixture):

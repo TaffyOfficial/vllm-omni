@@ -81,6 +81,18 @@ def test_normalize_diffusion_request_extra_args_rejects_root_conflict() -> None:
     )
 
 
+def test_normalize_diffusion_request_extra_args_rejects_root_alias_conflict() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        normalize_diffusion_request_extra_args(
+            provided_root_fields={"cfg_scale", "true_cfg_scale"},
+            root_field_aliases={"cfg_scale": "true_cfg_scale"},
+        )
+
+    assert str(exc_info.value) == (
+        'Parameter "true_cfg_scale" was provided more than once: request.cfg_scale, request.true_cfg_scale.'
+    )
+
+
 def test_normalize_diffusion_request_extra_args_rejects_alias_conflict_without_warning() -> None:
     with warnings.catch_warnings(record=True) as warning_records:
         warnings.simplefilter("always")

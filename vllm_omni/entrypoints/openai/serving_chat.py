@@ -153,7 +153,33 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     _supported_speakers: set[str] | None = None
     _diffusion_extra_body_params: frozenset[str] | None = None
     _diffusion_extra_output_params: frozenset[str] | None = None
-    _diffusion_sampling_fields = frozenset(field.name for field in fields(OmniDiffusionSamplingParams))
+    # Only request fields with an explicit Chat serving consumer belong here.
+    # OmniDiffusionSamplingParams also stores runtime-only tensors and KV state;
+    # reflecting the whole dataclass would accidentally expose those internals
+    # as accepted request fields.
+    _diffusion_sampling_root_fields = {
+        "height": "height",
+        "width": "width",
+        "num_outputs_per_prompt": "num_outputs_per_prompt",
+        "seed": "seed",
+        "num_inference_steps": "num_inference_steps",
+        "guidance_scale": "guidance_scale",
+        "true_cfg_scale": "true_cfg_scale",
+        "cfg_scale": "true_cfg_scale",
+        "num_frames": "num_frames",
+        "guidance_scale_2": "guidance_scale_2",
+        "layers": "layers",
+        "resolution": "resolution",
+    }
+    _diffusion_control_root_fields = frozenset(
+        {
+            "size",
+            "negative_prompt",
+            "lora",
+            "modalities",
+        }
+    )
+    _diffusion_root_field_aliases = {"cfg_scale": "true_cfg_scale"}
 
     # Harmony flag (always False for vllm-omni models)
     use_harmony: bool = False
@@ -293,7 +319,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         self._diffusion_extra_body_params = params
         return params
 
-    def _apply_diffusion_request_extra_args(
+    def _apply_diffusion_request_overrides(
         self,
         sampling_params: OmniDiffusionSamplingParams,
         request: ChatCompletionRequest,
@@ -304,9 +330,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if explicit_fields is None:
             explicit_fields = getattr(request, "__fields_set__", set())
         declared_extra_fields = self._get_diffusion_extra_body_params()
-        consumed_root_fields = declared_extra_fields | self._diffusion_sampling_fields
+        consumed_root_fields = (
+            declared_extra_fields | self._diffusion_sampling_root_fields.keys() | self._diffusion_control_root_fields
+        )
         provided_root_fields = set(root_extra_body) & consumed_root_fields
-        provided_root_fields.update(set(explicit_fields) & self._diffusion_sampling_fields)
+        provided_root_fields.update(set(explicit_fields) & consumed_root_fields)
         nested_provided_root_fields = set(nested_extra_body) & consumed_root_fields
 
         normalized = normalize_diffusion_request_extra_args(
@@ -316,7 +344,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             nested_provided_root_fields=nested_provided_root_fields,
             nested_extra_args=nested_extra_body.get("extra_args"),
             nested_extra_params=nested_extra_body.get("extra_params"),
+            root_field_aliases=self._diffusion_root_field_aliases,
         )
+
+        sampling_overrides: dict[str, Any] = {}
+        for request_field, sampling_field in self._diffusion_sampling_root_fields.items():
+            if request_field in explicit_fields:
+                value = getattr(request, request_field, None)
+            elif request_field in root_extra_body:
+                value = root_extra_body[request_field]
+            elif request_field in nested_extra_body:
+                value = nested_extra_body[request_field]
+            else:
+                continue
+            if value is not None:
+                if sampling_field == "num_inference_steps":
+                    value = int(value)
+                sampling_overrides[sampling_field] = value
+        self._set_if_supported(sampling_params, **sampling_overrides)
+
         apply_declared_extra_args(
             sampling_params,
             declared_extra_fields,
@@ -736,7 +782,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if hasattr(sp, "num_inference_steps") and num_inference_steps is not None:
                         sp.num_inference_steps = num_inference_steps
                     if isinstance(sp, OmniDiffusionSamplingParams):
-                        self._apply_diffusion_request_extra_args(
+                        self._apply_diffusion_request_overrides(
                             sp,
                             request,
                             root_extra_body,
@@ -3544,7 +3590,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if true_cfg_scale is not None:
                 gen_params.true_cfg_scale = true_cfg_scale
             try:
-                self._apply_diffusion_request_extra_args(
+                self._apply_diffusion_request_overrides(
                     gen_params,
                     request,
                     root_extra_body,
