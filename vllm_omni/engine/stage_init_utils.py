@@ -1076,6 +1076,9 @@ def get_stage_connector_spec(
     return {}
 
 
+# These are valid service CLI settings, but no service consumer reads them from
+# a per-stage diffusion payload. Reject that misplaced form instead of accepting
+# and dropping it while the service-level value remains owned by the entrypoint.
 _DIFFUSION_SERVICE_ONLY_FIELDS = frozenset(
     {
         "max_generated_image_size",

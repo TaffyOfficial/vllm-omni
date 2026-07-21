@@ -123,6 +123,9 @@ def normalize_omni_diffusion_engine_kwargs(kwargs: Mapping[str, Any]) -> dict[st
             )
         normalized["quantization_config"] = engine_quantization
 
+    # Preserve the existing HiDream engine ingress until RFC #5160 PR 4 moves
+    # this model-specific value into HiDream's model_config. ``extras`` remains
+    # a compatibility destination here, not the field's long-term owner.
     auxiliary_text_encoder = normalized.pop("auxiliary_text_encoder", None)
     if auxiliary_text_encoder is not None:
         extras = dict(normalized.get("extras") or {})

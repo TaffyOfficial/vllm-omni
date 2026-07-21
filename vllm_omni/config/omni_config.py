@@ -493,6 +493,8 @@ class _DiffusionConfigProjection:
     enable_diffusion_pipeline_profiler: bool = False
     step_execution: bool = False
     streaming_output: bool = False
+    # Temporary compatibility location. RFC #5160 PR 3 moves this
+    # scheduler-owned field to OmniStageSchedulerConfig.
     request_batch_max_wait_ms: float = Field(default=0.0, ge=0.0)
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
