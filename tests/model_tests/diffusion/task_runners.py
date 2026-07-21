@@ -7,6 +7,7 @@ import base64
 import io
 from dataclasses import replace
 
+import av
 import numpy as np
 from PIL import Image
 
@@ -98,13 +99,18 @@ def _get_online_images(responses: list[DiffusionResponse]) -> list[Image.Image]:
     return images
 
 
-def _get_online_videos(responses: list[DiffusionResponse]) -> list[bytes]:
-    """Extract encoded videos from a server response."""
+def _get_online_videos(responses: list[DiffusionResponse]) -> list[list[Image.Image]]:
+    """Decode videos returned by the online path."""
     assert len(responses) == 1
     videos = responses[0].videos
     assert videos is not None
     assert all(isinstance(video, bytes) and video for video in videos)
-    return videos
+
+    decoded_videos = []
+    for video in videos:
+        with av.open(io.BytesIO(video)) as container:
+            decoded_videos.append([frame.to_image().convert("RGB") for frame in container.decode(video=0)])
+    return decoded_videos
 
 
 ### Offline helpers
@@ -227,8 +233,7 @@ def run_and_validate_online_image_to_image_request(server: OmniServer, client: O
 
 def run_and_validate_online_text_to_video_request(server: OmniServer, client: OpenAIClientHandler):
     """Run and validate a text-to-video request through the server."""
-    videos = _get_online_videos(_run_online_t2v(server, client))
-    assert len(videos) == 1
+    _validate_videos(_get_online_videos(_run_online_t2v(server, client)))
 
 
 def run_and_validate_online_text_to_image_determinism(server: OmniServer, client: OpenAIClientHandler):
