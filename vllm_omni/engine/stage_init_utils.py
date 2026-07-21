@@ -1076,26 +1076,13 @@ def get_stage_connector_spec(
     return {}
 
 
-# These are valid service CLI settings, but no service consumer reads them from
-# a per-stage diffusion payload. Reject that misplaced form instead of accepting
-# and dropping it while the service-level value remains owned by the entrypoint.
-_DIFFUSION_SERVICE_ONLY_FIELDS = frozenset(
-    {
-        "max_generated_image_size",
-        "tts_max_instructions_length",
-    }
-)
-
-
 def _strict_diffusion_config_kwargs(engine_args: dict[str, Any]) -> dict[str, Any]:
     """Return the diffusion-owned startup payload and reject unowned keys."""
     normalized = normalize_omni_diffusion_engine_kwargs(engine_args)
     normalized = {key: value for key, value in normalized.items() if value is not None}
 
     diffusion_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
-    shared_engine_fields = frozenset(config_field.name for config_field in fields(OmniEngineArgs)) - (
-        _DIFFUSION_SERVICE_ONLY_FIELDS
-    )
+    shared_engine_fields = frozenset(config_field.name for config_field in fields(OmniEngineArgs))
     unknown_fields = sorted(set(normalized) - diffusion_fields - shared_engine_fields)
     if unknown_fields:
         stage_id = normalized.get("stage_id", "unknown")

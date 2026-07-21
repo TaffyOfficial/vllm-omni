@@ -2331,8 +2331,6 @@ stages:
       step_execution: false
       vae_use_tiling: false
       enable_cpu_offload: false
-      max_generated_image_size: 1048576
-      tts_max_instructions_length: 1000
 """,
             encoding="utf-8",
         )
@@ -2371,8 +2369,6 @@ stages:
         assert stage.yaml_engine_args["step_execution"] is False
         assert stage.yaml_engine_args["vae_use_tiling"] is False
         assert stage.yaml_engine_args["enable_cpu_offload"] is False
-        assert stage.yaml_engine_args["max_generated_image_size"] == 1048576
-        assert stage.yaml_engine_args["tts_max_instructions_length"] == 1000
 
         stage.runtime_overrides = StageConfigFactory._merge_cli_overrides(
             stage,
@@ -2395,8 +2391,6 @@ stages:
                 "step_execution": True,
                 "vae_use_tiling": True,
                 "enable_cpu_offload": True,
-                "max_generated_image_size": 2097152,
-                "tts_max_instructions_length": 2000,
             },
         )
 
@@ -2408,8 +2402,6 @@ stages:
         assert omega_config.engine_args.step_execution is True
         assert omega_config.engine_args.vae_use_tiling is True
         assert omega_config.engine_args.enable_cpu_offload is True
-        assert omega_config.engine_args.max_generated_image_size == 2097152
-        assert omega_config.engine_args.tts_max_instructions_length == 2000
         assert omega_config.engine_args.parallel_config.pipeline_parallel_size == 2
         assert omega_config.engine_args.parallel_config.data_parallel_size == 3
         assert omega_config.engine_args.parallel_config.tensor_parallel_size == 4

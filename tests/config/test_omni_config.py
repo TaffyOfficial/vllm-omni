@@ -212,6 +212,8 @@ def test_from_pipeline_config_does_not_route_server_cli_keys_to_diffusion_stage(
             "host": "0.0.0.0",
             "port": 8000,
             "api_key": "secret",
+            "max_generated_image_size": 1048576,
+            "tts_max_instructions_length": 1000,
             "stage_0_host": "127.0.0.1",
             "stage_0_port": 23456,
         },
@@ -223,6 +225,8 @@ def test_from_pipeline_config_does_not_route_server_cli_keys_to_diffusion_stage(
     assert stage.diffusion_config.host == "127.0.0.1"
     assert stage.diffusion_config.port == 23456
     assert not hasattr(stage.diffusion_config, "api_key")
+    assert not hasattr(stage.diffusion_config, "max_generated_image_size")
+    assert not hasattr(stage.diffusion_config, "tts_max_instructions_length")
 
 
 def test_pipeline_deploy_cli_fields_reuse_legacy_pipeline_wide_engine_fields():

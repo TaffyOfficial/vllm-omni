@@ -412,10 +412,6 @@ class StageDeployConfig:
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
 
-    # Modality/service constraints consumed outside the core engine config.
-    max_generated_image_size: int | None = None
-    tts_max_instructions_length: int | None = None
-
     # === Pass-through stage engine fields ===
     # Pass-through stage engine args that are not represented above.
     engine_extras: dict[str, Any] = field(default_factory=dict)
