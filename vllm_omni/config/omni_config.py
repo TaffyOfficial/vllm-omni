@@ -508,6 +508,7 @@ class _DiffusionConfigProjection:
     override_transformer_cls_name: str | None = None
     worker_extension_cls: str | None = None
     custom_pipeline_args: dict[str, Any] | None = None
+    omni_kv_config: dict[str, Any] = field(default_factory=dict)
     additional_config: dict[str, Any] = field(default_factory=dict)
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
@@ -680,6 +681,7 @@ _DIFFUSION_SHARED_CONFIG_FIELDS = frozenset(
         "distributed_executor_backend",
         "dist_timeout",
         "model_config",
+        "omni_kv_config",
         "quantization_config",
     }
 )
@@ -697,24 +699,6 @@ _DIFFUSION_RUNTIME_CONFIG_FIELDS = frozenset(
 _DIFFUSION_ONLY_CONFIG_FIELDS = (
     _DIFFUSION_CONFIG_FIELDS - _DIFFUSION_SHARED_CONFIG_FIELDS - _DIFFUSION_RUNTIME_CONFIG_FIELDS
 )
-_DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
-    {
-        "parallel_config",
-        "num_gpus",
-        "log_level",
-        "profiler_config",
-        "omni_kv_config",
-        "cfg_kv_collect_func",
-        "max_num_seqs",
-        "enable_sleep_mode",
-        "enforce_eager",
-        "enable_multithread_weight_load",
-        "num_weight_load_threads",
-        "disable_autocast",
-    }
-)
-
-
 _STAGE_DEPLOY_ENGINE_FIELDS: tuple[str, ...] = tuple(_STAGE_DEPLOY_FIELDS)
 
 _DIFFUSION_STAGE_ENGINE_FIELDS = _DIFFUSION_CONFIG_FIELDS - {

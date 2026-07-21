@@ -123,6 +123,7 @@ def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(mod
             assert omni_stage.diffusion_config is not None
             assert omni_stage.diffusion_config.stage_id == legacy_stage.stage_id
             assert omni_stage.diffusion_config.model_arch == engine_args.get("model_arch")
+            assert omni_stage.diffusion_config.omni_kv_config == engine_args.get("omni_kv_config", {})
         elif omni_stage.stage_pipeline_config.execution_type == StageExecutionType.LLM_AR:
             assert isinstance(omni_stage, VllmOmniARStageConfig)
             assert not hasattr(omni_stage, "diffusion_config")
@@ -1235,6 +1236,7 @@ def test_diffusion_config_field_classification_covers_current_fields():
         "revision",
         "trust_remote_code",
         "distributed_executor_backend",
+        "omni_kv_config",
     } <= omni_config_module._DIFFUSION_SHARED_CONFIG_FIELDS
     assert "prompt_file_path" in omni_config_module._DIFFUSION_RUNTIME_CONFIG_FIELDS
 
