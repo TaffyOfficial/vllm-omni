@@ -16,6 +16,7 @@ from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
 )
 from vllm_omni.diffusion.model_metadata import QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
+from vllm_omni.engine.stage_init_utils import _strict_diffusion_config_kwargs
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -29,7 +30,7 @@ def _roundtrip_diffusion_config(**kwargs) -> OmniDiffusionConfig:
     """
     stages = StageConfigFactory.create_default_diffusion(kwargs)
     engine_args = dict(stages[0]["engine_args"])
-    return OmniDiffusionConfig.from_kwargs(**engine_args)
+    return OmniDiffusionConfig.from_kwargs(**_strict_diffusion_config_kwargs(engine_args))
 
 
 class TestParallelConfigPropagation:
@@ -48,7 +49,7 @@ class TestParallelConfigPropagation:
 
         # Let __post_init__ reconstruct from dict (real code path)
         ea = dict(stages[0]["engine_args"])
-        od = OmniDiffusionConfig.from_kwargs(**ea)
+        od = OmniDiffusionConfig.from_kwargs(**_strict_diffusion_config_kwargs(ea))
         assert od.parallel_config.tensor_parallel_size == 4
         assert od.parallel_config.world_size == 4
 
