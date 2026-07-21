@@ -3,7 +3,7 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -297,29 +297,57 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         self,
         sampling_params: OmniDiffusionSamplingParams,
         request: ChatCompletionRequest,
-        extra_body: dict[str, Any],
+        root_extra_body: dict[str, Any],
+        nested_extra_body: dict[str, Any],
     ) -> None:
         explicit_fields = getattr(request, "model_fields_set", None)
         if explicit_fields is None:
             explicit_fields = getattr(request, "__fields_set__", set())
-        provided_root_fields = set(extra_body)
+        declared_extra_fields = self._get_diffusion_extra_body_params()
+        consumed_root_fields = declared_extra_fields | self._diffusion_sampling_fields
+        provided_root_fields = set(root_extra_body) & consumed_root_fields
         provided_root_fields.update(set(explicit_fields) & self._diffusion_sampling_fields)
+        nested_provided_root_fields = set(nested_extra_body) & consumed_root_fields
 
         normalized = normalize_diffusion_request_extra_args(
             provided_root_fields=provided_root_fields,
-            extra_args=extra_body.get("extra_args"),
-            extra_params=extra_body.get("extra_params"),
+            extra_args=root_extra_body.get("extra_args"),
+            extra_params=root_extra_body.get("extra_params"),
+            nested_provided_root_fields=nested_provided_root_fields,
+            nested_extra_args=nested_extra_body.get("extra_args"),
+            nested_extra_params=nested_extra_body.get("extra_params"),
         )
         apply_declared_extra_args(
             sampling_params,
-            self._get_diffusion_extra_body_params(),
-            extra_body,
+            declared_extra_fields,
+            nested_extra_body,
+        )
+        apply_declared_extra_args(
+            sampling_params,
+            declared_extra_fields,
+            root_extra_body,
         )
         if normalized:
             sampling_params.extra_args = {
                 **(sampling_params.extra_args or {}),
                 **normalized,
             }
+
+    @staticmethod
+    def _split_diffusion_request_extra_body(
+        request: ChatCompletionRequest,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        root_extra_body = dict(request.model_extra or {})
+        nested_value = root_extra_body.pop("extra_body", None)
+        if nested_value is None:
+            nested_value = getattr(request, "extra_body", None)
+        if nested_value is None:
+            return root_extra_body, {}
+        if not isinstance(nested_value, Mapping):
+            raise ValueError("extra_body must be a JSON object.")
+        if any(not isinstance(key, str) for key in nested_value):
+            raise ValueError("extra_body must be a JSON object with string keys.")
+        return root_extra_body, dict(nested_value)
 
     def _get_diffusion_extra_output_params(
         self,
@@ -561,8 +589,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         num_inference_steps = None
         # The OpenAI client flattens ``extra_body`` into request extras, while
-        # raw HTTP callers may send the nested compatibility form.
-        extra_body = getattr(request, "extra_body", None) or request.model_extra or {}
+        # raw HTTP callers may send the nested compatibility form. Keep both
+        # sources separate until duplicate detection has run.
+        try:
+            root_extra_body, nested_extra_body = self._split_diffusion_request_extra_body(request)
+        except ValueError as e:
+            return self.create_error_response(str(e))
+        extra_body = {**nested_extra_body, **root_extra_body}
         # Omni multistage image generation: Stage-0 (AR) should receive a clean
         # text prompt (and optional conditioning image/size) so the model's own
         # processor can construct the correct inputs.
@@ -703,7 +736,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if hasattr(sp, "num_inference_steps") and num_inference_steps is not None:
                         sp.num_inference_steps = num_inference_steps
                     if isinstance(sp, OmniDiffusionSamplingParams):
-                        self._apply_diffusion_request_extra_args(sp, request, extra_body)
+                        self._apply_diffusion_request_extra_args(
+                            sp,
+                            request,
+                            root_extra_body,
+                            nested_extra_body,
+                        )
                     else:
                         apply_declared_extra_args(sp, self._get_diffusion_extra_body_params(), extra_body)
 
@@ -3425,15 +3463,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 messages
             )
 
-            # Extract generation parameters from extra_body (preferred)
+            # Extract generation parameters from root request extras and the
+            # nested compatibility form without discarding either source.
             # Reference: text_to_image.py and text_to_video.py for supported parameters
             # [NOTE] When sending request via openai client Python library,
             #   `extra_body` is flattented and merged into the payload's root.
             #   These extra fields are accessible via `model_extra` property (from Pydantic base class).
             #   When sending raw request with curl, no flattening happens. Directly read the `extra_body` dict.
-            extra_body = getattr(request, "extra_body", None)
-            if not extra_body:
-                extra_body = request.model_extra or {}
+            try:
+                root_extra_body, nested_extra_body = self._split_diffusion_request_extra_body(request)
+            except ValueError as e:
+                return self._create_error_response(str(e), status_code=400)
+            extra_body = {**nested_extra_body, **root_extra_body}
 
             # Parse size if provided (supports "1024x1024" format)
             height, width = self._resolve_height_width_from_extra_body(extra_body)
@@ -3503,7 +3544,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if true_cfg_scale is not None:
                 gen_params.true_cfg_scale = true_cfg_scale
             try:
-                self._apply_diffusion_request_extra_args(gen_params, request, extra_body)
+                self._apply_diffusion_request_extra_args(
+                    gen_params,
+                    request,
+                    root_extra_body,
+                    nested_extra_body,
+                )
             except ValueError as e:
                 return self._create_error_response(str(e), status_code=400)
             if num_frames is not None:
@@ -3563,12 +3609,26 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Generate image or audio (e.g. AudioX) via AsyncOmni
             diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
             stage_configs = list(getattr(diffusion_engine, "stage_configs", []) or [])
+            default_sampling_params_list = get_default_sampling_params_list(diffusion_engine)
             sampling_params_list = build_stage_sampling_params_list(
                 stage_configs,
-                get_default_sampling_params_list(diffusion_engine),
+                default_sampling_params_list,
                 diffusion_params=gen_params,
                 replace_diffusion_params=True,
             )
+
+            # This endpoint replaces diffusion sampling params as a whole, but
+            # model-specific stage defaults remain defaults: request extras
+            # override matching keys without discarding unrelated defaults.
+            for idx, (stage_config, sampling_params) in enumerate(zip(stage_configs, sampling_params_list)):
+                if get_stage_type(stage_config) != "diffusion" or idx >= len(default_sampling_params_list):
+                    continue
+                default_extra_args = getattr(default_sampling_params_list[idx], "extra_args", None)
+                if default_extra_args:
+                    sampling_params.extra_args = {
+                        **default_extra_args,
+                        **(getattr(sampling_params, "extra_args", None) or {}),
+                    }
 
             if not sampling_params_list:
                 sampling_params_list = [gen_params]

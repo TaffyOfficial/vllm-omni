@@ -150,6 +150,7 @@ def test_diffusion_request_extra_args_reach_sampling_params(serving_chat):
             "cfg_text_scale": 7.0,
             "extra_args": {"sample_solver": "euler"},
         },
+        {},
     )
 
     assert sampling_params.extra_args == {
@@ -173,6 +174,7 @@ def test_unknown_root_extra_does_not_conflict_with_canonical_extra_args(serving_
             "model_specific_option": "ignored-root-value",
             "extra_args": {"model_specific_option": "canonical-value"},
         },
+        {},
     )
 
     assert sampling_params.extra_args == {"model_specific_option": "canonical-value"}
@@ -195,6 +197,68 @@ def test_diffusion_chat_returns_bad_request_for_duplicate_parameter(serving_chat
     assert response.error.message == (
         'Parameter "flow_shift" was provided more than once: request.flow_shift, request.extra_args.flow_shift.'
     )
+
+
+def test_diffusion_chat_rejects_mixed_flattened_nested_duplicate(serving_chat, mocker: MockerFixture):
+    serving_chat._diffusion_mode = True
+    serving_chat._diffusion_extra_body_params = frozenset({"cfg_text_scale"})
+    serving_chat._extract_diffusion_prompt_and_media = mocker.Mock(return_value=("prompt", [], [], []))
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        cfg_text_scale=6.0,
+        extra_body={"extra_args": {"cfg_text_scale": 7.0}},
+    )
+
+    response = asyncio.run(serving_chat._create_diffusion_chat_completion(request))
+
+    assert response.error.code == 400
+    assert response.error.message == (
+        'Parameter "cfg_text_scale" was provided more than once: '
+        "request.cfg_text_scale, request.extra_body.extra_args.cfg_text_scale."
+    )
+
+
+def test_diffusion_chat_preserves_stage_defaults_with_mixed_non_overlapping_extras(
+    serving_chat,
+    mocker: MockerFixture,
+):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    captured: dict[str, object] = {}
+
+    async def generate(**kwargs):
+        captured.update(kwargs)
+        if False:
+            yield None
+
+    serving_chat._diffusion_mode = True
+    serving_chat._diffusion_model_name = "test"
+    serving_chat._diffusion_extra_body_params = frozenset({"cfg_text_scale"})
+    serving_chat._extract_diffusion_prompt_and_media = mocker.Mock(return_value=("prompt", [], [], []))
+    serving_chat._diffusion_engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="diffusion")],
+        default_sampling_params_list=[
+            OmniDiffusionSamplingParams(extra_args={"stage_default": True}),
+        ],
+        generate=generate,
+    )
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        cfg_text_scale=7.0,
+        extra_body={"extra_args": {"sample_solver": "euler"}},
+    )
+
+    response = asyncio.run(serving_chat._create_diffusion_chat_completion(request))
+
+    sampling_params_list = captured["sampling_params_list"]
+    assert sampling_params_list[0].extra_args == {
+        "stage_default": True,
+        "cfg_text_scale": 7.0,
+        "sample_solver": "euler",
+    }
+    assert response.error.message == "No output generated from AsyncOmni"
 
 
 # =============================================================================

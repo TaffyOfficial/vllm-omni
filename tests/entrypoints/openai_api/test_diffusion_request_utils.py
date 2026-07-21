@@ -25,13 +25,35 @@ def test_normalize_diffusion_request_extra_args_preserves_unknown_model_keys() -
 
 
 def test_normalize_diffusion_request_extra_args_accepts_non_overlapping_legacy_keys() -> None:
-    with pytest.warns(DeprecationWarning, match="extra_params is deprecated"):
+    with pytest.warns(FutureWarning, match="extra_params is deprecated"):
         normalized = normalize_diffusion_request_extra_args(
             extra_args={"cfg_text_scale": 7.0},
             extra_params={"sample_solver": "euler"},
         )
 
     assert normalized == {"cfg_text_scale": 7.0, "sample_solver": "euler"}
+
+
+def test_normalize_diffusion_request_extra_args_merges_non_overlapping_nested_compatibility_form() -> None:
+    normalized = normalize_diffusion_request_extra_args(
+        extra_args={"cfg_text_scale": 7.0},
+        nested_extra_args={"sample_solver": "euler"},
+    )
+
+    assert normalized == {"cfg_text_scale": 7.0, "sample_solver": "euler"}
+
+
+def test_normalize_diffusion_request_extra_args_rejects_flattened_nested_conflict() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        normalize_diffusion_request_extra_args(
+            provided_root_fields={"cfg_text_scale"},
+            nested_extra_args={"cfg_text_scale": 7.0},
+        )
+
+    assert str(exc_info.value) == (
+        'Parameter "cfg_text_scale" was provided more than once: '
+        "request.cfg_text_scale, request.extra_body.extra_args.cfg_text_scale."
+    )
 
 
 @pytest.mark.parametrize("name", ["extra_args", "extra_params"])
