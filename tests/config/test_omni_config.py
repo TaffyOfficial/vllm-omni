@@ -875,9 +875,13 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     assert cfg.diffusers_call_kwargs == {}
 
 
-def test_diffusion_config_projection_rejects_unknown_field():
-    with pytest.raises(ValidationError, match="enable_sleep_mod"):
-        omni_config_module._DiffusionConfigProjection.from_kwargs(enable_sleep_mod=True)
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [("enable_sleep_mod", True), ("diffusion_model_runner_cls", "example.Runner")],
+)
+def test_diffusion_config_projection_rejects_unknown_field(field_name, value):
+    with pytest.raises(ValidationError, match=field_name):
+        omni_config_module._DiffusionConfigProjection.from_kwargs(**{field_name: value})
 
 
 def test_omni_diffusion_config_from_kwargs_rejects_unknown_field():
@@ -1021,7 +1025,11 @@ def test_diffusion_attention_backend_keeps_per_role_config():
     assert cfg.diffusion_attention_config.per_role["cross"].backend == "torch_sdpa"
 
 
-def test_from_pipeline_config_rejects_unclaimed_diffusion_engine_extra(tmp_path):
+@pytest.mark.parametrize(
+    ("field_name", "yaml_value"),
+    [("enable_sleep_mod", "true"), ("diffusion_model_runner_cls", "example.Runner")],
+)
+def test_from_pipeline_config_rejects_unclaimed_diffusion_engine_extra(tmp_path, field_name, yaml_value):
     deploy_path = tmp_path / "dreamzero_unknown_diffusion_field.yaml"
     deploy_path.write_text(
         "\n".join(
@@ -1030,12 +1038,12 @@ def test_from_pipeline_config_rejects_unclaimed_diffusion_engine_extra(tmp_path)
                 "async_chunk: false",
                 "stages:",
                 "  - stage_id: 0",
-                "    enable_sleep_mod: true",
+                f"    {field_name}: {yaml_value}",
             ]
         )
     )
 
-    with pytest.raises(ValueError, match=r"stage 0.*enable_sleep_mod"):
+    with pytest.raises(ValueError, match=rf"stage 0.*{field_name}"):
         _from_pipeline_key(
             "dreamzero",
             deploy_config_path=str(deploy_path),
