@@ -1227,6 +1227,10 @@ def _build_diffusion_config_projection(
         diffusion_kwargs["model"] = model
     if quantization_config is not None:
         diffusion_kwargs["quantization_config"] = _copy_value(quantization_config)
+    if topology.omni_kv_config:
+        # Match the legacy merge order: pipeline connector metadata wins over
+        # a deploy-level engine value for the same stage.
+        diffusion_kwargs["omni_kv_config"] = _copy_value(topology.omni_kv_config)
 
     return _DiffusionConfigProjection.from_kwargs(**{k: v for k, v in diffusion_kwargs.items() if v is not None})
 
