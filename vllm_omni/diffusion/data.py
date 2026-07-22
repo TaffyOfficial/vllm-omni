@@ -40,15 +40,12 @@ def _normalize_deprecated_diffusion_alias(
     legacy_name: str,
     canonical_name: str,
 ) -> None:
-    if legacy_name not in normalized:
-        return
-
-    if canonical_name in normalized:
-        raise ValueError(f"Diffusion config fields {legacy_name!r} and {canonical_name!r} cannot be provided together.")
-
-    legacy_value = normalized.pop(legacy_name)
+    legacy_value = normalized.pop(legacy_name, None)
     if legacy_value is None:
         return
+
+    if normalized.get(canonical_name) is not None:
+        raise ValueError(f"Diffusion config fields {legacy_name!r} and {canonical_name!r} cannot be provided together.")
 
     warnings.warn(
         f"Diffusion config field {legacy_name!r} is deprecated; use {canonical_name!r} instead.",
@@ -56,6 +53,17 @@ def _normalize_deprecated_diffusion_alias(
         stacklevel=3,
     )
     normalized[canonical_name] = legacy_value
+
+
+def _normalize_legacy_diffusion_kv_cache_alias(
+    normalized: dict[str, Any],
+    legacy_name: str,
+    canonical_name: str,
+) -> None:
+    """Preserve the pre-existing, non-warning diffusion KV-cache migration."""
+    legacy_value = normalized.pop(legacy_name, None)
+    if legacy_value is not None and normalized.get(canonical_name) is None:
+        normalized[canonical_name] = legacy_value
 
 
 def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
@@ -66,13 +74,13 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
     _normalize_deprecated_diffusion_alias(normalized, "quantization", "quantization_config")
 
     # Renamed from kv_cache_* to avoid clashing with vLLM's --kv-cache-dtype.
-    _normalize_deprecated_diffusion_alias(normalized, "kv_cache_dtype", "diffusion_kv_cache_dtype")
-    _normalize_deprecated_diffusion_alias(
+    _normalize_legacy_diffusion_kv_cache_alias(normalized, "kv_cache_dtype", "diffusion_kv_cache_dtype")
+    _normalize_legacy_diffusion_kv_cache_alias(
         normalized,
         "kv_cache_skip_steps",
         "diffusion_kv_cache_skip_steps",
     )
-    _normalize_deprecated_diffusion_alias(
+    _normalize_legacy_diffusion_kv_cache_alias(
         normalized,
         "kv_cache_skip_layers",
         "diffusion_kv_cache_skip_layers",
@@ -106,7 +114,14 @@ def normalize_omni_diffusion_engine_kwargs(kwargs: Mapping[str, Any]) -> dict[st
     """Normalize legacy engine ingress before diffusion config construction."""
     engine_kwargs = dict(kwargs)
     quantization = engine_kwargs.pop("quantization", None)
+    vllm_kv_cache_dtype = engine_kwargs.pop("kv_cache_dtype", None)
     normalized = normalize_omni_diffusion_kwargs(engine_kwargs)
+
+    # ``kv_cache_dtype`` is an active vLLM EngineArgs setting. Keep it out of
+    # the legacy diffusion KV-cache migration so the startup partitioner can
+    # recognize and remove the shared engine field below.
+    if vllm_kv_cache_dtype is not None:
+        normalized["kv_cache_dtype"] = vllm_kv_cache_dtype
 
     diffusion_quantization = normalized.pop("diffusion_quantization_config", None)
     engine_quantization = diffusion_quantization if diffusion_quantization is not None else quantization

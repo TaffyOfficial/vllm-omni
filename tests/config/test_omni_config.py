@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import fields
 from pathlib import Path
 
@@ -862,6 +863,7 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
         cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
             diffusion_attention_backend="flash_attn",
             kv_cache_dtype="fp8",
+            diffusion_kv_cache_dtype=None,
             kv_cache_skip_steps="0-1",
             kv_cache_skip_layers=[2],
             static_lora_scale=0.25,
@@ -869,7 +871,7 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
             diffusers_call_kwargs=None,
         )
 
-    assert len(warnings) == 4
+    assert len(warnings) == 1
     assert cfg.diffusion_attention_config.default.backend == "flash_attn"
     assert cfg.diffusion_kv_cache_dtype == "fp8"
     assert cfg.diffusion_kv_cache_skip_step_indices == {0, 1}
@@ -939,13 +941,10 @@ def test_omni_diffusion_config_from_kwargs_rejects_quantization_alias_conflict()
     ("legacy_name", "canonical_name", "value"),
     [
         ("static_lora_scale", "lora_scale", 0.5),
-        ("kv_cache_dtype", "diffusion_kv_cache_dtype", "fp8"),
-        ("kv_cache_skip_steps", "diffusion_kv_cache_skip_steps", "0-1"),
-        ("kv_cache_skip_layers", "diffusion_kv_cache_skip_layers", "2-3"),
         ("quantization", "quantization_config", "fp8"),
     ],
 )
-def test_diffusion_config_projection_rejects_alias_conflict(legacy_name, canonical_name, value):
+def test_diffusion_config_projection_rejects_deprecated_alias_conflict(legacy_name, canonical_name, value):
     with pytest.raises(ValueError, match=rf"{legacy_name}.*{canonical_name}"):
         omni_config_module._DiffusionConfigProjection.from_kwargs(
             **{
@@ -955,12 +954,63 @@ def test_diffusion_config_projection_rejects_alias_conflict(legacy_name, canonic
         )
 
 
-def test_diffusion_config_projection_rejects_alias_conflict_with_none_canonical_value():
-    with pytest.raises(ValueError, match=r"static_lora_scale.*lora_scale"):
-        omni_config_module._DiffusionConfigProjection.from_kwargs(
+def test_diffusion_config_projection_promotes_deprecated_alias_with_none_canonical_value():
+    with pytest.warns(FutureWarning, match=r"static_lora_scale.*lora_scale"):
+        cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
             static_lora_scale=0.5,
             lora_scale=None,
         )
+
+    assert cfg.lora_scale == 0.5
+
+
+def test_omni_diffusion_config_promotes_deprecated_alias_with_none_canonical_value():
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    with pytest.warns(FutureWarning, match=r"static_lora_scale.*lora_scale"):
+        cfg = OmniDiffusionConfig.from_kwargs(
+            static_lora_scale=0.5,
+            lora_scale=None,
+        )
+
+    assert cfg.lora_scale == 0.5
+
+
+def test_startup_diffusion_payload_keeps_active_vllm_kv_cache_dtype_out_of_diffusion_config():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        payload = _strict_diffusion_config_kwargs(
+            {
+                "kv_cache_dtype": "fp8",
+                "diffusion_kv_cache_dtype": "auto",
+            }
+        )
+
+    assert "kv_cache_dtype" not in payload
+    assert payload["diffusion_kv_cache_dtype"] == "auto"
+
+
+def test_startup_diffusion_payload_promotes_deprecated_alias_with_none_canonical_value():
+    with pytest.warns(FutureWarning, match=r"static_lora_scale.*lora_scale"):
+        payload = _strict_diffusion_config_kwargs(
+            {
+                "static_lora_scale": 0.5,
+                "lora_scale": None,
+            }
+        )
+
+    assert payload["lora_scale"] == 0.5
+
+
+def test_startup_diffusion_payload_keeps_canonical_value_with_none_deprecated_alias():
+    payload = _strict_diffusion_config_kwargs(
+        {
+            "static_lora_scale": None,
+            "lora_scale": 0.5,
+        }
+    )
+
+    assert payload["lora_scale"] == 0.5
 
 
 def test_startup_diffusion_payload_rejects_unknown_field_after_shared_fields_are_removed():
@@ -974,16 +1024,12 @@ def test_startup_diffusion_payload_rejects_unknown_field_after_shared_fields_are
         )
 
 
-@pytest.mark.parametrize(
-    ("legacy_value", "canonical_value"),
-    [(0.5, None), (None, 0.5)],
-)
-def test_startup_diffusion_payload_rejects_alias_keys_provided_together(legacy_value, canonical_value):
+def test_startup_diffusion_payload_rejects_deprecated_alias_keys_provided_together():
     with pytest.raises(ValueError, match=r"static_lora_scale.*lora_scale"):
         _strict_diffusion_config_kwargs(
             {
-                "static_lora_scale": legacy_value,
-                "lora_scale": canonical_value,
+                "static_lora_scale": 0.5,
+                "lora_scale": 0.7,
             }
         )
 
