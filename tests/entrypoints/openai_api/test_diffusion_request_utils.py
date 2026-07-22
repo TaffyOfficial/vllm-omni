@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import warnings
-
 import pytest
 
 from vllm_omni.entrypoints.openai.diffusion_request_utils import normalize_diffusion_request_extra_args
@@ -24,14 +22,18 @@ def test_normalize_diffusion_request_extra_args_preserves_unknown_model_keys() -
     assert normalized is not extra_args
 
 
-def test_normalize_diffusion_request_extra_args_accepts_non_overlapping_legacy_keys() -> None:
-    with pytest.warns(FutureWarning, match="extra_params is deprecated"):
-        normalized = normalize_diffusion_request_extra_args(
-            extra_args={"cfg_text_scale": 7.0},
-            extra_params={"sample_solver": "euler"},
-        )
+def test_normalize_diffusion_request_extra_args_accepts_non_overlapping_legacy_keys(mocker) -> None:
+    warning_once = mocker.patch("vllm_omni.entrypoints.openai.diffusion_request_utils.logger.warning_once")
+
+    normalized = normalize_diffusion_request_extra_args(
+        extra_args={"cfg_text_scale": 7.0},
+        extra_params={"sample_solver": "euler"},
+    )
 
     assert normalized == {"cfg_text_scale": 7.0, "sample_solver": "euler"}
+    warning_once.assert_called_once_with(
+        "extra_params is deprecated; use extra_args for model-specific diffusion request parameters."
+    )
 
 
 def test_normalize_diffusion_request_extra_args_merges_non_overlapping_nested_compatibility_form() -> None:
@@ -93,16 +95,15 @@ def test_normalize_diffusion_request_extra_args_rejects_root_alias_conflict() ->
     )
 
 
-def test_normalize_diffusion_request_extra_args_rejects_alias_conflict_without_warning() -> None:
-    with warnings.catch_warnings(record=True) as warning_records:
-        warnings.simplefilter("always")
-        with pytest.raises(ValueError) as exc_info:
-            normalize_diffusion_request_extra_args(
-                extra_args={"sample_solver": "euler"},
-                extra_params={"sample_solver": "euler"},
-            )
+def test_normalize_diffusion_request_extra_args_rejects_alias_conflict_without_warning(mocker) -> None:
+    warning_once = mocker.patch("vllm_omni.entrypoints.openai.diffusion_request_utils.logger.warning_once")
+    with pytest.raises(ValueError) as exc_info:
+        normalize_diffusion_request_extra_args(
+            extra_args={"sample_solver": "euler"},
+            extra_params={"sample_solver": "euler"},
+        )
 
-    assert not warning_records
+    warning_once.assert_not_called()
     assert str(exc_info.value) == (
         'Parameter "sample_solver" was provided more than once: '
         "request.extra_args.sample_solver, request.extra_params.sample_solver."

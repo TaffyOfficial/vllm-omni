@@ -782,12 +782,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if hasattr(sp, "num_inference_steps") and num_inference_steps is not None:
                         sp.num_inference_steps = num_inference_steps
                     if isinstance(sp, OmniDiffusionSamplingParams):
-                        self._apply_diffusion_request_overrides(
-                            sp,
-                            request,
-                            root_extra_body,
-                            nested_extra_body,
-                        )
+                        try:
+                            self._apply_diffusion_request_overrides(
+                                sp,
+                                request,
+                                root_extra_body,
+                                nested_extra_body,
+                            )
+                        except ValueError as e:
+                            return self._create_error_response(str(e), status_code=400)
                     else:
                         apply_declared_extra_args(sp, self._get_diffusion_extra_body_params(), extra_body)
 

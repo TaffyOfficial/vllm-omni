@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
-import warnings
 from collections.abc import Collection, Mapping
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def _copy_request_mapping(name: str, value: object | None) -> dict[str, object]:
@@ -68,10 +71,9 @@ def normalize_diffusion_request_extra_args(
         raise ValueError(f"Diffusion request parameters were provided more than once: {details}.")
 
     if extra_params is not None or nested_extra_params is not None:
-        warnings.warn(
-            "extra_params is deprecated; use extra_args for model-specific diffusion request parameters.",
-            FutureWarning,
-            stacklevel=2,
+        logger.warning_once(
+            "extra_params is deprecated; use extra_args for model-specific diffusion request parameters."
         )
 
+    # Duplicate request keys were rejected above, so these mappings are disjoint.
     return {**legacy, **nested_legacy, **canonical, **nested_canonical}

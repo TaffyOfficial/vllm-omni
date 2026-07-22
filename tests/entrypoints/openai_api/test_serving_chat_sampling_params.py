@@ -266,6 +266,61 @@ def test_diffusion_chat_rejects_mixed_flattened_nested_duplicate(serving_chat, m
     )
 
 
+def test_multistage_diffusion_duplicate_uses_bad_request_helper(serving_chat, mocker: MockerFixture):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    serving_chat._diffusion_mode = False
+    serving_chat._check_model = mocker.AsyncMock(return_value=None)
+    serving_chat._maybe_get_adapters = mocker.Mock(return_value=None)
+    serving_chat.models = mocker.MagicMock()
+    serving_chat.models.model_name.return_value = "test-model"
+    serving_chat.renderer = mocker.MagicMock()
+    serving_chat.renderer.get_tokenizer.return_value = mocker.MagicMock()
+    serving_chat.reasoning_parser_cls = None
+    serving_chat.tool_parser = None
+    serving_chat.parser_cls = None
+    serving_chat.use_harmony = False
+    serving_chat.enable_auto_tools = False
+    serving_chat.exclude_tools_when_tool_choice_none = False
+    serving_chat.trust_request_chat_template = False
+    serving_chat.chat_template = None
+    serving_chat.chat_template_content_format = "string"
+    serving_chat.default_chat_template_kwargs = {}
+    serving_chat.online_renderer = mocker.MagicMock()
+    serving_chat.online_renderer.validate_chat_template.return_value = None
+    serving_chat._effective_chat_template_kwargs = mocker.Mock(return_value={})
+    serving_chat._preprocess_chat = mocker.AsyncMock(return_value=([], [{"prompt": "preprocessed"}]))
+    serving_chat._base_request_id = mocker.Mock(return_value="multistage-duplicate")
+    serving_chat._extract_diffusion_prompt_and_images_from_messages = mocker.Mock(return_value=("prompt", []))
+    serving_chat._build_sampling_params_list_from_request = mocker.Mock(return_value=[OmniDiffusionSamplingParams()])
+    serving_chat._apply_diffusion_request_overrides = mocker.Mock(side_effect=ValueError("duplicate parameter"))
+    serving_chat._create_error_response = mocker.Mock(return_value="bad-request")
+    serving_chat.engine_client.errored = False
+    serving_chat.engine_client.output_modalities = ["image"]
+
+    request = SimpleNamespace(
+        tool_choice=None,
+        tools=None,
+        chat_template=None,
+        chat_template_kwargs=None,
+        reasoning_effort=None,
+        messages=[],
+        add_generation_prompt=False,
+        continue_final_message=False,
+        add_special_tokens=False,
+        request_id="multistage-duplicate",
+        modalities=["image"],
+        model_extra={},
+        extra_body=None,
+        stream=False,
+    )
+
+    result = asyncio.run(serving_chat._create_chat_completion(request))
+
+    assert result == "bad-request"
+    serving_chat._create_error_response.assert_called_once_with("duplicate parameter", status_code=400)
+
+
 def test_diffusion_chat_preserves_stage_defaults_with_mixed_non_overlapping_extras(
     serving_chat,
     mocker: MockerFixture,
