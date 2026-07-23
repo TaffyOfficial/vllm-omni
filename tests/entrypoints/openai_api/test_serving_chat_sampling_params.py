@@ -495,6 +495,124 @@ def test_multistage_stage_extra_args_conflict_is_rejected_before_prompt_work(
     serving_chat._preprocess_chat.assert_not_awaited()
 
 
+def test_pure_diffusion_stage_override_conflict_is_rejected_before_dispatch(
+    serving_chat,
+    mocker: MockerFixture,
+):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    serving_chat._diffusion_mode = True
+    serving_chat._diffusion_extra_body_params = frozenset()
+    serving_chat._diffusion_engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="diffusion")],
+        default_sampling_params_list=[OmniDiffusionSamplingParams()],
+    )
+    diffusion_dispatch = mocker.patch.object(
+        serving_chat,
+        "_create_diffusion_chat_completion",
+        new=mocker.AsyncMock(),
+    )
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        seed=111,
+        sampling_params_list=[{"seed": 222}],
+    )
+
+    response = asyncio.run(serving_chat._create_chat_completion(request))
+
+    assert response.error.code == 400
+    assert response.error.message == (
+        'Parameter "seed" was provided more than once: request.seed, request.sampling_params_list[0].seed.'
+    )
+    diffusion_dispatch.assert_not_awaited()
+
+
+def test_pure_diffusion_compiles_non_conflicting_stage_override(serving_chat):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    serving_chat._diffusion_mode = True
+    serving_chat._diffusion_extra_body_params = frozenset()
+    serving_chat._diffusion_engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="diffusion")],
+        default_sampling_params_list=[OmniDiffusionSamplingParams()],
+    )
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        sampling_params_list=[{"guidance_scale": 4.0}],
+    )
+
+    contract = serving_chat._compile_diffusion_request_contract(request)
+
+    assert contract.sampling_params_list is not None
+    assert contract.sampling_params_list[0].guidance_scale == 4.0
+
+
+def test_non_diffusion_stage_declared_extra_conflict_is_rejected(serving_chat):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    serving_chat._diffusion_mode = False
+    serving_chat._diffusion_extra_body_params = frozenset({"cfg_text_scale"})
+    serving_chat.engine_client.stage_configs = [
+        SimpleNamespace(stage_type="llm", is_comprehension=True),
+        SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+    ]
+    serving_chat.engine_client.default_sampling_params_list = [
+        SamplingParams(),
+        OmniDiffusionSamplingParams(),
+    ]
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        cfg_text_scale=7.0,
+        sampling_params_list=[
+            {"extra_args": {"cfg_text_scale": 8.0}},
+            {},
+        ],
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        serving_chat._compile_diffusion_request_contract(request)
+
+    assert str(exc_info.value) == (
+        'Parameter "cfg_text_scale" was provided more than once: '
+        "request.cfg_text_scale, request.sampling_params_list[0].extra_args.cfg_text_scale."
+    )
+
+
+def test_registry_owned_schema_field_has_same_ar_effect_for_flattened_and_nested_forms(
+    serving_chat,
+):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    serving_chat._diffusion_mode = False
+    serving_chat._diffusion_extra_body_params = frozenset({"max_tokens"})
+    serving_chat.engine_client.stage_configs = [
+        SimpleNamespace(stage_type="llm", is_comprehension=True),
+        SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+    ]
+    serving_chat.engine_client.default_sampling_params_list = [
+        SamplingParams(max_tokens=100),
+        OmniDiffusionSamplingParams(),
+    ]
+    requests = [
+        ChatCompletionRequest(model="test", messages=[], max_tokens=32),
+        ChatCompletionRequest(model="test", messages=[], extra_body={"max_tokens": 32}),
+    ]
+
+    contracts = [serving_chat._compile_diffusion_request_contract(request) for request in requests]
+
+    assert [contract.sampling_params_list[0].max_tokens for contract in contracts] == [
+        100,
+        100,
+    ]
+    assert [contract.declared_extra_args["max_tokens"] for contract in contracts] == [
+        32,
+        32,
+    ]
+
+
 def test_multistage_server_default_is_not_request_provenance(serving_chat):
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 

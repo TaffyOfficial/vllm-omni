@@ -142,6 +142,7 @@ class _DiffusionRequestSources:
     explicit_root_values: Mapping[str, Any]
     stage_provided_root_fields: Mapping[int, frozenset[str]]
     stage_extra_args: Mapping[int, object | None]
+    non_diffusion_stage_extra_args: Mapping[int, object | None]
     raw_sampling_params_list: object | None
 
 
@@ -358,24 +359,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         )
         explicit_root_values = {key: getattr(request, key, None) for key in set(explicit_fields) & consumed_root_fields}
 
-        raw_sampling_params_list = None
-        if not self._diffusion_mode:
-            raw_sampling_params_list = getattr(request, "sampling_params_list", None)
-            if raw_sampling_params_list is not None and not isinstance(raw_sampling_params_list, list):
-                raise ValueError("sampling_params_list must be a JSON array.")
+        raw_sampling_params_list = getattr(request, "sampling_params_list", None)
+        if raw_sampling_params_list is not None and not isinstance(raw_sampling_params_list, list):
+            raise ValueError("sampling_params_list must be a JSON array.")
 
-        stage_configs = [] if self._diffusion_mode else list(getattr(self.engine_client, "stage_configs", []) or [])
+        stage_owner = self._diffusion_engine if self._diffusion_mode else self.engine_client
+        stage_configs = list(getattr(stage_owner, "stage_configs", []) or [])
         stage_provided_root_fields: dict[int, frozenset[str]] = {}
         stage_extra_args: dict[int, object | None] = {}
+        non_diffusion_stage_extra_args: dict[int, object | None] = {}
         stage_root_field_names = frozenset(self._diffusion_sampling_root_fields) | declared_extra_fields
         for stage_index, stage_params in enumerate(raw_sampling_params_list or []):
-            if stage_index >= len(stage_configs) or get_stage_type(stage_configs[stage_index]) != "diffusion":
-                continue
-
             if not isinstance(stage_params, Mapping):
                 raise ValueError(f"sampling_params_list[{stage_index}] must be a JSON object.")
             if any(not isinstance(key, str) for key in stage_params):
                 raise ValueError(f"sampling_params_list[{stage_index}] must be a JSON object with string keys.")
+            if stage_index >= len(stage_configs) or get_stage_type(stage_configs[stage_index]) != "diffusion":
+                if not self._diffusion_mode:
+                    non_diffusion_stage_extra_args[stage_index] = stage_params.get("extra_args")
+                continue
             stage_provided_root_fields[stage_index] = frozenset(stage_params) & stage_root_field_names
             stage_extra_args[stage_index] = stage_params.get("extra_args")
 
@@ -385,6 +387,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             explicit_root_values=MappingProxyType(explicit_root_values),
             stage_provided_root_fields=MappingProxyType(stage_provided_root_fields),
             stage_extra_args=MappingProxyType(stage_extra_args),
+            non_diffusion_stage_extra_args=MappingProxyType(non_diffusion_stage_extra_args),
             raw_sampling_params_list=raw_sampling_params_list,
         )
 
@@ -401,19 +404,46 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
         return any(get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs)
 
+    @staticmethod
+    def _validate_non_diffusion_stage_extra_conflicts(
+        sources: _DiffusionRequestSources,
+        declared_root_extra_args: Mapping[str, Any],
+    ) -> None:
+        conflicts: dict[str, list[str]] = {}
+        for stage_index, stage_extra_args in sources.non_diffusion_stage_extra_args.items():
+            if stage_extra_args is None:
+                continue
+            if not isinstance(stage_extra_args, Mapping):
+                raise ValueError(f"sampling_params_list[{stage_index}].extra_args must be a JSON object.")
+            for key in sorted(set(declared_root_extra_args) & set(stage_extra_args)):
+                root_source = f"request.extra_body.{key}" if key in sources.nested_extra_body else f"request.{key}"
+                conflicts.setdefault(key, [root_source]).append(
+                    f"request.sampling_params_list[{stage_index}].extra_args.{key}"
+                )
+        if not conflicts:
+            return
+        if len(conflicts) == 1:
+            key, conflict_sources = next(iter(conflicts.items()))
+            raise ValueError(f'Parameter "{key}" was provided more than once: {", ".join(conflict_sources)}.')
+        details = "; ".join(f'"{key}": {", ".join(conflicts[key])}' for key in sorted(conflicts))
+        raise ValueError(f"Diffusion request parameters were provided more than once: {details}.")
+
     def _compile_request_sampling_params_list(
         self,
         request: ChatCompletionRequest,
         sources: _DiffusionRequestSources,
         declared_extra_fields: frozenset[str],
     ) -> tuple[Any, ...] | None:
-        if self._diffusion_mode:
-            return None
-
-        stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
+        stage_owner = self._diffusion_engine if self._diffusion_mode else self.engine_client
+        stage_configs = list(getattr(stage_owner, "stage_configs", []) or [])
         try:
             if sources.raw_sampling_params_list is None:
-                sampling_params_list = self._build_sampling_params_list_from_request(request)
+                if self._diffusion_mode:
+                    return None
+                sampling_params_list = self._build_sampling_params_list_from_request(
+                    request,
+                    excluded_fields=declared_extra_fields,
+                )
             else:
                 request_sampling_params: list[Any] = []
                 for stage_index, stage_params in enumerate(sources.raw_sampling_params_list):
@@ -439,7 +469,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if "extra_args" in compiled_stage_params or compiled_stage_extra_args:
                         compiled_stage_params["extra_args"] = compiled_stage_extra_args
                     request_sampling_params.append(compiled_stage_params)
-                sampling_params_list = self._to_sampling_params_list(request_sampling_params)
+                sampling_params_list = self._to_sampling_params_list(
+                    request_sampling_params,
+                    stage_owner=stage_owner,
+                )
         except TypeError as exc:
             raise ValueError(f"Invalid sampling_params_list: {exc}") from exc
 
@@ -505,6 +538,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             nested_extra_params=sources.nested_extra_body.get("extra_params"),
             stage_provided_root_fields=sources.stage_provided_root_fields,
             stage_extra_args=sources.stage_extra_args,
+        )
+        self._validate_non_diffusion_stage_extra_conflicts(
+            sources,
+            compiled.declared_extra_args,
         )
 
         request_values = dict(compiled.request_values)
@@ -1425,7 +1462,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return new_messages
 
-    def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[Any]:
+    def _to_sampling_params_list(
+        self,
+        sampling_params_list: list[dict],
+        *,
+        stage_owner: Any | None = None,
+    ) -> list[Any]:
         """Convert request dicts to stage-typed sampling params objects.
 
         For diffusion stages, build ``OmniDiffusionSamplingParams`` so
@@ -1435,8 +1477,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         (for example AURA has three semantic models but four engine stages),
         append cloned deploy defaults for the omitted tail stages.
         """
-        stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
-        default_params_list = list(getattr(self.engine_client, "default_sampling_params_list", []) or [])
+        stage_owner = self.engine_client if stage_owner is None else stage_owner
+        stage_configs = list(getattr(stage_owner, "stage_configs", []) or [])
+        default_params_list = list(getattr(stage_owner, "default_sampling_params_list", []) or [])
         final_sampling_params_list: list[Any] = []
         for idx, sampling_params in enumerate(sampling_params_list):
             stage_type = get_stage_type(stage_configs[idx]) if idx < len(stage_configs) else "llm"
@@ -1491,6 +1534,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         self,
         default_params: SamplingParams,
         request: ChatCompletionRequest,
+        *,
+        excluded_fields: frozenset[str] = frozenset(),
     ) -> SamplingParams:
         """Clone default params and override with user-provided request values.
 
@@ -1517,7 +1562,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             explicit_fields = getattr(request, "__fields_set__", set())
 
         for field_name in self._OPENAI_SAMPLING_FIELDS:
-            if field_name not in explicit_fields:
+            if field_name in excluded_fields or field_name not in explicit_fields:
                 continue
 
             value = getattr(request, field_name, None)
@@ -1570,6 +1615,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     def _build_sampling_params_list_from_request(
         self,
         request: ChatCompletionRequest,
+        *,
+        excluded_fields: frozenset[str] = frozenset(),
     ) -> list[SamplingParams]:
         """Build sampling_params_list using standard OpenAI API parameters.
 
@@ -1593,7 +1640,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if isinstance(default_params, dict):
                 default_params = SamplingParams(**default_params)
             if idx == comprehension_idx:
-                params = self._apply_request_overrides(default_params, request)
+                params = self._apply_request_overrides(
+                    default_params,
+                    request,
+                    excluded_fields=excluded_fields,
+                )
                 sampling_params_list.append(params)
             else:
                 # For other stages, clone default params
@@ -3787,34 +3838,51 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             status_code=400,
                         )
 
-            if reference_videos:
-                gen_params.extra_args["video_path"] = reference_videos[0]
-            if reference_audios:
-                gen_params.extra_args["audio_path"] = reference_audios[0]
-
             # Generate image or audio (e.g. AudioX) via AsyncOmni
             diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
             stage_configs = list(getattr(diffusion_engine, "stage_configs", []) or [])
             default_sampling_params_list = get_default_sampling_params_list(diffusion_engine)
-            sampling_params_list = build_stage_sampling_params_list(
-                stage_configs,
-                default_sampling_params_list,
-                diffusion_params=gen_params,
-                replace_diffusion_params=True,
-            )
+            if diffusion_contract.sampling_params_list is None:
+                sampling_params_list = build_stage_sampling_params_list(
+                    stage_configs,
+                    default_sampling_params_list,
+                    diffusion_params=gen_params,
+                    replace_diffusion_params=True,
+                )
+            else:
+                sampling_params_list = [
+                    clone_sampling_params(sampling_params)
+                    for sampling_params in diffusion_contract.sampling_params_list
+                ]
+                for sampling_params in sampling_params_list:
+                    if isinstance(sampling_params, OmniDiffusionSamplingParams):
+                        self._apply_diffusion_request_contract(
+                            sampling_params,
+                            diffusion_contract,
+                        )
 
             # This endpoint replaces diffusion sampling params as a whole, but
             # model-specific stage defaults remain defaults: request extras
             # override matching keys without discarding unrelated defaults.
             for idx, (stage_config, sampling_params) in enumerate(zip(stage_configs, sampling_params_list)):
-                if get_stage_type(stage_config) != "diffusion" or idx >= len(default_sampling_params_list):
+                if get_stage_type(stage_config) != "diffusion":
                     continue
-                default_extra_args = getattr(default_sampling_params_list[idx], "extra_args", None)
+                default_extra_args = (
+                    getattr(default_sampling_params_list[idx], "extra_args", None)
+                    if idx < len(default_sampling_params_list)
+                    else None
+                )
                 if default_extra_args:
                     sampling_params.extra_args = {
                         **default_extra_args,
                         **(getattr(sampling_params, "extra_args", None) or {}),
                     }
+                if (reference_videos or reference_audios) and sampling_params.extra_args is None:
+                    sampling_params.extra_args = {}
+                if reference_videos:
+                    sampling_params.extra_args["video_path"] = reference_videos[0]
+                if reference_audios:
+                    sampling_params.extra_args["audio_path"] = reference_audios[0]
 
             if not sampling_params_list:
                 sampling_params_list = [gen_params]
