@@ -4,9 +4,10 @@ import json
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from types import MappingProxyType
 from typing import Any, Final, cast
 
 import jinja2
@@ -25,7 +26,9 @@ from vllm.entrypoints.chat_utils import (
 
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.openai.diffusion_request_utils import normalize_diffusion_request_extra_args
+from vllm_omni.entrypoints.openai.diffusion_request_utils import (
+    compile_diffusion_request_overrides,
+)
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -132,6 +135,29 @@ from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class _DiffusionRequestSources:
+    root_extra_body: Mapping[str, Any]
+    nested_extra_body: Mapping[str, Any]
+    explicit_root_values: Mapping[str, Any]
+    stage_provided_root_fields: Mapping[int, frozenset[str]]
+    stage_extra_args: Mapping[int, object | None]
+    raw_sampling_params_list: object | None
+
+
+@dataclass(frozen=True)
+class _DiffusionRequestContract:
+    request_values: Mapping[str, Any]
+    extra_body: Mapping[str, Any]
+    sampling_overrides: Mapping[str, Any]
+    declared_extra_args: Mapping[str, Any]
+    extra_args_overrides: Mapping[str, Any]
+    control_overrides: Mapping[str, Any]
+    lora_request: LoRARequest | None
+    lora_scale: float | None
+    sampling_params_list: tuple[Any, ...] | None
+
+
 async def _identity_async(value: Any) -> Any:
     return value
 
@@ -179,7 +205,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             "modalities",
         }
     )
-    _diffusion_root_field_aliases = {"cfg_scale": "true_cfg_scale"}
 
     # Harmony flag (always False for vllm-omni models)
     use_harmony: bool = False
@@ -319,65 +344,250 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         self._diffusion_extra_body_params = params
         return params
 
-    def _apply_diffusion_request_overrides(
+    def _collect_diffusion_request_sources(
         self,
-        sampling_params: OmniDiffusionSamplingParams,
         request: ChatCompletionRequest,
-        root_extra_body: dict[str, Any],
-        nested_extra_body: dict[str, Any],
-    ) -> None:
+        declared_extra_fields: frozenset[str],
+    ) -> _DiffusionRequestSources:
+        root_extra_body, nested_extra_body = self._split_diffusion_request_extra_body(request)
         explicit_fields = getattr(request, "model_fields_set", None)
         if explicit_fields is None:
             explicit_fields = getattr(request, "__fields_set__", set())
-        declared_extra_fields = self._get_diffusion_extra_body_params()
         consumed_root_fields = (
             declared_extra_fields | self._diffusion_sampling_root_fields.keys() | self._diffusion_control_root_fields
         )
-        provided_root_fields = set(root_extra_body) & consumed_root_fields
-        provided_root_fields.update(set(explicit_fields) & consumed_root_fields)
-        nested_provided_root_fields = set(nested_extra_body) & consumed_root_fields
+        explicit_root_values = {key: getattr(request, key, None) for key in set(explicit_fields) & consumed_root_fields}
 
-        normalized = normalize_diffusion_request_extra_args(
-            provided_root_fields=provided_root_fields,
-            extra_args=root_extra_body.get("extra_args"),
-            extra_params=root_extra_body.get("extra_params"),
-            nested_provided_root_fields=nested_provided_root_fields,
-            nested_extra_args=nested_extra_body.get("extra_args"),
-            nested_extra_params=nested_extra_body.get("extra_params"),
-            root_field_aliases=self._diffusion_root_field_aliases,
-        )
+        raw_sampling_params_list = None
+        if not self._diffusion_mode:
+            raw_sampling_params_list = getattr(request, "sampling_params_list", None)
+            if raw_sampling_params_list is not None and not isinstance(raw_sampling_params_list, list):
+                raise ValueError("sampling_params_list must be a JSON array.")
 
-        sampling_overrides: dict[str, Any] = {}
-        for request_field, sampling_field in self._diffusion_sampling_root_fields.items():
-            if request_field in explicit_fields:
-                value = getattr(request, request_field, None)
-            elif request_field in root_extra_body:
-                value = root_extra_body[request_field]
-            elif request_field in nested_extra_body:
-                value = nested_extra_body[request_field]
-            else:
+        stage_configs = [] if self._diffusion_mode else list(getattr(self.engine_client, "stage_configs", []) or [])
+        stage_provided_root_fields: dict[int, frozenset[str]] = {}
+        stage_extra_args: dict[int, object | None] = {}
+        stage_root_field_names = frozenset(self._diffusion_sampling_root_fields) | declared_extra_fields
+        for stage_index, stage_params in enumerate(raw_sampling_params_list or []):
+            if stage_index >= len(stage_configs) or get_stage_type(stage_configs[stage_index]) != "diffusion":
                 continue
-            if value is not None:
-                if sampling_field == "num_inference_steps":
-                    value = int(value)
-                sampling_overrides[sampling_field] = value
-        self._set_if_supported(sampling_params, **sampling_overrides)
 
-        apply_declared_extra_args(
-            sampling_params,
-            declared_extra_fields,
-            nested_extra_body,
+            if not isinstance(stage_params, Mapping):
+                raise ValueError(f"sampling_params_list[{stage_index}] must be a JSON object.")
+            if any(not isinstance(key, str) for key in stage_params):
+                raise ValueError(f"sampling_params_list[{stage_index}] must be a JSON object with string keys.")
+            stage_provided_root_fields[stage_index] = frozenset(stage_params) & stage_root_field_names
+            stage_extra_args[stage_index] = stage_params.get("extra_args")
+
+        return _DiffusionRequestSources(
+            root_extra_body=MappingProxyType(root_extra_body),
+            nested_extra_body=MappingProxyType(nested_extra_body),
+            explicit_root_values=MappingProxyType(explicit_root_values),
+            stage_provided_root_fields=MappingProxyType(stage_provided_root_fields),
+            stage_extra_args=MappingProxyType(stage_extra_args),
+            raw_sampling_params_list=raw_sampling_params_list,
         )
-        apply_declared_extra_args(
-            sampling_params,
-            declared_extra_fields,
-            root_extra_body,
+
+    @staticmethod
+    def _coerce_num_inference_steps(value: object) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("num_inference_steps must be an integer.") from exc
+
+    def _serves_diffusion_requests(self) -> bool:
+        if self._diffusion_mode:
+            return True
+        stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
+        return any(get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs)
+
+    def _compile_request_sampling_params_list(
+        self,
+        request: ChatCompletionRequest,
+        sources: _DiffusionRequestSources,
+        declared_extra_fields: frozenset[str],
+    ) -> tuple[Any, ...] | None:
+        if self._diffusion_mode:
+            return None
+
+        stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
+        try:
+            if sources.raw_sampling_params_list is None:
+                sampling_params_list = self._build_sampling_params_list_from_request(request)
+            else:
+                request_sampling_params: list[Any] = []
+                for stage_index, stage_params in enumerate(sources.raw_sampling_params_list):
+                    if stage_index >= len(stage_configs) or get_stage_type(stage_configs[stage_index]) != "diffusion":
+                        request_sampling_params.append(
+                            dict(stage_params) if isinstance(stage_params, Mapping) else stage_params
+                        )
+                        continue
+
+                    assert isinstance(stage_params, Mapping)
+                    compiled_stage_params = dict(stage_params)
+                    compiled_stage_extra_args = dict(
+                        cast(Mapping[str, Any], sources.stage_extra_args.get(stage_index)) or {}
+                    )
+                    for request_field in sources.stage_provided_root_fields.get(stage_index, ()):
+                        value = compiled_stage_params.pop(request_field)
+                        if request_field in declared_extra_fields:
+                            compiled_stage_extra_args[request_field] = value
+                        else:
+                            sampling_field = self._diffusion_sampling_root_fields.get(request_field)
+                            if sampling_field is not None:
+                                compiled_stage_params[sampling_field] = value
+                    if "extra_args" in compiled_stage_params or compiled_stage_extra_args:
+                        compiled_stage_params["extra_args"] = compiled_stage_extra_args
+                    request_sampling_params.append(compiled_stage_params)
+                sampling_params_list = self._to_sampling_params_list(request_sampling_params)
+        except TypeError as exc:
+            raise ValueError(f"Invalid sampling_params_list: {exc}") from exc
+
+        for stage_index, sampling_params in enumerate(sampling_params_list):
+            if stage_index >= len(stage_configs) or get_stage_type(stage_configs[stage_index]) != "diffusion":
+                continue
+
+            provided_root_fields = sources.stage_provided_root_fields.get(stage_index, ())
+            provided_extra_args = sources.stage_extra_args.get(stage_index)
+            provided_extra_fields = set(provided_extra_args) if isinstance(provided_extra_args, Mapping) else set()
+
+            if "num_inference_steps" in declared_extra_fields and (
+                "num_inference_steps" in provided_root_fields or "num_inference_steps" in provided_extra_fields
+            ):
+                stage_extra_args = dict(getattr(sampling_params, "extra_args", None) or {})
+                value = stage_extra_args.get("num_inference_steps")
+                if value is not None:
+                    stage_extra_args["num_inference_steps"] = self._coerce_num_inference_steps(value)
+                    sampling_params.extra_args = stage_extra_args
+            elif "num_inference_steps" in provided_root_fields:
+                value = getattr(sampling_params, "num_inference_steps", None)
+                if value is not None:
+                    sampling_params.num_inference_steps = self._coerce_num_inference_steps(value)
+
+            if "layers" in declared_extra_fields and (
+                "layers" in provided_root_fields or "layers" in provided_extra_fields
+            ):
+                stage_extra_args = dict(getattr(sampling_params, "extra_args", None) or {})
+                value = stage_extra_args.get("layers")
+                if value is not None:
+                    stage_extra_args["layers"] = validate_layered_layers(value)
+                    sampling_params.extra_args = stage_extra_args
+            elif "layers" in provided_root_fields:
+                value = getattr(sampling_params, "layers", None)
+                if value is not None:
+                    sampling_params.layers = validate_layered_layers(value)
+
+        return tuple(clone_sampling_params(sampling_params) for sampling_params in sampling_params_list)
+
+    def _compile_diffusion_request_contract(
+        self,
+        request: ChatCompletionRequest,
+    ) -> _DiffusionRequestContract:
+        declared_extra_fields = self._get_diffusion_extra_body_params()
+        sources = self._collect_diffusion_request_sources(request, declared_extra_fields)
+
+        # Schema fields and Pydantic model extras are the same flattened JSON
+        # source. Collect each root key once before comparing it with nested and
+        # container sources.
+        root_values = {
+            **sources.root_extra_body,
+            **sources.explicit_root_values,
+        }
+        compiled = compile_diffusion_request_overrides(
+            root_values=root_values,
+            nested_root_values=sources.nested_extra_body,
+            sampling_root_fields=self._diffusion_sampling_root_fields,
+            declared_extra_fields=declared_extra_fields,
+            control_root_fields=self._diffusion_control_root_fields,
+            extra_args=sources.root_extra_body.get("extra_args"),
+            extra_params=sources.root_extra_body.get("extra_params"),
+            nested_extra_args=sources.nested_extra_body.get("extra_args"),
+            nested_extra_params=sources.nested_extra_body.get("extra_params"),
+            stage_provided_root_fields=sources.stage_provided_root_fields,
+            stage_extra_args=sources.stage_extra_args,
         )
-        if normalized:
+
+        request_values = dict(compiled.request_values)
+        sampling_overrides = dict(compiled.sampling_overrides)
+        declared_extra_args = dict(compiled.declared_extra_args)
+        extra_args_overrides = dict(compiled.extra_args)
+        control_overrides = dict(compiled.control_overrides)
+
+        if "num_inference_steps" in sampling_overrides:
+            sampling_overrides["num_inference_steps"] = self._coerce_num_inference_steps(
+                sampling_overrides["num_inference_steps"]
+            )
+        if "num_inference_steps" in declared_extra_fields and "num_inference_steps" in extra_args_overrides:
+            extra_args_overrides["num_inference_steps"] = self._coerce_num_inference_steps(
+                extra_args_overrides["num_inference_steps"]
+            )
+            if "num_inference_steps" in declared_extra_args:
+                declared_extra_args["num_inference_steps"] = extra_args_overrides["num_inference_steps"]
+
+        if "layers" in sampling_overrides:
+            sampling_overrides["layers"] = validate_layered_layers(sampling_overrides["layers"])
+        if "layers" in declared_extra_fields and "layers" in extra_args_overrides:
+            extra_args_overrides["layers"] = validate_layered_layers(extra_args_overrides["layers"])
+            if "layers" in declared_extra_args:
+                declared_extra_args["layers"] = extra_args_overrides["layers"]
+
+        height, width = self._resolve_height_width_from_extra_body(request_values)
+        if height is not None:
+            control_overrides["height"] = height
+            if "height" in sampling_overrides:
+                sampling_overrides["height"] = height
+        if width is not None:
+            control_overrides["width"] = width
+            if "width" in sampling_overrides:
+                sampling_overrides["width"] = width
+
+        try:
+            lora_request, lora_scale = parse_lora_request(control_overrides.get("lora"))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(str(exc)) from exc
+
+        # Duplicate consumed keys were rejected above. This union preserves the
+        # complete request for diagnostics; its ordering is not precedence.
+        extra_body = MappingProxyType(
+            {
+                **sources.nested_extra_body,
+                **sources.root_extra_body,
+                **sources.explicit_root_values,
+            }
+        )
+        compiled_sampling_params_list = self._compile_request_sampling_params_list(
+            request,
+            sources,
+            declared_extra_fields,
+        )
+
+        return _DiffusionRequestContract(
+            request_values=MappingProxyType(request_values),
+            extra_body=extra_body,
+            sampling_overrides=MappingProxyType(sampling_overrides),
+            declared_extra_args=MappingProxyType(declared_extra_args),
+            extra_args_overrides=MappingProxyType(extra_args_overrides),
+            control_overrides=MappingProxyType(control_overrides),
+            lora_request=lora_request,
+            lora_scale=lora_scale,
+            sampling_params_list=compiled_sampling_params_list,
+        )
+
+    def _apply_diffusion_request_contract(
+        self,
+        sampling_params: OmniDiffusionSamplingParams,
+        contract: _DiffusionRequestContract,
+    ) -> None:
+        self._set_if_supported(sampling_params, **contract.sampling_overrides)
+        if contract.extra_args_overrides:
             sampling_params.extra_args = {
                 **(sampling_params.extra_args or {}),
-                **normalized,
+                **contract.extra_args_overrides,
             }
+        if contract.lora_request is not None:
+            sampling_params.lora_request = contract.lora_request
+            if contract.lora_scale is not None:
+                sampling_params.lora_scale = contract.lora_scale
 
     @staticmethod
     def _split_diffusion_request_extra_body(
@@ -490,9 +700,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        diffusion_contract: _DiffusionRequestContract | None = None
+        if self._serves_diffusion_requests():
+            try:
+                diffusion_contract = self._compile_diffusion_request_contract(request)
+            except ValueError as exc:
+                return self._create_error_response(str(exc), status_code=400)
+
         # Handle diffusion mode
         if self._diffusion_mode:
-            return await self._create_diffusion_chat_completion(request, raw_request)
+            assert diffusion_contract is not None
+            return await self._create_diffusion_chat_completion(
+                request,
+                diffusion_contract,
+                raw_request,
+            )
 
         request_timestamp = time.time()
         if raw_request is not None:
@@ -613,7 +835,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Some models will return a list like ["text", None, "audio"], better
         # to strip None in the list
         engine_output_modalities = [x for x in self.engine_client.output_modalities if x is not None]
-        output_modalities = getattr(request, "modalities", engine_output_modalities)
+        if diffusion_contract is not None and "modalities" in diffusion_contract.control_overrides:
+            output_modalities = diffusion_contract.control_overrides["modalities"]
+        else:
+            output_modalities = getattr(request, "modalities", engine_output_modalities)
         request.modalities = output_modalities if output_modalities is not None else engine_output_modalities
 
         if not isinstance(request.modalities, list) or not all(isinstance(m, str) for m in request.modalities):
@@ -633,15 +858,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if isinstance(audio_format_check, ErrorResponse):
                 return audio_format_check
 
-        num_inference_steps = None
-        # The OpenAI client flattens ``extra_body`` into request extras, while
-        # raw HTTP callers may send the nested compatibility form. Keep both
-        # sources separate until duplicate detection has run.
-        try:
-            root_extra_body, nested_extra_body = self._split_diffusion_request_extra_body(request)
-        except ValueError as e:
-            return self.create_error_response(str(e))
-        extra_body = {**nested_extra_body, **root_extra_body}
+        if diffusion_contract is None:
+            try:
+                root_extra_body, nested_extra_body = self._split_diffusion_request_extra_body(request)
+            except ValueError as exc:
+                return self.create_error_response(str(exc))
+            extra_body = {**nested_extra_body, **root_extra_body}
+        else:
+            extra_body = diffusion_contract.extra_body
         # Omni multistage image generation: Stage-0 (AR) should receive a clean
         # text prompt (and optional conditioning image/size) so the model's own
         # processor can construct the correct inputs.
@@ -655,16 +879,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if not extracted_prompt:
                     return self.create_error_response("No text prompt found in messages")
 
-                height, width = self._resolve_height_width_from_extra_body(extra_body)
-
-                num_inference_steps = extra_body.get("num_inference_steps")
-                if num_inference_steps is not None:
-                    try:
-                        num_inference_steps = int(num_inference_steps)
-                    except Exception:
-                        num_inference_steps = None
-
-                negative_prompt = extra_body.get("negative_prompt")
+                if diffusion_contract is None:
+                    height, width = self._resolve_height_width_from_extra_body(extra_body)
+                    negative_prompt = extra_body.get("negative_prompt")
+                else:
+                    height = diffusion_contract.control_overrides.get("height")
+                    width = diffusion_contract.control_overrides.get("width")
+                    negative_prompt = diffusion_contract.control_overrides.get("negative_prompt")
                 engine_prompt_image: dict[str, Any] | None = None
                 if reference_images:
                     # Best-effort decode first reference image for i2i.
@@ -714,13 +935,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     }
 
                 engine_prompts = [tprompt]
-                # Store height/width for applying to diffusion stage sampling params later
-                _image_gen_height = height
-                _image_gen_width = width
             except Exception as e:
                 logger.warning("Failed to build image-generation prompt for omni multistage: %s", e)
-                _image_gen_height = None
-                _image_gen_width = None
         elif request.modalities and ("text" in request.modalities) and is_single_stage_diffusion(self.engine_client):
             # Single-stage diffusion text output (img2text / text2text).
             # Build a diffusion-style prompt with modalities=["text"] so the
@@ -747,21 +963,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 engine_prompts = [tprompt]
             except Exception as e:
                 logger.warning("Failed to build text-output prompt for single-stage diffusion: %s", e)
-            _image_gen_height = None
-            _image_gen_width = None
-        else:
-            _image_gen_height = None
-            _image_gen_width = None
 
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
-            for i, engine_prompt in enumerate(engine_prompts):
-                if hasattr(request, "sampling_params_list"):
-                    sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
+            for engine_prompt in engine_prompts:
+                if diffusion_contract is None:
+                    raw_sampling_params_list = getattr(request, "sampling_params_list", None)
+                    if raw_sampling_params_list is not None:
+                        sampling_params_list = self._to_sampling_params_list(raw_sampling_params_list)
+                    else:
+                        sampling_params_list = self._build_sampling_params_list_from_request(request)
                 else:
-                    # Use standard OpenAI API parameters for comprehension stage
-                    sampling_params_list = self._build_sampling_params_list_from_request(request)
+                    assert diffusion_contract.sampling_params_list is not None
+                    sampling_params_list = [
+                        clone_sampling_params(sampling_params)
+                        for sampling_params in diffusion_contract.sampling_params_list
+                    ]
 
                 # If this is a streaming (output) request, coerce cumulative outputs
                 # to delta to ensure emitted outputs are correctly drained. Otherwise
@@ -774,25 +992,22 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     )
 
                 # Apply user-specified overrides to diffusion stage(s) for image generation
-                for idx, sp in enumerate(sampling_params_list):
-                    if hasattr(sp, "height") and _image_gen_height is not None:
-                        sp.height = _image_gen_height
-                    if hasattr(sp, "width") and _image_gen_width is not None:
-                        sp.width = _image_gen_width
-                    if hasattr(sp, "num_inference_steps") and num_inference_steps is not None:
-                        sp.num_inference_steps = num_inference_steps
+                for sp in sampling_params_list:
                     if isinstance(sp, OmniDiffusionSamplingParams):
-                        try:
-                            self._apply_diffusion_request_overrides(
-                                sp,
-                                request,
-                                root_extra_body,
-                                nested_extra_body,
-                            )
-                        except ValueError as e:
-                            return self._create_error_response(str(e), status_code=400)
-                    else:
-                        apply_declared_extra_args(sp, self._get_diffusion_extra_body_params(), extra_body)
+                        assert diffusion_contract is not None
+                        self._apply_diffusion_request_contract(sp, diffusion_contract)
+                    elif diffusion_contract is not None and diffusion_contract.declared_extra_args:
+                        apply_declared_extra_args(
+                            sp,
+                            frozenset(diffusion_contract.declared_extra_args),
+                            diffusion_contract.declared_extra_args,
+                        )
+                    elif diffusion_contract is None:
+                        apply_declared_extra_args(
+                            sp,
+                            self._get_diffusion_extra_body_params(),
+                            extra_body,
+                        )
 
                 self._log_inputs(
                     request_id,
@@ -3482,6 +3697,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     async def _create_diffusion_chat_completion(
         self,
         request: ChatCompletionRequest,
+        diffusion_contract: _DiffusionRequestContract,
         raw_request: Request | None = None,
     ) -> ChatCompletionResponse | ErrorResponse:
         """Generate images via chat completion interface for diffusion models.
@@ -3512,48 +3728,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 messages
             )
 
-            # Extract generation parameters from root request extras and the
-            # nested compatibility form without discarding either source.
-            # Reference: text_to_image.py and text_to_video.py for supported parameters
-            # [NOTE] When sending request via openai client Python library,
-            #   `extra_body` is flattented and merged into the payload's root.
-            #   These extra fields are accessible via `model_extra` property (from Pydantic base class).
-            #   When sending raw request with curl, no flattening happens. Directly read the `extra_body` dict.
-            try:
-                root_extra_body, nested_extra_body = self._split_diffusion_request_extra_body(request)
-            except ValueError as e:
-                return self._create_error_response(str(e), status_code=400)
-            extra_body = {**nested_extra_body, **root_extra_body}
-
-            # Parse size if provided (supports "1024x1024" format)
-            height, width = self._resolve_height_width_from_extra_body(extra_body)
-
-            # Get request parameters from extra_body.
-            # Avoid hardcoded defaults here — let each pipeline's forward()
-            # method apply its own model-specific default when the user does
-            # not provide a value.
-            num_inference_steps = extra_body.get("num_inference_steps")
-            guidance_scale = extra_body.get("guidance_scale")
-            true_cfg_scale = extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale")
-            seed = extra_body.get("seed")
-            if seed is None:
-                seed = getattr(request, "seed", None)
-            negative_prompt = extra_body.get("negative_prompt")
-            num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
-
-            # Text-to-video parameters (ref: text_to_video.py)
-            num_frames = extra_body.get("num_frames")
-            guidance_scale_2 = extra_body.get("guidance_scale_2")
-            lora_body = extra_body.get("lora")
-
-            # Qwen-Image-Layered parameters
-            layers = extra_body.get("layers")
-            resolution = extra_body.get("resolution")
-
-            try:
-                layers = validate_layered_layers(layers)
-            except ValueError as e:
-                return self._create_error_response(str(e), status_code=400)
+            # Request extras were compiled once at the shared serving boundary.
+            extra_body = diffusion_contract.extra_body
+            negative_prompt = diffusion_contract.control_overrides.get("negative_prompt")
 
             logger.info(
                 "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
@@ -3578,51 +3755,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 "negative_prompt": negative_prompt,
                 "modalities": ["image"],
             }
-            gen_params = OmniDiffusionSamplingParams(
-                height=height,
-                width=width,
-                num_outputs_per_prompt=num_outputs_per_prompt,
-                seed=seed,
-            )
-
-            # Only override defaults when the user explicitly provides values
-            if num_inference_steps is not None:
-                gen_params.num_inference_steps = num_inference_steps
-            if guidance_scale is not None:
-                gen_params.guidance_scale = guidance_scale
-            if true_cfg_scale is not None:
-                gen_params.true_cfg_scale = true_cfg_scale
-            try:
-                self._apply_diffusion_request_overrides(
-                    gen_params,
-                    request,
-                    root_extra_body,
-                    nested_extra_body,
-                )
-            except ValueError as e:
-                return self._create_error_response(str(e), status_code=400)
-            if num_frames is not None:
-                gen_params.num_frames = num_frames
-            if guidance_scale_2 is not None:
-                gen_params.guidance_scale_2 = guidance_scale_2
-            if layers is not None:
-                gen_params.layers = layers
-            if resolution is not None:
-                gen_params.resolution = resolution
-
-            # Parse per-request LoRA.
-            if lora_body and isinstance(lora_body, dict):
-                try:
-                    lora_req, lora_scale = parse_lora_request(lora_body)
-                    if lora_req is not None:
-                        gen_params.lora_request = lora_req
-                        if lora_scale is not None:
-                            gen_params.lora_scale = lora_scale
-                except Exception as e:  # pragma: no cover - safeguard
-                    logger.warning("Failed to parse LoRA request: %s", e)
+            gen_params = OmniDiffusionSamplingParams()
+            self._apply_diffusion_request_contract(gen_params, diffusion_contract)
 
             # Route text modality for single-stage diffusion (img2text / text2text)
-            requested_modalities = extra_body.get("modalities") or []
+            requested_modalities = diffusion_contract.control_overrides.get("modalities") or []
             is_text_request = "text" in requested_modalities
 
             if is_text_request:

@@ -111,6 +111,56 @@ def mock_request(mocker: MockerFixture):
     return request
 
 
+def _configure_multistage_diffusion_chat(serving_chat, mocker: MockerFixture):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    async def empty_output():
+        if False:
+            yield None
+
+    serving_chat._diffusion_mode = False
+    serving_chat._diffusion_extra_body_params = frozenset()
+    serving_chat._check_model = mocker.AsyncMock(return_value=None)
+    serving_chat._maybe_get_adapters = mocker.Mock(return_value=None)
+    serving_chat.models = mocker.MagicMock()
+    serving_chat.models.model_name.return_value = "test-model"
+    serving_chat.renderer = mocker.MagicMock()
+    serving_chat.renderer.get_tokenizer.return_value = mocker.MagicMock()
+    serving_chat.parser_cls = None
+    serving_chat.use_harmony = False
+    serving_chat.enable_auto_tools = False
+    serving_chat.exclude_tools_when_tool_choice_none = False
+    serving_chat.trust_request_chat_template = False
+    serving_chat.chat_template = None
+    serving_chat.chat_template_content_format = "string"
+    serving_chat.default_chat_template_kwargs = {}
+    serving_chat.online_renderer = mocker.MagicMock()
+    serving_chat.online_renderer.validate_chat_template.return_value = None
+    serving_chat._effective_chat_template_kwargs = mocker.Mock(return_value={})
+    serving_chat._preprocess_chat = mocker.AsyncMock(return_value=([], [{"prompt": "preprocessed"}]))
+    serving_chat._base_request_id = mocker.Mock(return_value="multistage-request")
+    serving_chat._extract_diffusion_prompt_and_images_from_messages = mocker.Mock(return_value=("prompt", []))
+    serving_chat._build_sampling_params_list_from_request = mocker.Mock(
+        return_value=[
+            OmniDiffusionSamplingParams(),
+            OmniDiffusionSamplingParams(),
+        ]
+    )
+    serving_chat._log_inputs = mocker.Mock()
+    serving_chat.engine_client.errored = False
+    serving_chat.engine_client.output_modalities = ["image"]
+    serving_chat.engine_client.stage_configs = [
+        SimpleNamespace(stage_type="diffusion"),
+        SimpleNamespace(stage_type="diffusion"),
+    ]
+    serving_chat.engine_client.default_sampling_params_list = [
+        OmniDiffusionSamplingParams(),
+        OmniDiffusionSamplingParams(),
+    ]
+    serving_chat.engine_client.generate = mocker.Mock(side_effect=lambda **_: empty_output())
+    return serving_chat.engine_client.generate
+
+
 # =============================================================================
 # Tests for _OPENAI_SAMPLING_FIELDS constant
 # =============================================================================
@@ -139,20 +189,20 @@ def test_openai_sampling_fields_contains_expected_fields():
 def test_diffusion_request_overrides_reach_sampling_params(serving_chat):
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+    serving_chat._diffusion_mode = True
     serving_chat._diffusion_extra_body_params = frozenset({"cfg_text_scale"})
-    request = ChatCompletionRequest(model="test", messages=[], seed=1)
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        seed=1,
+        cfg_text_scale=7.0,
+        guidance_scale=6.0,
+        extra_args={"sample_solver": "euler"},
+    )
     sampling_params = OmniDiffusionSamplingParams(extra_args={"stage_default": True})
 
-    serving_chat._apply_diffusion_request_overrides(
-        sampling_params,
-        request,
-        {
-            "cfg_text_scale": 7.0,
-            "guidance_scale": 6.0,
-            "extra_args": {"sample_solver": "euler"},
-        },
-        {},
-    )
+    contract = serving_chat._compile_diffusion_request_contract(request)
+    serving_chat._apply_diffusion_request_contract(sampling_params, contract)
 
     assert sampling_params.seed == 1
     assert sampling_params.guidance_scale == 6.0
@@ -163,22 +213,127 @@ def test_diffusion_request_overrides_reach_sampling_params(serving_chat):
     }
 
 
+def test_schema_declared_root_reaches_model_extra_consumer(serving_chat):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_extras import get_extra_body_params
+
+    serving_chat._diffusion_mode = True
+    serving_chat._diffusion_extra_body_params = get_extra_body_params("SenseNovaU1Pipeline")
+    request = ChatCompletionRequest(model="test", messages=[], max_tokens=32)
+    sampling_params = OmniDiffusionSamplingParams(extra_args={"stage_default": True})
+
+    contract = serving_chat._compile_diffusion_request_contract(request)
+    serving_chat._apply_diffusion_request_contract(sampling_params, contract)
+
+    assert sampling_params.extra_args == {
+        "stage_default": True,
+        "max_tokens": 32,
+    }
+
+
+def test_schema_declared_root_conflicts_with_canonical_extra_arg(serving_chat):
+    from vllm_omni.model_extras import get_extra_body_params
+
+    serving_chat._diffusion_mode = True
+    serving_chat._diffusion_extra_body_params = get_extra_body_params("SenseNovaU1Pipeline")
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        max_tokens=32,
+        extra_args={"max_tokens": 64},
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        serving_chat._compile_diffusion_request_contract(request)
+
+    assert str(exc_info.value) == (
+        'Parameter "max_tokens" was provided more than once: request.max_tokens, request.extra_args.max_tokens.'
+    )
+
+
+def test_model_declared_cfg_scale_uses_model_extra_consumer(serving_chat):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_extras import get_extra_body_params
+
+    serving_chat._diffusion_mode = True
+    serving_chat._diffusion_extra_body_params = get_extra_body_params("SenseNovaU1Pipeline")
+    request = ChatCompletionRequest(model="test", messages=[], cfg_scale=3.0)
+    sampling_params = OmniDiffusionSamplingParams()
+
+    contract = serving_chat._compile_diffusion_request_contract(request)
+    serving_chat._apply_diffusion_request_contract(sampling_params, contract)
+
+    assert sampling_params.true_cfg_scale is None
+    assert sampling_params.extra_args == {"cfg_scale": 3.0}
+
+
+def test_generic_cfg_scale_still_targets_true_cfg_scale(serving_chat):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    serving_chat._diffusion_mode = True
+    serving_chat._diffusion_extra_body_params = frozenset()
+    request = ChatCompletionRequest(model="test", messages=[], cfg_scale=3.0)
+    sampling_params = OmniDiffusionSamplingParams()
+
+    contract = serving_chat._compile_diffusion_request_contract(request)
+    serving_chat._apply_diffusion_request_contract(sampling_params, contract)
+
+    assert sampling_params.true_cfg_scale == 3.0
+    assert sampling_params.extra_args == {}
+
+
+def test_model_declared_dimension_remains_available_to_prompt_consumer(serving_chat):
+    from vllm_omni.model_extras import get_extra_body_params
+
+    serving_chat._diffusion_mode = True
+    serving_chat._diffusion_extra_body_params = get_extra_body_params("MingImagePipeline")
+    request = ChatCompletionRequest(model="test", messages=[], height=512, width=768)
+
+    contract = serving_chat._compile_diffusion_request_contract(request)
+
+    assert contract.sampling_overrides.get("height") is None
+    assert contract.extra_args_overrides["height"] == 512
+    assert contract.control_overrides["height"] == 512
+    assert contract.control_overrides["width"] == 768
+
+
+def test_stage_root_uses_same_model_aware_consumer_as_global_root(serving_chat):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_extras import get_extra_body_params
+
+    serving_chat._diffusion_mode = False
+    serving_chat._diffusion_extra_body_params = get_extra_body_params("SenseNovaU1Pipeline")
+    serving_chat.engine_client.stage_configs = [SimpleNamespace(stage_type="diffusion")]
+    serving_chat.engine_client.default_sampling_params_list = [OmniDiffusionSamplingParams()]
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        sampling_params_list=[{"cfg_scale": 3.0}],
+    )
+
+    contract = serving_chat._compile_diffusion_request_contract(request)
+
+    assert contract.sampling_params_list is not None
+    sampling_params = contract.sampling_params_list[0]
+    assert sampling_params.true_cfg_scale is None
+    assert sampling_params.extra_args == {"cfg_scale": 3.0}
+
+
 def test_unknown_root_extra_does_not_conflict_with_canonical_extra_args(serving_chat):
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+    serving_chat._diffusion_mode = True
     serving_chat._diffusion_extra_body_params = frozenset()
-    request = ChatCompletionRequest(model="test", messages=[])
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        model_specific_option="ignored-root-value",
+        extra_args={"model_specific_option": "canonical-value"},
+    )
     sampling_params = OmniDiffusionSamplingParams()
 
-    serving_chat._apply_diffusion_request_overrides(
-        sampling_params,
-        request,
-        {
-            "model_specific_option": "ignored-root-value",
-            "extra_args": {"model_specific_option": "canonical-value"},
-        },
-        {},
-    )
+    contract = serving_chat._compile_diffusion_request_contract(request)
+    serving_chat._apply_diffusion_request_contract(sampling_params, contract)
 
     assert sampling_params.extra_args == {"model_specific_option": "canonical-value"}
 
@@ -186,6 +341,7 @@ def test_unknown_root_extra_does_not_conflict_with_canonical_extra_args(serving_
 def test_internal_sampling_state_is_not_a_public_root_field(serving_chat):
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+    serving_chat._diffusion_mode = True
     serving_chat._diffusion_extra_body_params = frozenset()
     request = ChatCompletionRequest(
         model="test",
@@ -195,13 +351,8 @@ def test_internal_sampling_state_is_not_a_public_root_field(serving_chat):
     )
     sampling_params = OmniDiffusionSamplingParams()
 
-    root_extra_body, nested_extra_body = serving_chat._split_diffusion_request_extra_body(request)
-    serving_chat._apply_diffusion_request_overrides(
-        sampling_params,
-        request,
-        root_extra_body,
-        nested_extra_body,
-    )
+    contract = serving_chat._compile_diffusion_request_contract(request)
+    serving_chat._apply_diffusion_request_contract(sampling_params, contract)
 
     assert sampling_params.latents is None
     assert sampling_params.extra_args == {"latents": "model-specific-value"}
@@ -218,7 +369,8 @@ def test_diffusion_chat_rejects_flattened_nested_control_conflict(serving_chat, 
         extra_body={"negative_prompt": "nested"},
     )
 
-    response = asyncio.run(serving_chat._create_diffusion_chat_completion(request))
+    response = asyncio.run(serving_chat._create_chat_completion(request))
+    serving_chat._extract_diffusion_prompt_and_media.assert_not_called()
 
     assert response.error.code == 400
     assert response.error.message == (
@@ -238,12 +390,48 @@ def test_diffusion_chat_returns_bad_request_for_duplicate_parameter(serving_chat
         extra_args={"flow_shift": 2.0},
     )
 
-    response = asyncio.run(serving_chat._create_diffusion_chat_completion(request))
+    response = asyncio.run(serving_chat._create_chat_completion(request))
+    serving_chat._extract_diffusion_prompt_and_media.assert_not_called()
 
     assert response.error.code == 400
     assert response.error.message == (
         'Parameter "flow_shift" was provided more than once: request.flow_shift, request.extra_args.flow_shift.'
     )
+
+
+def test_pure_and_multistage_return_the_same_duplicate_error_before_dispatch(
+    serving_chat,
+    mocker: MockerFixture,
+):
+    diffusion_dispatch = mocker.patch.object(
+        serving_chat,
+        "_create_diffusion_chat_completion",
+        new=mocker.AsyncMock(),
+    )
+    serving_chat._check_model = mocker.AsyncMock()
+    responses = []
+    for diffusion_mode in (True, False):
+        serving_chat._diffusion_mode = diffusion_mode
+        serving_chat._diffusion_extra_body_params = frozenset({"flow_shift"})
+        serving_chat.engine_client.stage_configs = [
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ]
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[],
+            flow_shift=1.0,
+            extra_args={"flow_shift": 2.0},
+        )
+
+        responses.append(asyncio.run(serving_chat._create_chat_completion(request)))
+
+    assert [response.error.code for response in responses] == [400, 400]
+    assert [response.error.message for response in responses] == [
+        'Parameter "flow_shift" was provided more than once: request.flow_shift, request.extra_args.flow_shift.',
+        'Parameter "flow_shift" was provided more than once: request.flow_shift, request.extra_args.flow_shift.',
+    ]
+    diffusion_dispatch.assert_not_awaited()
+    serving_chat._check_model.assert_not_awaited()
 
 
 def test_diffusion_chat_rejects_mixed_flattened_nested_duplicate(serving_chat, mocker: MockerFixture):
@@ -257,7 +445,8 @@ def test_diffusion_chat_rejects_mixed_flattened_nested_duplicate(serving_chat, m
         extra_body={"extra_args": {"cfg_text_scale": 7.0}},
     )
 
-    response = asyncio.run(serving_chat._create_diffusion_chat_completion(request))
+    response = asyncio.run(serving_chat._create_chat_completion(request))
+    serving_chat._extract_diffusion_prompt_and_media.assert_not_called()
 
     assert response.error.code == 400
     assert response.error.message == (
@@ -266,59 +455,184 @@ def test_diffusion_chat_rejects_mixed_flattened_nested_duplicate(serving_chat, m
     )
 
 
-def test_multistage_diffusion_duplicate_uses_bad_request_helper(serving_chat, mocker: MockerFixture):
+def test_multistage_stage_extra_args_conflict_is_rejected_before_prompt_work(
+    serving_chat,
+    mocker: MockerFixture,
+):
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     serving_chat._diffusion_mode = False
+    serving_chat._diffusion_extra_body_params = frozenset()
+    serving_chat.engine_client.stage_configs = [
+        SimpleNamespace(stage_type="llm", is_comprehension=True),
+        SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+    ]
+    serving_chat.engine_client.default_sampling_params_list = [
+        SamplingParams(),
+        OmniDiffusionSamplingParams(),
+    ]
     serving_chat._check_model = mocker.AsyncMock(return_value=None)
-    serving_chat._maybe_get_adapters = mocker.Mock(return_value=None)
-    serving_chat.models = mocker.MagicMock()
-    serving_chat.models.model_name.return_value = "test-model"
-    serving_chat.renderer = mocker.MagicMock()
-    serving_chat.renderer.get_tokenizer.return_value = mocker.MagicMock()
-    serving_chat.reasoning_parser_cls = None
-    serving_chat.tool_parser = None
-    serving_chat.parser_cls = None
-    serving_chat.use_harmony = False
-    serving_chat.enable_auto_tools = False
-    serving_chat.exclude_tools_when_tool_choice_none = False
-    serving_chat.trust_request_chat_template = False
-    serving_chat.chat_template = None
-    serving_chat.chat_template_content_format = "string"
-    serving_chat.default_chat_template_kwargs = {}
-    serving_chat.online_renderer = mocker.MagicMock()
-    serving_chat.online_renderer.validate_chat_template.return_value = None
-    serving_chat._effective_chat_template_kwargs = mocker.Mock(return_value={})
-    serving_chat._preprocess_chat = mocker.AsyncMock(return_value=([], [{"prompt": "preprocessed"}]))
-    serving_chat._base_request_id = mocker.Mock(return_value="multistage-duplicate")
-    serving_chat._extract_diffusion_prompt_and_images_from_messages = mocker.Mock(return_value=("prompt", []))
-    serving_chat._build_sampling_params_list_from_request = mocker.Mock(return_value=[OmniDiffusionSamplingParams()])
-    serving_chat._apply_diffusion_request_overrides = mocker.Mock(side_effect=ValueError("duplicate parameter"))
-    serving_chat._create_error_response = mocker.Mock(return_value="bad-request")
-    serving_chat.engine_client.errored = False
-    serving_chat.engine_client.output_modalities = ["image"]
-
-    request = SimpleNamespace(
-        tool_choice=None,
-        tools=None,
-        chat_template=None,
-        chat_template_kwargs=None,
-        reasoning_effort=None,
+    serving_chat._preprocess_chat = mocker.AsyncMock()
+    request = ChatCompletionRequest(
+        model="test",
         messages=[],
-        add_generation_prompt=False,
-        continue_final_message=False,
-        add_special_tokens=False,
-        request_id="multistage-duplicate",
         modalities=["image"],
-        model_extra={},
-        extra_body=None,
-        stream=False,
+        sampling_params_list=[
+            {},
+            {"extra_args": {"seed": 111}},
+        ],
+        extra_args={"seed": 222},
     )
 
     result = asyncio.run(serving_chat._create_chat_completion(request))
 
-    assert result == "bad-request"
-    serving_chat._create_error_response.assert_called_once_with("duplicate parameter", status_code=400)
+    assert result.error.code == 400
+    assert result.error.message == (
+        'Parameter "seed" was provided more than once: '
+        "request.extra_args.seed, request.sampling_params_list[1].extra_args.seed."
+    )
+    serving_chat._check_model.assert_not_awaited()
+    serving_chat._preprocess_chat.assert_not_awaited()
+
+
+def test_multistage_server_default_is_not_request_provenance(serving_chat):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    serving_chat._diffusion_mode = False
+    serving_chat._diffusion_extra_body_params = frozenset()
+    serving_chat.engine_client.stage_configs = [
+        SimpleNamespace(stage_type="llm", is_comprehension=True),
+        SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+    ]
+    serving_chat.engine_client.default_sampling_params_list = [
+        SamplingParams(),
+        OmniDiffusionSamplingParams(extra_args={"seed": 111, "stage_default": True}),
+    ]
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        sampling_params_list=[{}],
+        extra_args={"seed": 222},
+    )
+
+    contract = serving_chat._compile_diffusion_request_contract(request)
+    assert contract.sampling_params_list is not None
+    diffusion_params = contract.sampling_params_list[1]
+    serving_chat._apply_diffusion_request_contract(diffusion_params, contract)
+
+    assert diffusion_params.extra_args == {"seed": 222, "stage_default": True}
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value", "expected_message"),
+    [
+        (
+            "layers",
+            999,
+            "Invalid layers value 999. layers must be between 2 and 10 inclusive.",
+        ),
+        (
+            "num_inference_steps",
+            [],
+            "num_inference_steps must be an integer.",
+        ),
+        (
+            "num_inference_steps",
+            {"invalid": "object"},
+            "num_inference_steps must be an integer.",
+        ),
+    ],
+)
+def test_pure_and_multistage_reject_invalid_compiled_values_before_dispatch(
+    serving_chat,
+    mocker: MockerFixture,
+    field_name,
+    invalid_value,
+    expected_message,
+):
+    responses = []
+    for diffusion_mode in (True, False):
+        serving_chat._diffusion_mode = diffusion_mode
+        serving_chat._diffusion_extra_body_params = frozenset()
+        serving_chat.engine_client.stage_configs = [
+            SimpleNamespace(stage_type="diffusion", is_comprehension=True),
+        ]
+        serving_chat.engine_client.default_sampling_params_list = [
+            SamplingParams(),
+        ]
+        serving_chat._check_model = mocker.AsyncMock(return_value=None)
+        serving_chat._extract_diffusion_prompt_and_media = mocker.Mock()
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[],
+            **{field_name: invalid_value},
+        )
+
+        responses.append(asyncio.run(serving_chat._create_chat_completion(request)))
+
+        serving_chat._check_model.assert_not_awaited()
+        serving_chat._extract_diffusion_prompt_and_media.assert_not_called()
+
+    assert [response.error.code for response in responses] == [400, 400]
+    assert [response.error.message for response in responses] == [
+        expected_message,
+        expected_message,
+    ]
+
+
+def test_plain_llm_chat_skips_diffusion_compiler(serving_chat, mocker: MockerFixture):
+    serving_chat._diffusion_mode = False
+    serving_chat.engine_client.stage_configs = [
+        SimpleNamespace(stage_type="llm", is_comprehension=True),
+    ]
+    serving_chat._compile_diffusion_request_contract = mocker.Mock()
+    serving_chat._check_model = mocker.AsyncMock(return_value="model-error")
+    request = ChatCompletionRequest(model="test", messages=[])
+
+    response = asyncio.run(serving_chat._create_chat_completion(request))
+
+    assert response == "model-error"
+    serving_chat._compile_diffusion_request_contract.assert_not_called()
+
+
+def test_diffusion_request_is_compiled_once_before_dispatch(serving_chat, mocker: MockerFixture):
+    serving_chat._diffusion_mode = True
+    serving_chat._diffusion_extra_body_params = frozenset()
+    compile_spy = mocker.spy(serving_chat, "_compile_diffusion_request_contract")
+    serving_chat._create_diffusion_chat_completion = mocker.AsyncMock(return_value="ok")
+    request = ChatCompletionRequest(model="test", messages=[], seed=123)
+
+    response = asyncio.run(serving_chat._create_chat_completion(request))
+
+    assert response == "ok"
+    compile_spy.assert_called_once_with(request)
+    compiled_contract = compile_spy.spy_return
+    serving_chat._create_diffusion_chat_completion.assert_awaited_once_with(
+        request,
+        compiled_contract,
+        None,
+    )
+
+
+def test_multistage_nested_modalities_is_compiled_once_and_dispatched(
+    serving_chat,
+    mocker: MockerFixture,
+):
+    generate = _configure_multistage_diffusion_chat(serving_chat, mocker)
+    compile_contract = mocker.spy(serving_chat, "_compile_diffusion_request_contract")
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        stream=True,
+        extra_body={"modalities": ["image"]},
+    )
+
+    result = asyncio.run(serving_chat._create_chat_completion(request))
+
+    assert hasattr(result, "__aiter__")
+    compile_contract.assert_called_once()
+    generate.assert_called_once()
+    assert generate.call_args.kwargs["output_modalities"] == ["image"]
 
 
 def test_diffusion_chat_preserves_stage_defaults_with_mixed_non_overlapping_extras(
@@ -352,7 +666,7 @@ def test_diffusion_chat_preserves_stage_defaults_with_mixed_non_overlapping_extr
         extra_body={"extra_args": {"sample_solver": "euler"}},
     )
 
-    response = asyncio.run(serving_chat._create_diffusion_chat_completion(request))
+    response = asyncio.run(serving_chat._create_chat_completion(request))
 
     sampling_params_list = captured["sampling_params_list"]
     assert sampling_params_list[0].extra_args == {

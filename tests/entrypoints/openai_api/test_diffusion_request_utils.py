@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_omni.entrypoints.openai.diffusion_request_utils import normalize_diffusion_request_extra_args
+from vllm_omni.entrypoints.openai.diffusion_request_utils import (
+    compile_diffusion_request_overrides,
+    normalize_diffusion_request_extra_args,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -132,3 +135,108 @@ def test_normalize_diffusion_request_extra_args_does_not_treat_stage_defaults_as
     )
 
     assert normalized == {"flow_shift": 3.0}
+
+
+def test_normalize_diffusion_request_extra_args_rejects_stage_request_conflict() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        normalize_diffusion_request_extra_args(
+            provided_root_fields={"seed"},
+            stage_extra_args={1: {"seed": 111}},
+        )
+
+    assert str(exc_info.value) == (
+        'Parameter "seed" was provided more than once: request.seed, request.sampling_params_list[1].extra_args.seed.'
+    )
+
+
+def test_normalize_diffusion_request_extra_args_allows_same_key_in_distinct_stages() -> None:
+    normalized = normalize_diffusion_request_extra_args(
+        stage_extra_args={
+            1: {"seed": 111},
+            2: {"seed": 222},
+        },
+    )
+
+    assert normalized == {}
+
+
+def test_normalize_diffusion_request_extra_args_rejects_non_object_stage_extra_args() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"^sampling_params_list\[1\]\.extra_args must be a JSON object\.$",
+    ):
+        normalize_diffusion_request_extra_args(
+            stage_extra_args={1: ["not", "an", "object"]},
+        )
+
+
+def test_compile_routes_registry_declared_root_to_extra_args() -> None:
+    compiled = compile_diffusion_request_overrides(
+        root_values={"max_tokens": 32},
+        nested_root_values={},
+        sampling_root_fields={},
+        declared_extra_fields={"max_tokens"},
+        control_root_fields=set(),
+    )
+
+    assert compiled.sampling_overrides == {}
+    assert compiled.extra_args == {"max_tokens": 32}
+
+
+def test_compile_uses_sampling_alias_without_model_declaration() -> None:
+    compiled = compile_diffusion_request_overrides(
+        root_values={"cfg_scale": 3.0},
+        nested_root_values={},
+        sampling_root_fields={"cfg_scale": "true_cfg_scale"},
+        declared_extra_fields=set(),
+        control_root_fields=set(),
+    )
+
+    assert compiled.sampling_overrides == {"true_cfg_scale": 3.0}
+    assert compiled.extra_args == {}
+
+
+def test_compile_preserves_shared_control_for_model_declared_root() -> None:
+    compiled = compile_diffusion_request_overrides(
+        root_values={"negative_prompt": "avoid blur"},
+        nested_root_values={},
+        sampling_root_fields={},
+        declared_extra_fields={"negative_prompt"},
+        control_root_fields={"negative_prompt"},
+    )
+
+    assert compiled.extra_args == {"negative_prompt": "avoid blur"}
+    assert compiled.control_overrides == {"negative_prompt": "avoid blur"}
+
+
+def test_compile_registry_declaration_changes_cfg_scale_conflict_key() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        compile_diffusion_request_overrides(
+            root_values={"cfg_scale": 3.0},
+            nested_root_values={},
+            sampling_root_fields={"cfg_scale": "true_cfg_scale"},
+            declared_extra_fields={"cfg_scale"},
+            control_root_fields=set(),
+            extra_args={"cfg_scale": 7.0},
+        )
+
+    assert str(exc_info.value) == (
+        'Parameter "cfg_scale" was provided more than once: request.cfg_scale, request.extra_args.cfg_scale.'
+    )
+
+
+def test_compile_uses_model_aware_aliases_for_stage_conflicts() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        compile_diffusion_request_overrides(
+            root_values={"cfg_scale": 3.0},
+            nested_root_values={},
+            sampling_root_fields={"cfg_scale": "true_cfg_scale"},
+            declared_extra_fields={"cfg_scale"},
+            control_root_fields=set(),
+            stage_extra_args={1: {"cfg_scale": 7.0}},
+        )
+
+    assert str(exc_info.value) == (
+        'Parameter "cfg_scale" was provided more than once: '
+        "request.cfg_scale, request.sampling_params_list[1].extra_args.cfg_scale."
+    )
