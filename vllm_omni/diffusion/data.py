@@ -66,15 +66,9 @@ def _normalize_legacy_diffusion_kv_cache_alias(
         normalized[canonical_name] = legacy_value
 
 
-def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalize legacy diffusion kwargs before config construction."""
-    normalized = dict(kwargs)
-
+def _normalize_common_diffusion_kwargs(normalized: dict[str, Any]) -> None:
+    """Normalize unambiguous diffusion inputs shared by all ingress paths."""
     _normalize_deprecated_diffusion_alias(normalized, "static_lora_scale", "lora_scale")
-    _normalize_deprecated_diffusion_alias(normalized, "quantization", "quantization_config")
-
-    # Renamed from kv_cache_* to avoid clashing with vLLM's --kv-cache-dtype.
-    _normalize_legacy_diffusion_kv_cache_alias(normalized, "kv_cache_dtype", "diffusion_kv_cache_dtype")
     _normalize_legacy_diffusion_kv_cache_alias(
         normalized,
         "kv_cache_skip_steps",
@@ -106,6 +100,17 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
     for key in ("diffusers_load_kwargs", "diffusers_call_kwargs"):
         if key in normalized and normalized[key] is None:
             normalized[key] = {}
+
+
+def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize direct diffusion-config kwargs before construction."""
+    normalized = dict(kwargs)
+    _normalize_common_diffusion_kwargs(normalized)
+
+    # These names are compatibility aliases only for direct diffusion-config
+    # callers. Engine ingress assigns both names to active engine arguments.
+    _normalize_deprecated_diffusion_alias(normalized, "quantization", "quantization_config")
+    _normalize_legacy_diffusion_kv_cache_alias(normalized, "kv_cache_dtype", "diffusion_kv_cache_dtype")
 
     return normalized
 
@@ -160,16 +165,9 @@ def _normalize_flat_diffusion_parallel_fields(
 
 def normalize_omni_diffusion_engine_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize legacy engine ingress before diffusion config construction."""
-    engine_kwargs = dict(kwargs)
-    quantization = engine_kwargs.pop("quantization", None)
-    vllm_kv_cache_dtype = engine_kwargs.pop("kv_cache_dtype", None)
-    normalized = normalize_omni_diffusion_kwargs(engine_kwargs)
-
-    # ``kv_cache_dtype`` is an active vLLM EngineArgs setting. Keep it out of
-    # the legacy diffusion KV-cache migration so the startup partitioner can
-    # recognize and remove the shared engine field below.
-    if vllm_kv_cache_dtype is not None:
-        normalized["kv_cache_dtype"] = vllm_kv_cache_dtype
+    normalized = dict(kwargs)
+    _normalize_common_diffusion_kwargs(normalized)
+    quantization = normalized.pop("quantization", None)
 
     _normalize_flat_diffusion_parallel_fields(normalized, normalized, overwrite=False)
 
