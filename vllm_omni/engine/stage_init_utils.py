@@ -25,7 +25,11 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig, normalize_omni_diffusion_engine_kwargs
+from vllm_omni.diffusion.data import (
+    OmniDiffusionConfig,
+    _validate_normalized_diffusion_kwargs,
+    normalize_omni_diffusion_engine_kwargs,
+)
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
@@ -1079,15 +1083,12 @@ def get_stage_connector_spec(
 def _strict_diffusion_config_kwargs(engine_args: dict[str, Any]) -> dict[str, Any]:
     """Return the diffusion-owned startup payload and reject unowned keys."""
     normalized = normalize_omni_diffusion_engine_kwargs(engine_args)
-
     diffusion_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
     shared_engine_fields = frozenset(config_field.name for config_field in fields(OmniEngineArgs))
-    unknown_fields = sorted(set(normalized) - diffusion_fields - shared_engine_fields)
-    if unknown_fields:
-        stage_id = normalized.get("stage_id", "unknown")
-        names = ", ".join(repr(name) for name in unknown_fields)
-        raise ValueError(f"Unknown diffusion config field(s) for stage {stage_id}: {names}")
-
+    _validate_normalized_diffusion_kwargs(
+        normalized,
+        diffusion_fields | shared_engine_fields,
+    )
     return {name: value for name, value in normalized.items() if name in diffusion_fields and value is not None}
 
 

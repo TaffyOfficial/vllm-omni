@@ -139,7 +139,6 @@ class _StageEngineValues:
     parallel: _ParallelEngineOverrides
     diffusion: _DiffusionEngineOverrides
     shared_engine_args: dict[str, Any]
-    unclaimed: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -767,21 +766,29 @@ def _stage_engine_overrides(stage_deploy: StageDeployConfig | None) -> dict[str,
 def _stage_engine_values(
     stage_deploy: StageDeployConfig | None,
     execution_type: StageExecutionType,
+    stage_id: int,
     stage_cli_overrides: Mapping[str, Any] | None = None,
 ) -> _StageEngineValues:
     engine = _stage_engine_overrides(stage_deploy)
     if stage_cli_overrides:
         engine.update(_copy_value(stage_cli_overrides))
 
-    shared_engine_fields = _omni_engine_arg_fields() - _KNOWN_STAGE_ENGINE_FIELDS
-    shared_engine_args = _select_engine_overrides(engine, shared_engine_fields)
-    unclaimed: dict[str, Any] = {}
     if execution_type == StageExecutionType.DIFFUSION:
-        from vllm_omni.diffusion.data import normalize_omni_diffusion_engine_kwargs
+        from vllm_omni.diffusion.data import (
+            _validate_normalized_diffusion_kwargs,
+            normalize_omni_diffusion_engine_kwargs,
+        )
 
         engine = normalize_omni_diffusion_engine_kwargs(engine)
-        unclaimed_names = set(engine) - _KNOWN_STAGE_ENGINE_FIELDS - _omni_engine_arg_fields()
-        unclaimed = {name: _copy_value(engine[name]) for name in sorted(unclaimed_names)}
+        shared_engine_fields = _omni_engine_arg_fields()
+        _validate_normalized_diffusion_kwargs(
+            engine,
+            _KNOWN_STAGE_ENGINE_FIELDS | shared_engine_fields,
+            stage_id=stage_id,
+        )
+        shared_engine_args = _select_engine_overrides(engine, shared_engine_fields - _KNOWN_STAGE_ENGINE_FIELDS)
+    else:
+        shared_engine_args = {}
 
     return _StageEngineValues(
         quantization=cast(
@@ -799,7 +806,6 @@ def _stage_engine_values(
         parallel=cast(_ParallelEngineOverrides, _select_engine_overrides(engine, _PARALLEL_ENGINE_FIELDS)),
         diffusion=_DiffusionEngineOverrides.from_engine(engine),
         shared_engine_args=shared_engine_args,
-        unclaimed=unclaimed,
     )
 
 
@@ -992,11 +998,9 @@ def _with_resolved_processors(
     stage_config: StageConfigType,
     input_proc: str | None,
     next_stage_proc: str | None,
-    shared_engine_args: Mapping[str, Any],
 ) -> StageConfigType:
     stage_config._resolved_custom_process_input_func = input_proc
     stage_config._resolved_custom_process_next_stage_input_func = next_stage_proc
-    stage_config._shared_engine_args = _copy_value(shared_engine_args)
     return stage_config
 
 
@@ -1021,7 +1025,6 @@ def _build_ar_stage_config(
             VllmOmniARStageConfig(**common_kwargs),
             input_proc,
             next_stage_proc,
-            engine.shared_engine_args,
         ),
     )
 
@@ -1047,7 +1050,6 @@ def _build_generation_stage_config(
             VllmOmniGenerationStageConfig(**common_kwargs),
             input_proc,
             next_stage_proc,
-            engine.shared_engine_args,
         ),
     )
 
@@ -1061,10 +1063,6 @@ def _build_diffusion_stage_config(
     *,
     model: str | None,
 ) -> VllmOmniDiffusionStageConfig:
-    if engine.unclaimed:
-        unknown_fields = ", ".join(repr(name) for name in engine.unclaimed)
-        raise ValueError(f"Unknown diffusion config field(s) for stage {topology.stage_id}: {unknown_fields}")
-
     common_kwargs, input_proc, next_stage_proc = _build_common_stage_config_kwargs(
         deploy,
         topology,
@@ -1080,13 +1078,14 @@ def _build_diffusion_stage_config(
         model=model,
         quantization_config=common_kwargs["quantization_config"],
     )
+    stage_config = VllmOmniDiffusionStageConfig(**common_kwargs)
+    stage_config._shared_engine_args = _copy_value(engine.shared_engine_args)
     return cast(
         VllmOmniDiffusionStageConfig,
         _with_resolved_processors(
-            VllmOmniDiffusionStageConfig(**common_kwargs),
+            stage_config,
             input_proc,
             next_stage_proc,
-            engine.shared_engine_args,
         ),
     )
 
@@ -1322,6 +1321,7 @@ class VllmOmniConfig:
                 _stage_engine_values(
                     deploy_by_id.get(topology.stage_id),
                     topology.execution_type,
+                    topology.stage_id,
                     _stage_cli_overrides(topology.stage_id, cli_overrides),
                 ),
                 model=model,

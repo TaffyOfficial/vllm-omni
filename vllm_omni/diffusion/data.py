@@ -5,7 +5,7 @@ import copy
 import os
 import random
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -35,50 +35,53 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _normalize_deprecated_diffusion_alias(
+def _normalize_diffusion_alias(
     normalized: dict[str, Any],
     legacy_name: str,
     canonical_name: str,
+    *,
+    deprecated: bool = False,
 ) -> None:
     legacy_value = normalized.pop(legacy_name, None)
     if legacy_value is None:
         return
 
     if normalized.get(canonical_name) is not None:
-        raise ValueError(f"Diffusion config fields {legacy_name!r} and {canonical_name!r} cannot be provided together.")
+        if deprecated:
+            raise ValueError(
+                f"Diffusion config fields {legacy_name!r} and {canonical_name!r} cannot be provided together."
+            )
+        return
 
-    warnings.warn(
-        f"Diffusion config field {legacy_name!r} is deprecated; use {canonical_name!r} instead.",
-        FutureWarning,
-        stacklevel=3,
-    )
+    if deprecated:
+        warnings.warn(
+            f"Diffusion config field {legacy_name!r} is deprecated; use {canonical_name!r} instead.",
+            FutureWarning,
+            stacklevel=3,
+        )
     normalized[canonical_name] = legacy_value
 
 
-def _normalize_legacy_diffusion_kv_cache_alias(
-    normalized: dict[str, Any],
-    legacy_name: str,
-    canonical_name: str,
-) -> None:
-    """Preserve the pre-existing, non-warning diffusion KV-cache migration."""
-    legacy_value = normalized.pop(legacy_name, None)
-    if legacy_value is not None and normalized.get(canonical_name) is None:
-        normalized[canonical_name] = legacy_value
-
-
-def _normalize_common_diffusion_kwargs(normalized: dict[str, Any]) -> None:
-    """Normalize unambiguous diffusion inputs shared by all ingress paths."""
-    _normalize_deprecated_diffusion_alias(normalized, "static_lora_scale", "lora_scale")
-    _normalize_legacy_diffusion_kv_cache_alias(
-        normalized,
-        "kv_cache_skip_steps",
-        "diffusion_kv_cache_skip_steps",
-    )
-    _normalize_legacy_diffusion_kv_cache_alias(
-        normalized,
-        "kv_cache_skip_layers",
-        "diffusion_kv_cache_skip_layers",
-    )
+def _normalize_omni_diffusion_kwargs(
+    kwargs: Mapping[str, Any],
+    *,
+    engine_ingress: bool,
+) -> dict[str, Any]:
+    normalized = dict(kwargs)
+    aliases = [
+        ("static_lora_scale", "lora_scale", True),
+        ("kv_cache_skip_steps", "diffusion_kv_cache_skip_steps", False),
+        ("kv_cache_skip_layers", "diffusion_kv_cache_skip_layers", False),
+    ]
+    if not engine_ingress:
+        aliases.extend(
+            [
+                ("quantization", "quantization_config", True),
+                ("kv_cache_dtype", "diffusion_kv_cache_dtype", False),
+            ]
+        )
+    for legacy_name, canonical_name, deprecated in aliases:
+        _normalize_diffusion_alias(normalized, legacy_name, canonical_name, deprecated=deprecated)
 
     # Handle "diffusion_attention_backend" shorthand: merge into
     # diffusion_attention_config before field filtering.
@@ -101,18 +104,12 @@ def _normalize_common_diffusion_kwargs(normalized: dict[str, Any]) -> None:
         if key in normalized and normalized[key] is None:
             normalized[key] = {}
 
+    return normalized
+
 
 def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize direct diffusion-config kwargs before construction."""
-    normalized = dict(kwargs)
-    _normalize_common_diffusion_kwargs(normalized)
-
-    # These names are compatibility aliases only for direct diffusion-config
-    # callers. Engine ingress assigns both names to active engine arguments.
-    _normalize_deprecated_diffusion_alias(normalized, "quantization", "quantization_config")
-    _normalize_legacy_diffusion_kv_cache_alias(normalized, "kv_cache_dtype", "diffusion_kv_cache_dtype")
-
-    return normalized
+    return _normalize_omni_diffusion_kwargs(kwargs, engine_ingress=False)
 
 
 def _normalize_flat_diffusion_parallel_fields(
@@ -144,7 +141,9 @@ def _normalize_flat_diffusion_parallel_fields(
 
     moved_value = False
     degree_overridden = False
-    sequence_parallel_explicit = flattened_values.get("sequence_parallel_size") is not None
+    sequence_parallel_explicit = flattened_values.get("sequence_parallel_size") is not None or (
+        not overwrite and parallel_config_dict.get("sequence_parallel_size") is not None
+    )
     for name in flat_keys:
         value = flattened_values.pop(name)
         if value is None or (not overwrite and name in parallel_config_dict):
@@ -165,26 +164,19 @@ def _normalize_flat_diffusion_parallel_fields(
 
 def normalize_omni_diffusion_engine_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize legacy engine ingress before diffusion config construction."""
-    normalized = dict(kwargs)
-    _normalize_common_diffusion_kwargs(normalized)
-    quantization = normalized.pop("quantization", None)
-
+    normalized = _normalize_omni_diffusion_kwargs(kwargs, engine_ingress=True)
     _normalize_flat_diffusion_parallel_fields(normalized, normalized, overwrite=False)
 
-    diffusion_quantization = normalized.pop("diffusion_quantization_config", None)
-    engine_quantization = diffusion_quantization if diffusion_quantization is not None else quantization
-    engine_quantization_name = "diffusion_quantization_config" if diffusion_quantization is not None else "quantization"
-    if diffusion_quantization is not None and quantization is not None:
-        raise ValueError(
-            "Diffusion engine fields 'diffusion_quantization_config' and 'quantization' cannot be provided together."
-        )
-    if engine_quantization is not None:
-        if normalized.get("quantization_config") is not None:
-            raise ValueError(
-                f"Diffusion engine fields {engine_quantization_name!r} and "
-                "'quantization_config' cannot be provided together."
-            )
-        normalized["quantization_config"] = engine_quantization
+    quantization_sources = [
+        (name, normalized.pop(name, None)) for name in ("diffusion_quantization_config", "quantization")
+    ]
+    quantization_sources.append(("quantization_config", normalized.get("quantization_config")))
+    provided_quantization = [(name, value) for name, value in quantization_sources if value is not None]
+    if len(provided_quantization) > 1:
+        names = " and ".join(repr(name) for name, _ in provided_quantization)
+        raise ValueError(f"Diffusion engine fields {names} cannot be provided together.")
+    if provided_quantization:
+        normalized["quantization_config"] = provided_quantization[0][1]
 
     # Preserve the existing HiDream engine ingress until RFC #5160 PR 4 moves
     # this model-specific value into HiDream's model_config. ``extras`` remains
@@ -201,6 +193,20 @@ def normalize_omni_diffusion_engine_kwargs(kwargs: Mapping[str, Any]) -> dict[st
         normalized["extras"] = extras
 
     return normalized
+
+
+def _validate_normalized_diffusion_kwargs(
+    kwargs: Mapping[str, Any],
+    allowed_fields: Collection[str],
+    *,
+    stage_id: int | str | None = None,
+) -> None:
+    """Reject keys that have no owner after ingress normalization."""
+    unknown = sorted(set(kwargs) - set(allowed_fields))
+    if unknown:
+        names = ", ".join(repr(name) for name in unknown)
+        resolved_stage_id = kwargs.get("stage_id", "unknown") if stage_id is None else stage_id
+        raise ValueError(f"Unknown diffusion config field(s) for stage {resolved_stage_id}: {names}")
 
 
 def parse_kv_cache_skip_selector(
@@ -1348,16 +1354,9 @@ class OmniDiffusionConfig:
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
-        kwargs = normalize_omni_diffusion_kwargs(kwargs)
-
-        valid_fields = {f.name for f in fields(cls)}
-        unknown_fields = sorted(set(kwargs) - valid_fields)
-        if unknown_fields:
-            stage_id = kwargs.get("stage_id", "unknown")
-            names = ", ".join(repr(name) for name in unknown_fields)
-            raise ValueError(f"Unknown diffusion config field(s) for stage {stage_id}: {names}")
-
-        return cls(**kwargs)
+        normalized = normalize_omni_diffusion_kwargs(kwargs)
+        _validate_normalized_diffusion_kwargs(normalized, (config_field.name for config_field in fields(cls)))
+        return cls(**normalized)
 
 
 @dataclass

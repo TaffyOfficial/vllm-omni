@@ -41,8 +41,8 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
 )
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.stage_init_utils import (
-    StageMetadata,
     _strict_diffusion_config_kwargs,
     build_diffusion_config,
     build_engine_args_dict,
@@ -88,6 +88,23 @@ def _from_pipeline_key(
         deploy_config_path=deploy_config_path,
         cli_overrides=cli_overrides,
     )
+
+
+def _build_dreamzero_stage(
+    *,
+    engine_extras: dict | None = None,
+    cli_overrides: dict | None = None,
+    **stage_values,
+) -> VllmOmniDiffusionStageConfig:
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    stage_deploy = StageDeployConfig(stage_id=0, engine_extras=engine_extras or {}, **stage_values)
+    stage = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=DeployConfig(stages=[stage_deploy]),
+        cli_overrides=cli_overrides,
+    ).stage_by_id(0)
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    return stage
 
 
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
@@ -538,26 +555,17 @@ def test_from_pipeline_config_preserves_legacy_pp_dp_for_world_size():
     assert cfg.world_size == 4
 
 
-def test_from_pipeline_config_validates_sequence_parallel_size_from_degrees(tmp_path):
-    deploy_path = tmp_path / "dreamzero_derived_parallel.yaml"
-    deploy_path.write_text(
-        "\n".join(
-            [
-                "pipeline: dreamzero",
-                "async_chunk: false",
-                "stages:",
-                "  - stage_id: 0",
-                "    parallel_config:",
-                '      sequence_parallel_size: "6"',
-                '      ulysses_degree: "2"',
-                '      ring_degree: "3"',
-            ]
-        )
+def test_from_pipeline_config_validates_sequence_parallel_size_from_degrees():
+    stage = _build_dreamzero_stage(
+        engine_extras={
+            "parallel_config": {
+                "sequence_parallel_size": "6",
+                "ulysses_degree": "2",
+                "ring_degree": "3",
+            }
+        }
     )
 
-    stage = _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
-
-    assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.parallel_config.sequence_parallel_size == 6
     assert stage.parallel_config.world_size == 6
 
@@ -890,318 +898,30 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     assert cfg.diffusers_call_kwargs == {}
 
 
-@pytest.mark.parametrize(
-    ("field_name", "value"),
-    [("enable_sleep_mod", True)],
-)
-def test_diffusion_config_projection_rejects_unknown_field(field_name, value):
-    with pytest.raises(ValidationError, match=field_name):
-        omni_config_module._DiffusionConfigProjection.from_kwargs(**{field_name: value})
-
-
-def test_diffusion_config_projection_accepts_model_runner_override():
-    config = omni_config_module._DiffusionConfigProjection.from_kwargs(diffusion_model_runner_cls="example.Runner")
-
-    assert config.diffusion_model_runner_cls == "example.Runner"
-
-
-def test_omni_diffusion_config_from_kwargs_rejects_unknown_field():
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-
-    with pytest.raises(ValueError, match=r"stage unknown.*enable_sleep_mod"):
-        OmniDiffusionConfig.from_kwargs(enable_sleep_mod=True)
-
-
-@pytest.mark.parametrize("field_name", ["diffusion_quantization_config", "auxiliary_text_encoder"])
-def test_omni_diffusion_config_from_kwargs_rejects_engine_only_field(field_name):
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-
-    with pytest.raises(ValueError, match=field_name):
-        OmniDiffusionConfig.from_kwargs(**{field_name: "example"})
-
-
-def test_diffusion_config_projection_rejects_engine_only_field():
-    with pytest.raises(ValidationError, match="auxiliary_text_encoder"):
-        omni_config_module._DiffusionConfigProjection.from_kwargs(auxiliary_text_encoder="example/encoder")
-
-
-def test_omni_diffusion_config_from_kwargs_normalizes_compatibility_fields(monkeypatch):
-    from vllm_omni.diffusion import data as diffusion_data
-
-    monkeypatch.setattr(diffusion_data, "build_quant_config", lambda config: config)
-
-    with pytest.warns(FutureWarning, match=r"quantization.*quantization_config"):
-        cfg = diffusion_data.OmniDiffusionConfig.from_kwargs(
-            quantization={"method": "example_quant"},
-            extras={"auxiliary_text_encoder": "example/encoder"},
-        )
-
-    assert cfg.quantization_config == {"method": "example_quant"}
-    assert cfg.extras["auxiliary_text_encoder"] == "example/encoder"
-
-
-def test_omni_diffusion_config_from_kwargs_rejects_quantization_alias_conflict():
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-
-    with pytest.raises(ValueError, match=r"quantization.*quantization_config"):
-        OmniDiffusionConfig.from_kwargs(
-            model="test",
-            quantization="fp8",
-            quantization_config={"method": "fp8", "activation_scheme": "static"},
-        )
-
-
-@pytest.mark.parametrize(
-    ("legacy_name", "canonical_name", "value"),
-    [
-        ("static_lora_scale", "lora_scale", 0.5),
-        ("quantization", "quantization_config", "fp8"),
-    ],
-)
-def test_diffusion_config_projection_rejects_deprecated_alias_conflict(legacy_name, canonical_name, value):
-    with pytest.raises(ValueError, match=rf"{legacy_name}.*{canonical_name}"):
-        omni_config_module._DiffusionConfigProjection.from_kwargs(
-            **{
-                legacy_name: value,
-                canonical_name: value,
-            }
-        )
-
-
-def test_diffusion_config_projection_promotes_deprecated_alias_with_none_canonical_value():
-    with pytest.warns(FutureWarning, match=r"static_lora_scale.*lora_scale"):
-        cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
-            static_lora_scale=0.5,
-            lora_scale=None,
-        )
-
-    assert cfg.lora_scale == 0.5
-
-
-def test_omni_diffusion_config_promotes_deprecated_alias_with_none_canonical_value():
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-
-    with pytest.warns(FutureWarning, match=r"static_lora_scale.*lora_scale"):
-        cfg = OmniDiffusionConfig.from_kwargs(
-            static_lora_scale=0.5,
-            lora_scale=None,
-        )
-
-    assert cfg.lora_scale == 0.5
-
-
-def test_startup_diffusion_payload_keeps_active_vllm_kv_cache_dtype_out_of_diffusion_config():
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", FutureWarning)
-        payload = _strict_diffusion_config_kwargs(
-            {
-                "kv_cache_dtype": "fp8",
-                "diffusion_kv_cache_dtype": "auto",
-            }
-        )
-
-    assert "kv_cache_dtype" not in payload
-    assert payload["diffusion_kv_cache_dtype"] == "auto"
-
-
-def test_startup_diffusion_payload_promotes_deprecated_alias_with_none_canonical_value():
-    with pytest.warns(FutureWarning, match=r"static_lora_scale.*lora_scale"):
-        payload = _strict_diffusion_config_kwargs(
-            {
-                "static_lora_scale": 0.5,
-                "lora_scale": None,
-            }
-        )
-
-    assert payload["lora_scale"] == 0.5
-
-
-def test_startup_diffusion_payload_keeps_canonical_value_with_none_deprecated_alias():
-    payload = _strict_diffusion_config_kwargs(
-        {
-            "static_lora_scale": None,
-            "lora_scale": 0.5,
-        }
+def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_args():
+    stage = _build_dreamzero_stage(
+        max_num_seqs=2,
+        vae_parallel_mode="spatial_shard_height",
+        diffusion_attention_backend="flash_attn",
+        diffusion_quantization_config={"method": "example_quant"},
+        auxiliary_text_encoder="example/encoder",
+        engine_extras={
+            "engine_backend": "custom.engine.Backend",
+            "model_config": {"default_robot_embodiment": "test"},
+            "diffusion_model_runner_cls": "example.Runner",
+        },
+        cli_overrides={"seed": 7, "kv_cache_dtype": "fp8"},
     )
 
-    assert payload["lora_scale"] == 0.5
-
-
-def test_startup_diffusion_payload_rejects_unknown_field_after_shared_fields_are_removed():
-    with pytest.raises(ValueError, match=r"stage 2.*enable_sleep_mod"):
-        _strict_diffusion_config_kwargs(
-            {
-                "stage_id": 2,
-                "max_num_seqs": 4,
-                "enable_sleep_mod": True,
-            }
-        )
-
-
-def test_startup_diffusion_payload_rejects_unknown_none_field():
-    with pytest.raises(ValueError, match=r"stage 2.*enable_sleep_mod"):
-        _strict_diffusion_config_kwargs(
-            {
-                "stage_id": 2,
-                "enable_sleep_mod": None,
-            }
-        )
-
-
-def test_startup_diffusion_payload_nests_flat_parallel_fields():
-    payload = _strict_diffusion_config_kwargs(
-        {
-            "stage_id": 2,
-            "vae_parallel_mode": "spatial_shard_height",
-        }
-    )
-
-    assert payload["parallel_config"] == {"vae_parallel_mode": "spatial_shard_height"}
-
-
-def test_legacy_diffusion_deploy_flat_parallel_fields_drive_preflight_and_config(tmp_path, monkeypatch):
-    from vllm_omni.engine import stage_init_utils
-
-    deploy_path = tmp_path / "dreamzero_flat_parallel.yaml"
-    deploy_path.write_text(
-        "\n".join(
-            [
-                "pipeline: dreamzero",
-                "async_chunk: false",
-                "stages:",
-                "  - stage_id: 0",
-                "    ulysses_degree: 2",
-                "    sequence_parallel_size: 2",
-                "    vae_parallel_mode: spatial_shard_height",
-            ]
-        )
-    )
-    pipeline = _resolve_pipeline_or_skip("dreamzero")
-    deploy = load_deploy_config(deploy_path)
-    stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
-    metadata = extract_stage_metadata(stage)
-    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 2)
-
-    config = build_diffusion_config("unused", stage, metadata)
-
-    assert "ulysses_degree" not in stage.engine_args
-    assert "vae_parallel_mode" not in stage.engine_args
-    assert stage.engine_args.parallel_config.ulysses_degree == 2
-    assert stage.engine_args.parallel_config.vae_parallel_mode == "spatial_shard_height"
-    assert get_stage_devices_per_replica(stage) == 2
-    assert config.parallel_config.ulysses_degree == 2
-    assert config.parallel_config.vae_parallel_mode == "spatial_shard_height"
-
-
-def test_explicit_sequence_parallel_size_conflict_has_legacy_structured_parity(tmp_path):
-    deploy_path = tmp_path / "dreamzero_sequence_parallel_conflict.yaml"
-    deploy_path.write_text(
-        "\n".join(
-            [
-                "pipeline: dreamzero",
-                "async_chunk: false",
-                "stages:",
-                "  - stage_id: 0",
-                "    ulysses_degree: 2",
-                "    sequence_parallel_size: 1",
-            ]
-        )
-    )
-    pipeline = _resolve_pipeline_or_skip("dreamzero")
-    deploy = load_deploy_config(deploy_path)
-    legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
-    metadata = extract_stage_metadata(legacy_stage)
-
-    with pytest.raises(ValueError, match="Sequence parallel size"):
-        build_diffusion_config("unused", legacy_stage, metadata)
-    with pytest.raises(ValueError, match="Sequence parallel size"):
-        VllmOmniConfig.from_pipeline_config(
-            pipeline,
-            user_deploy_config=deploy,
-        )
-
-
-def test_null_flat_parallel_engine_extra_has_legacy_structured_parity(tmp_path, monkeypatch):
-    from vllm_omni.engine import stage_init_utils
-
-    deploy_path = tmp_path / "dreamzero_null_flat_parallel.yaml"
-    deploy_path.write_text(
-        "\n".join(
-            [
-                "pipeline: dreamzero",
-                "async_chunk: false",
-                "stages:",
-                "  - stage_id: 0",
-                "    engine_extras:",
-                "      vae_parallel_mode: null",
-            ]
-        )
-    )
-    pipeline = _resolve_pipeline_or_skip("dreamzero")
-    deploy = load_deploy_config(deploy_path)
-    legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
-    metadata = extract_stage_metadata(legacy_stage)
-    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
-
-    legacy_config = build_diffusion_config("unused", legacy_stage, metadata)
-    structured_stage = VllmOmniConfig.from_pipeline_config(
-        pipeline,
-        user_deploy_config=deploy,
-    ).stage_by_id(0)
-
-    assert "vae_parallel_mode" not in legacy_stage.engine_args
-    assert legacy_config.parallel_config.vae_parallel_mode == "tile"
-    assert isinstance(structured_stage, VllmOmniDiffusionStageConfig)
-    assert structured_stage.parallel_config.vae_parallel_mode == "tile"
-
-
-def test_startup_diffusion_payload_rejects_deprecated_alias_keys_provided_together():
-    with pytest.raises(ValueError, match=r"static_lora_scale.*lora_scale"):
-        _strict_diffusion_config_kwargs(
-            {
-                "static_lora_scale": 0.5,
-                "lora_scale": 0.7,
-            }
-        )
-
-
-def test_startup_diffusion_payload_normalizes_compatibility_fields():
-    payload = _strict_diffusion_config_kwargs(
-        {
-            "stage_id": 2,
-            "diffusion_quantization_config": {"method": "example_quant"},
-            "auxiliary_text_encoder": "example/encoder",
-        }
-    )
-
-    assert payload["quantization_config"] == {"method": "example_quant"}
-    assert payload["extras"]["auxiliary_text_encoder"] == "example/encoder"
-
-
-def test_startup_diffusion_payload_rejects_quantization_source_conflict():
-    with pytest.raises(ValueError, match=r"diffusion_quantization_config.*quantization_config"):
-        _strict_diffusion_config_kwargs(
-            {
-                "diffusion_quantization_config": {"method": "example_quant"},
-                "quantization_config": {"method": "fallback_quant"},
-            }
-        )
-
-
-@pytest.mark.parametrize("field_name", ["max_generated_image_size", "tts_max_instructions_length"])
-def test_startup_diffusion_payload_rejects_service_only_field(field_name):
-    with pytest.raises(ValueError, match=field_name):
-        _strict_diffusion_config_kwargs({"stage_id": 2, field_name: 1000})
-
-
-def test_startup_diffusion_payload_rejects_auxiliary_text_encoder_conflict():
-    with pytest.raises(ValueError, match=r"auxiliary_text_encoder.*top level.*extras"):
-        _strict_diffusion_config_kwargs(
-            {
-                "auxiliary_text_encoder": "top-level/encoder",
-                "extras": {"auxiliary_text_encoder": "extras/encoder"},
-            }
-        )
+    assert stage.shared_engine_args == {"seed": 7, "kv_cache_dtype": "fp8"}
+    assert stage.scheduler_config.max_num_seqs == 2
+    assert stage.parallel_config.vae_parallel_mode == "spatial_shard_height"
+    assert stage.diffusion_config.engine_backend == "custom.engine.Backend"
+    assert stage.diffusion_config.model_config["default_robot_embodiment"] == "test"
+    assert stage.diffusion_config.diffusion_model_runner_cls == "example.Runner"
+    assert stage.diffusion_config.diffusion_attention_config.default.backend == "flash_attn"
+    assert stage.diffusion_config.quantization_config == {"method": "example_quant"}
+    assert stage.diffusion_config.extras["auxiliary_text_encoder"] == "example/encoder"
 
 
 def test_diffusion_attention_backend_keeps_per_role_config():
@@ -1219,67 +939,178 @@ def test_diffusion_attention_backend_keeps_per_role_config():
 
 
 @pytest.mark.parametrize(
-    ("field_name", "yaml_value"),
-    [("enable_sleep_mod", "true")],
+    ("factory", "error_type", "field_name"),
+    [
+        (omni_config_module._DiffusionConfigProjection.from_kwargs, ValidationError, "enable_sleep_mod"),
+        (OmniDiffusionConfig.from_kwargs, ValueError, "enable_sleep_mod"),
+    ],
 )
-def test_from_pipeline_config_rejects_unclaimed_diffusion_engine_extra(tmp_path, field_name, yaml_value):
+def test_diffusion_config_entrypoints_reject_unowned_fields(factory, error_type, field_name):
+    with pytest.raises(error_type, match=field_name):
+        factory(**{field_name: "example"})
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "field_name", "expected", "warning_count"),
+    [
+        ({"kv_cache_dtype": "fp8", "diffusion_kv_cache_dtype": None}, "diffusion_kv_cache_dtype", "fp8", 0),
+        ({"quantization": {"method": "example"}}, "quantization_config", {"method": "example"}, 1),
+    ],
+)
+def test_omni_diffusion_config_normalizes_direct_aliases(monkeypatch, kwargs, field_name, expected, warning_count):
+    from vllm_omni.diffusion import data as diffusion_data
+
+    monkeypatch.setattr(diffusion_data, "build_quant_config", lambda config: config)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        config = OmniDiffusionConfig.from_kwargs(**kwargs)
+
+    assert getattr(config, field_name) == expected
+    assert sum(item.category is FutureWarning for item in caught) == warning_count
+
+
+@pytest.mark.parametrize(
+    ("legacy_name", "canonical_name", "value"),
+    [
+        ("static_lora_scale", "lora_scale", 0.5),
+        ("quantization", "quantization_config", "fp8"),
+    ],
+)
+def test_omni_diffusion_config_rejects_deprecated_alias_conflicts(legacy_name, canonical_name, value):
+    with pytest.raises(ValueError, match=rf"{legacy_name}.*{canonical_name}"):
+        OmniDiffusionConfig.from_kwargs(**{legacy_name: value, canonical_name: value})
+
+
+def test_startup_diffusion_payload_keeps_active_vllm_kv_cache_dtype_out_of_diffusion_config():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        payload = _strict_diffusion_config_kwargs({"kv_cache_dtype": "fp8", "diffusion_kv_cache_dtype": "auto"})
+
+    assert "kv_cache_dtype" not in payload
+    assert payload["diffusion_kv_cache_dtype"] == "auto"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"static_lora_scale": 0.5, "lora_scale": None}, {"lora_scale": 0.5}),
+        (
+            {"vae_parallel_mode": "spatial_shard_height"},
+            {"parallel_config": {"vae_parallel_mode": "spatial_shard_height"}},
+        ),
+        (
+            {
+                "diffusion_quantization_config": {"method": "example_quant"},
+                "auxiliary_text_encoder": "example/encoder",
+            },
+            {
+                "quantization_config": {"method": "example_quant"},
+                "extras": {"auxiliary_text_encoder": "example/encoder"},
+            },
+        ),
+    ],
+)
+def test_startup_diffusion_payload_normalizes_owned_fields(kwargs, expected):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        payload = _strict_diffusion_config_kwargs({"stage_id": 2, **kwargs})
+
+    for name, value in expected.items():
+        assert payload[name] == value
+
+
+def test_legacy_diffusion_deploy_flat_parallel_fields_drive_preflight_and_config(tmp_path, monkeypatch):
+    from vllm_omni.engine import stage_init_utils
+
+    deploy_path = tmp_path / "dreamzero_flat_parallel.yaml"
+    deploy_path.write_text(
+        """\
+pipeline: dreamzero
+async_chunk: false
+stages:
+  - stage_id: 0
+    ulysses_degree: 2
+    sequence_parallel_size: 2
+    vae_parallel_mode: spatial_shard_height
+"""
+    )
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    deploy = load_deploy_config(deploy_path)
+    stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
+    metadata = extract_stage_metadata(stage)
+    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 2)
+
+    config = build_diffusion_config("unused", stage, metadata)
+
+    assert stage.engine_args.parallel_config.ulysses_degree == 2
+    assert stage.engine_args.parallel_config.vae_parallel_mode == "spatial_shard_height"
+    assert get_stage_devices_per_replica(stage) == 2
+    assert config.parallel_config.ulysses_degree == 2
+    assert config.parallel_config.vae_parallel_mode == "spatial_shard_height"
+
+
+def test_explicit_sequence_parallel_size_conflict_has_legacy_structured_parity():
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    deploy = DeployConfig(
+        async_chunk=False,
+        stages=[
+            StageDeployConfig(
+                stage_id=0,
+                ulysses_degree=2,
+                engine_extras={"parallel_config": {"sequence_parallel_size": 1}},
+            )
+        ],
+    )
+    legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
+
+    with pytest.raises(ValueError, match="Sequence parallel size"):
+        build_diffusion_config("unused", legacy_stage, extract_stage_metadata(legacy_stage))
+    with pytest.raises(ValueError, match="Sequence parallel size"):
+        VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"max_num_seqs": 4, "enable_sleep_mod": True}, r"stage 2.*enable_sleep_mod"),
+        ({"enable_sleep_mod": None}, r"stage 2.*enable_sleep_mod"),
+        ({"static_lora_scale": 0.5, "lora_scale": 0.7}, r"static_lora_scale.*lora_scale"),
+        (
+            {
+                "diffusion_quantization_config": {"method": "example"},
+                "quantization_config": {"method": "fallback"},
+            },
+            r"diffusion_quantization_config.*quantization_config",
+        ),
+        ({"max_generated_image_size": 1000}, "max_generated_image_size"),
+        (
+            {
+                "auxiliary_text_encoder": "top-level/encoder",
+                "extras": {"auxiliary_text_encoder": "extras/encoder"},
+            },
+            r"auxiliary_text_encoder.*top level.*extras",
+        ),
+    ],
+)
+def test_startup_diffusion_payload_rejects_invalid_sources(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _strict_diffusion_config_kwargs({"stage_id": 2, **kwargs})
+
+
+def test_from_pipeline_config_rejects_unknown_diffusion_yaml_field(tmp_path):
     deploy_path = tmp_path / "dreamzero_unknown_diffusion_field.yaml"
     deploy_path.write_text(
-        "\n".join(
-            [
-                "pipeline: dreamzero",
-                "async_chunk: false",
-                "stages:",
-                "  - stage_id: 0",
-                f"    {field_name}: {yaml_value}",
-            ]
-        )
+        """\
+pipeline: dreamzero
+async_chunk: false
+stages:
+  - stage_id: 0
+    enable_sleep_mod: true
+"""
     )
 
-    with pytest.raises(ValueError, match=rf"stage 0.*{field_name}"):
-        _from_pipeline_key(
-            "dreamzero",
-            deploy_config_path=str(deploy_path),
-        )
-
-
-def test_from_pipeline_config_keeps_diffusion_model_runner_override(tmp_path):
-    deploy_path = tmp_path / "dreamzero_diffusion_model_runner.yaml"
-    deploy_path.write_text(
-        "\n".join(
-            [
-                "pipeline: dreamzero",
-                "async_chunk: false",
-                "stages:",
-                "  - stage_id: 0",
-                "    diffusion_model_runner_cls: example.Runner",
-            ]
-        )
-    )
-
-    stage = _from_pipeline_key(
-        "dreamzero",
-        deploy_config_path=str(deploy_path),
-    ).stage_by_id(0)
-
-    assert isinstance(stage, VllmOmniDiffusionStageConfig)
-    assert stage.diffusion_config.diffusion_model_runner_cls == "example.Runner"
-
-
-def test_from_pipeline_config_accepts_shared_diffusion_cli_fields():
-    config = _from_pipeline_key(
-        "dreamzero",
-        cli_overrides={
-            "async_chunk": False,
-            "seed": 7,
-            "kv_cache_dtype": "fp8",
-        },
-    )
-
-    stage = config.stage_by_id(0)
-    assert isinstance(stage, VllmOmniDiffusionStageConfig)
-    assert stage.shared_engine_args["seed"] == 7
-    assert stage.shared_engine_args["kv_cache_dtype"] == "fp8"
+    with pytest.raises(ValueError, match=r"stage 0.*enable_sleep_mod"):
+        _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path))
 
 
 def test_default_diffusion_factory_builds_without_orchestrator_only_field(monkeypatch):
@@ -1292,190 +1123,31 @@ def test_default_diffusion_factory_builds_without_orchestrator_only_field(monkey
         stage_type="diffusion",
         engine_args=stage["engine_args"],
     )
-    metadata = StageMetadata(
-        stage_id=0,
-        stage_type="diffusion",
-        engine_output_type="image",
-        is_comprehension=False,
-        requires_multimodal_data=False,
-        engine_input_source=[],
-        final_output=True,
-        final_output_type="image",
-        default_sampling_params={},
-        custom_process_input_func=None,
-        model_stage=None,
-        runtime_cfg=None,
-    )
     monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
 
-    config = build_diffusion_config("unused", stage_config, metadata)
+    config = build_diffusion_config("unused", stage_config, extract_stage_metadata(stage_config))
 
     assert "enable_ar_profiler" not in stage["engine_args"]
     assert config.stage_id == 0
 
 
-def test_from_pipeline_config_rejects_unclaimed_diffusion_cli_override():
-    with pytest.raises(ValueError, match=r"stage 0.*enable_sleep_mod"):
-        _from_pipeline_key(
-            "dreamzero",
-            cli_overrides={
-                "async_chunk": False,
-                "stage_0_enable_sleep_mod": True,
-            },
-        )
-
-
-def test_from_pipeline_config_does_not_apply_diffusion_extra_check_to_ar_stage(tmp_path):
-    deploy_path = tmp_path / "qwen3_tts_ar_engine_extra.yaml"
-    deploy_path.write_text(
-        "\n".join(
-            [
-                "pipeline: qwen3_tts",
-                "stages:",
-                "  - stage_id: 0",
-                "    engine_extras:",
-                "      custom_ar_option: true",
-            ]
-        )
-    )
-
-    config = _from_pipeline_key(
-        "qwen3_tts",
-        deploy_config_path=str(deploy_path),
-    )
-
-    assert isinstance(config.stage_by_id(0), VllmOmniARStageConfig)
-
-
-def test_from_pipeline_config_partitions_known_diffusion_stage_fields(tmp_path):
-    deploy_path = tmp_path / "dreamzero_known_diffusion_fields.yaml"
-    deploy_path.write_text(
-        "\n".join(
-            [
-                "pipeline: dreamzero",
-                "async_chunk: false",
-                "stages:",
-                "  - stage_id: 0",
-                "    max_num_seqs: 2",
-                "    vae_parallel_mode: spatial_shard_height",
-                "    engine_backend: custom.engine.Backend",
-                "    model_config:",
-                "      default_robot_embodiment: test",
-                "    quantization_config:",
-                "      method: example_quant",
-                "    auxiliary_text_encoder: example/encoder",
-            ]
-        )
-    )
-
-    stage = _from_pipeline_key(
-        "dreamzero",
-        deploy_config_path=str(deploy_path),
-    ).stage_by_id(0)
-
-    assert isinstance(stage, VllmOmniDiffusionStageConfig)
-    assert stage.scheduler_config.max_num_seqs == 2
-    assert stage.parallel_config.vae_parallel_mode == "spatial_shard_height"
-    assert stage.diffusion_config.engine_backend == "custom.engine.Backend"
-    assert stage.diffusion_config.model_config["default_robot_embodiment"] == "test"
-    assert stage.diffusion_config.quantization_config == {"method": "example_quant"}
-    assert stage.diffusion_config.extras["auxiliary_text_encoder"] == "example/encoder"
-
-
 @pytest.mark.parametrize(
-    ("field_name", "yaml_value"),
+    ("build_kwargs", "match"),
     [
-        ("max_generated_image_size", "1048576"),
-        ("tts_max_instructions_length", "1000"),
+        ({"cli_overrides": {"stage_0_enable_sleep_mod": True}}, r"stage 0.*enable_sleep_mod"),
+        ({"engine_extras": {"enable_sleep_mod": None}}, r"stage 0.*enable_sleep_mod"),
     ],
 )
-def test_from_pipeline_config_rejects_noncanonical_diffusion_stage_field(tmp_path, field_name, yaml_value):
-    deploy_path = tmp_path / f"dreamzero_{field_name}.yaml"
-    deploy_path.write_text(
-        "\n".join(
-            [
-                "pipeline: dreamzero",
-                "async_chunk: false",
-                "stages:",
-                "  - stage_id: 0",
-                f"    {field_name}: {yaml_value}",
-            ]
-        )
-    )
-
-    with pytest.raises(ValueError, match=field_name):
-        _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path))
+def test_from_pipeline_config_rejects_invalid_diffusion_sources(build_kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _build_dreamzero_stage(**build_kwargs)
 
 
-def test_from_pipeline_config_rejects_auxiliary_text_encoder_conflict(tmp_path):
-    deploy_path = tmp_path / "dreamzero_auxiliary_text_encoder_conflict.yaml"
-    deploy_path.write_text(
-        "\n".join(
-            [
-                "pipeline: dreamzero",
-                "async_chunk: false",
-                "stages:",
-                "  - stage_id: 0",
-                "    auxiliary_text_encoder: top-level/encoder",
-                "    engine_extras:",
-                "      extras:",
-                "        auxiliary_text_encoder: extras/encoder",
-            ]
-        )
-    )
-
-    with pytest.raises(ValueError, match=r"auxiliary_text_encoder.*top level.*extras"):
-        _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path))
-
-
-def test_from_pipeline_config_rejects_quantization_source_conflict(tmp_path):
-    deploy_path = tmp_path / "dreamzero_quantization_conflict.yaml"
-    deploy_path.write_text(
-        "\n".join(
-            [
-                "pipeline: dreamzero",
-                "async_chunk: false",
-                "stages:",
-                "  - stage_id: 0",
-                "    diffusion_quantization_config:",
-                "      method: example_quant",
-                "    engine_extras:",
-                "      quantization_config:",
-                "        method: fallback_quant",
-            ]
-        )
-    )
-
-    with pytest.raises(ValueError, match=r"diffusion_quantization_config.*quantization_config"):
-        _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path))
-
-
-def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_args(tmp_path):
-    deploy_path = tmp_path / "dreamzero_diffusion_aliases.yaml"
-    deploy_path.write_text(
-        "\n".join(
-            [
-                "pipeline: dreamzero",
-                "async_chunk: false",
-                "stages:",
-                "  - stage_id: 0",
-                "    diffusion_attention_backend: flash_attn",
-                "    diffusion_quantization_config:",
-                "      method: example_quant",
-                "    auxiliary_text_encoder: example/encoder",
-            ]
-        )
-    )
-
-    stage = _from_pipeline_key(
-        "dreamzero",
-        deploy_config_path=str(deploy_path),
-    ).stage_by_id(0)
-
-    assert isinstance(stage, VllmOmniDiffusionStageConfig)
-    assert stage.diffusion_config.diffusion_attention_config.default.backend == "flash_attn"
-    assert stage.diffusion_config.quantization_config == {"method": "example_quant"}
-    assert stage.diffusion_config.extras["auxiliary_text_encoder"] == "example/encoder"
+def test_from_pipeline_config_keeps_ar_engine_extras_permissive():
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, engine_extras={"custom_ar_option": True})])
+    config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    assert isinstance(config.stage_by_id(0), VllmOmniARStageConfig)
 
 
 def test_diffusion_config_field_classification_covers_current_fields():
