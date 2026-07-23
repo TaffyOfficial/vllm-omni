@@ -3,11 +3,10 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
-from dataclasses import dataclass, fields, is_dataclass
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
-from types import MappingProxyType
 from typing import Any, Final, cast
 
 import jinja2
@@ -27,7 +26,8 @@ from vllm.entrypoints.chat_utils import (
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.diffusion_request_utils import (
-    compile_diffusion_request_overrides,
+    DiffusionChatRequestPlan,
+    compile_diffusion_chat_request_plan,
 )
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
@@ -37,7 +37,11 @@ from vllm_omni.metrics.modality import (
     observe_audio_first_packet,
     observe_audio_streaming_finalize,
 )
-from vllm_omni.model_extras import get_extra_body_params, get_extra_output_params
+from vllm_omni.model_extras import (
+    get_extra_body_params,
+    get_extra_output_params,
+    should_init_extra_args_for_non_diffusion_stages,
+)
 
 try:
     import soundfile
@@ -99,7 +103,7 @@ from vllm.utils.collection_utils import as_list
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
-from vllm_omni.entrypoints.openai.image_api_utils import encode_image_base64_with_compression, validate_layered_layers
+from vllm_omni.entrypoints.openai.image_api_utils import encode_image_base64_with_compression
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import (
     DEFAULT_AUDIO_FORMAT,
@@ -133,30 +137,6 @@ from vllm_omni.outputs.output_metadata import DiffusionMetadataMapping, Diffusio
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
 
 logger = init_logger(__name__)
-
-
-@dataclass(frozen=True)
-class _DiffusionRequestSources:
-    root_extra_body: Mapping[str, Any]
-    nested_extra_body: Mapping[str, Any]
-    explicit_root_values: Mapping[str, Any]
-    stage_provided_root_fields: Mapping[int, frozenset[str]]
-    stage_extra_args: Mapping[int, object | None]
-    non_diffusion_stage_extra_args: Mapping[int, object | None]
-    raw_sampling_params_list: object | None
-
-
-@dataclass(frozen=True)
-class _DiffusionRequestContract:
-    request_values: Mapping[str, Any]
-    extra_body: Mapping[str, Any]
-    sampling_overrides: Mapping[str, Any]
-    declared_extra_args: Mapping[str, Any]
-    extra_args_overrides: Mapping[str, Any]
-    control_overrides: Mapping[str, Any]
-    lora_request: LoRARequest | None
-    lora_scale: float | None
-    sampling_params_list: tuple[Any, ...] | None
 
 
 async def _identity_async(value: Any) -> Any:
@@ -345,302 +325,49 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         self._diffusion_extra_body_params = params
         return params
 
-    def _collect_diffusion_request_sources(
-        self,
-        request: ChatCompletionRequest,
-        declared_extra_fields: frozenset[str],
-    ) -> _DiffusionRequestSources:
-        root_extra_body, nested_extra_body = self._split_diffusion_request_extra_body(request)
-        explicit_fields = getattr(request, "model_fields_set", None)
-        if explicit_fields is None:
-            explicit_fields = getattr(request, "__fields_set__", set())
-        consumed_root_fields = (
-            declared_extra_fields | self._diffusion_sampling_root_fields.keys() | self._diffusion_control_root_fields
-        )
-        explicit_root_values = {key: getattr(request, key, None) for key in set(explicit_fields) & consumed_root_fields}
-
-        raw_sampling_params_list = getattr(request, "sampling_params_list", None)
-        if raw_sampling_params_list is not None and not isinstance(raw_sampling_params_list, list):
-            raise ValueError("sampling_params_list must be a JSON array.")
-
-        stage_owner = self._diffusion_engine if self._diffusion_mode else self.engine_client
-        stage_configs = list(getattr(stage_owner, "stage_configs", []) or [])
-        stage_provided_root_fields: dict[int, frozenset[str]] = {}
-        stage_extra_args: dict[int, object | None] = {}
-        non_diffusion_stage_extra_args: dict[int, object | None] = {}
-        stage_root_field_names = frozenset(self._diffusion_sampling_root_fields) | declared_extra_fields
-        for stage_index, stage_params in enumerate(raw_sampling_params_list or []):
-            if not isinstance(stage_params, Mapping):
-                raise ValueError(f"sampling_params_list[{stage_index}] must be a JSON object.")
-            if any(not isinstance(key, str) for key in stage_params):
-                raise ValueError(f"sampling_params_list[{stage_index}] must be a JSON object with string keys.")
-            if stage_index >= len(stage_configs) or get_stage_type(stage_configs[stage_index]) != "diffusion":
-                if not self._diffusion_mode:
-                    non_diffusion_stage_extra_args[stage_index] = stage_params.get("extra_args")
-                continue
-            stage_provided_root_fields[stage_index] = frozenset(stage_params) & stage_root_field_names
-            stage_extra_args[stage_index] = stage_params.get("extra_args")
-
-        return _DiffusionRequestSources(
-            root_extra_body=MappingProxyType(root_extra_body),
-            nested_extra_body=MappingProxyType(nested_extra_body),
-            explicit_root_values=MappingProxyType(explicit_root_values),
-            stage_provided_root_fields=MappingProxyType(stage_provided_root_fields),
-            stage_extra_args=MappingProxyType(stage_extra_args),
-            non_diffusion_stage_extra_args=MappingProxyType(non_diffusion_stage_extra_args),
-            raw_sampling_params_list=raw_sampling_params_list,
-        )
-
-    @staticmethod
-    def _coerce_num_inference_steps(value: object) -> int:
-        try:
-            return int(value)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("num_inference_steps must be an integer.") from exc
-
     def _serves_diffusion_requests(self) -> bool:
         if self._diffusion_mode:
             return True
         stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
         return any(get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs)
 
-    @staticmethod
-    def _validate_non_diffusion_stage_extra_conflicts(
-        sources: _DiffusionRequestSources,
-        declared_root_extra_args: Mapping[str, Any],
-    ) -> None:
-        conflicts: dict[str, list[str]] = {}
-        for stage_index, stage_extra_args in sources.non_diffusion_stage_extra_args.items():
-            if stage_extra_args is None:
-                continue
-            if not isinstance(stage_extra_args, Mapping):
-                raise ValueError(f"sampling_params_list[{stage_index}].extra_args must be a JSON object.")
-            for key in sorted(set(declared_root_extra_args) & set(stage_extra_args)):
-                root_source = f"request.extra_body.{key}" if key in sources.nested_extra_body else f"request.{key}"
-                conflicts.setdefault(key, [root_source]).append(
-                    f"request.sampling_params_list[{stage_index}].extra_args.{key}"
-                )
-        if not conflicts:
-            return
-        if len(conflicts) == 1:
-            key, conflict_sources = next(iter(conflicts.items()))
-            raise ValueError(f'Parameter "{key}" was provided more than once: {", ".join(conflict_sources)}.')
-        details = "; ".join(f'"{key}": {", ".join(conflicts[key])}' for key in sorted(conflicts))
-        raise ValueError(f"Diffusion request parameters were provided more than once: {details}.")
-
-    def _compile_request_sampling_params_list(
-        self,
-        request: ChatCompletionRequest,
-        sources: _DiffusionRequestSources,
-        declared_extra_fields: frozenset[str],
-    ) -> tuple[Any, ...] | None:
+    def _get_diffusion_request_plan_inputs(self) -> dict[str, Any]:
+        """Resolve engine topology and registry policy for the sole compiler."""
         stage_owner = self._diffusion_engine if self._diffusion_mode else self.engine_client
         stage_configs = list(getattr(stage_owner, "stage_configs", []) or [])
+        declared_extra_fields = self._diffusion_extra_body_params
+        apply_declared_to_non_diffusion = False
         try:
-            if sources.raw_sampling_params_list is None:
-                if self._diffusion_mode:
-                    return None
-                sampling_params_list = self._build_sampling_params_list_from_request(
-                    request,
-                    excluded_fields=declared_extra_fields,
-                )
-            else:
-                request_sampling_params: list[Any] = []
-                for stage_index, stage_params in enumerate(sources.raw_sampling_params_list):
-                    if stage_index >= len(stage_configs) or get_stage_type(stage_configs[stage_index]) != "diffusion":
-                        request_sampling_params.append(
-                            dict(stage_params) if isinstance(stage_params, Mapping) else stage_params
-                        )
-                        continue
+            od_config = resolve_diffusion_od_config(self.engine_client, self._diffusion_engine)
+            model_class_name = getattr(od_config, "model_class_name", None)
+            if isinstance(model_class_name, str):
+                if declared_extra_fields is None:
+                    declared_extra_fields = get_extra_body_params(model_class_name)
+                # These pipelines have non-diffusion stage processors that
+                # consume the same declared request extras.
+                apply_declared_to_non_diffusion = should_init_extra_args_for_non_diffusion_stages(model_class_name)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to resolve diffusion request model extras: {exc}") from exc
+        if declared_extra_fields is None:
+            declared_extra_fields = frozenset()
+        self._diffusion_extra_body_params = declared_extra_fields
 
-                    assert isinstance(stage_params, Mapping)
-                    compiled_stage_params = dict(stage_params)
-                    compiled_stage_extra_args = dict(
-                        cast(Mapping[str, Any], sources.stage_extra_args.get(stage_index)) or {}
-                    )
-                    for request_field in sources.stage_provided_root_fields.get(stage_index, ()):
-                        value = compiled_stage_params.pop(request_field)
-                        if request_field in declared_extra_fields:
-                            compiled_stage_extra_args[request_field] = value
-                        else:
-                            sampling_field = self._diffusion_sampling_root_fields.get(request_field)
-                            if sampling_field is not None:
-                                compiled_stage_params[sampling_field] = value
-                    if "extra_args" in compiled_stage_params or compiled_stage_extra_args:
-                        compiled_stage_params["extra_args"] = compiled_stage_extra_args
-                    request_sampling_params.append(compiled_stage_params)
-                sampling_params_list = self._to_sampling_params_list(
-                    request_sampling_params,
-                    stage_owner=stage_owner,
-                )
-        except TypeError as exc:
-            raise ValueError(f"Invalid sampling_params_list: {exc}") from exc
-
-        for stage_index, sampling_params in enumerate(sampling_params_list):
-            if stage_index >= len(stage_configs) or get_stage_type(stage_configs[stage_index]) != "diffusion":
-                continue
-
-            provided_root_fields = sources.stage_provided_root_fields.get(stage_index, ())
-            provided_extra_args = sources.stage_extra_args.get(stage_index)
-            provided_extra_fields = set(provided_extra_args) if isinstance(provided_extra_args, Mapping) else set()
-
-            if "num_inference_steps" in declared_extra_fields and (
-                "num_inference_steps" in provided_root_fields or "num_inference_steps" in provided_extra_fields
-            ):
-                stage_extra_args = dict(getattr(sampling_params, "extra_args", None) or {})
-                value = stage_extra_args.get("num_inference_steps")
-                if value is not None:
-                    stage_extra_args["num_inference_steps"] = self._coerce_num_inference_steps(value)
-                    sampling_params.extra_args = stage_extra_args
-            elif "num_inference_steps" in provided_root_fields:
-                value = getattr(sampling_params, "num_inference_steps", None)
-                if value is not None:
-                    sampling_params.num_inference_steps = self._coerce_num_inference_steps(value)
-
-            if "layers" in declared_extra_fields and (
-                "layers" in provided_root_fields or "layers" in provided_extra_fields
-            ):
-                stage_extra_args = dict(getattr(sampling_params, "extra_args", None) or {})
-                value = stage_extra_args.get("layers")
-                if value is not None:
-                    stage_extra_args["layers"] = validate_layered_layers(value)
-                    sampling_params.extra_args = stage_extra_args
-            elif "layers" in provided_root_fields:
-                value = getattr(sampling_params, "layers", None)
-                if value is not None:
-                    sampling_params.layers = validate_layered_layers(value)
-
-        return tuple(clone_sampling_params(sampling_params) for sampling_params in sampling_params_list)
-
-    def _compile_diffusion_request_contract(
-        self,
-        request: ChatCompletionRequest,
-    ) -> _DiffusionRequestContract:
-        declared_extra_fields = self._get_diffusion_extra_body_params()
-        sources = self._collect_diffusion_request_sources(request, declared_extra_fields)
-
-        # Schema fields and Pydantic model extras are the same flattened JSON
-        # source. Collect each root key once before comparing it with nested and
-        # container sources.
-        root_values = {
-            **sources.root_extra_body,
-            **sources.explicit_root_values,
+        stage_types = [get_stage_type(stage_config) for stage_config in stage_configs]
+        comprehension_stage_index = next(
+            (
+                index
+                for index, stage_config in enumerate(stage_configs)
+                if getattr(stage_config, "is_comprehension", False)
+            ),
+            None,
+        )
+        return {
+            "stage_types": stage_types,
+            "default_sampling_params_list": get_default_sampling_params_list(stage_owner),
+            "comprehension_stage_index": comprehension_stage_index,
+            "declared_extra_fields": declared_extra_fields,
+            "apply_declared_to_non_diffusion": apply_declared_to_non_diffusion,
         }
-        compiled = compile_diffusion_request_overrides(
-            root_values=root_values,
-            nested_root_values=sources.nested_extra_body,
-            sampling_root_fields=self._diffusion_sampling_root_fields,
-            declared_extra_fields=declared_extra_fields,
-            control_root_fields=self._diffusion_control_root_fields,
-            extra_args=sources.root_extra_body.get("extra_args"),
-            extra_params=sources.root_extra_body.get("extra_params"),
-            nested_extra_args=sources.nested_extra_body.get("extra_args"),
-            nested_extra_params=sources.nested_extra_body.get("extra_params"),
-            stage_provided_root_fields=sources.stage_provided_root_fields,
-            stage_extra_args=sources.stage_extra_args,
-        )
-        self._validate_non_diffusion_stage_extra_conflicts(
-            sources,
-            compiled.declared_extra_args,
-        )
-
-        request_values = dict(compiled.request_values)
-        sampling_overrides = dict(compiled.sampling_overrides)
-        declared_extra_args = dict(compiled.declared_extra_args)
-        extra_args_overrides = dict(compiled.extra_args)
-        control_overrides = dict(compiled.control_overrides)
-
-        if "num_inference_steps" in sampling_overrides:
-            sampling_overrides["num_inference_steps"] = self._coerce_num_inference_steps(
-                sampling_overrides["num_inference_steps"]
-            )
-        if "num_inference_steps" in declared_extra_fields and "num_inference_steps" in extra_args_overrides:
-            extra_args_overrides["num_inference_steps"] = self._coerce_num_inference_steps(
-                extra_args_overrides["num_inference_steps"]
-            )
-            if "num_inference_steps" in declared_extra_args:
-                declared_extra_args["num_inference_steps"] = extra_args_overrides["num_inference_steps"]
-
-        if "layers" in sampling_overrides:
-            sampling_overrides["layers"] = validate_layered_layers(sampling_overrides["layers"])
-        if "layers" in declared_extra_fields and "layers" in extra_args_overrides:
-            extra_args_overrides["layers"] = validate_layered_layers(extra_args_overrides["layers"])
-            if "layers" in declared_extra_args:
-                declared_extra_args["layers"] = extra_args_overrides["layers"]
-
-        height, width = self._resolve_height_width_from_extra_body(request_values)
-        if height is not None:
-            control_overrides["height"] = height
-            if "height" in sampling_overrides:
-                sampling_overrides["height"] = height
-        if width is not None:
-            control_overrides["width"] = width
-            if "width" in sampling_overrides:
-                sampling_overrides["width"] = width
-
-        try:
-            lora_request, lora_scale = parse_lora_request(control_overrides.get("lora"))
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(str(exc)) from exc
-
-        # Duplicate consumed keys were rejected above. This union preserves the
-        # complete request for diagnostics; its ordering is not precedence.
-        extra_body = MappingProxyType(
-            {
-                **sources.nested_extra_body,
-                **sources.root_extra_body,
-                **sources.explicit_root_values,
-            }
-        )
-        compiled_sampling_params_list = self._compile_request_sampling_params_list(
-            request,
-            sources,
-            declared_extra_fields,
-        )
-
-        return _DiffusionRequestContract(
-            request_values=MappingProxyType(request_values),
-            extra_body=extra_body,
-            sampling_overrides=MappingProxyType(sampling_overrides),
-            declared_extra_args=MappingProxyType(declared_extra_args),
-            extra_args_overrides=MappingProxyType(extra_args_overrides),
-            control_overrides=MappingProxyType(control_overrides),
-            lora_request=lora_request,
-            lora_scale=lora_scale,
-            sampling_params_list=compiled_sampling_params_list,
-        )
-
-    def _apply_diffusion_request_contract(
-        self,
-        sampling_params: OmniDiffusionSamplingParams,
-        contract: _DiffusionRequestContract,
-    ) -> None:
-        self._set_if_supported(sampling_params, **contract.sampling_overrides)
-        if contract.extra_args_overrides:
-            sampling_params.extra_args = {
-                **(sampling_params.extra_args or {}),
-                **contract.extra_args_overrides,
-            }
-        if contract.lora_request is not None:
-            sampling_params.lora_request = contract.lora_request
-            if contract.lora_scale is not None:
-                sampling_params.lora_scale = contract.lora_scale
-
-    @staticmethod
-    def _split_diffusion_request_extra_body(
-        request: ChatCompletionRequest,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        root_extra_body = dict(request.model_extra or {})
-        nested_value = root_extra_body.pop("extra_body", None)
-        if nested_value is None:
-            nested_value = getattr(request, "extra_body", None)
-        if nested_value is None:
-            return root_extra_body, {}
-        if not isinstance(nested_value, Mapping):
-            raise ValueError("extra_body must be a JSON object.")
-        if any(not isinstance(key, str) for key in nested_value):
-            raise ValueError("extra_body must be a JSON object with string keys.")
-        return root_extra_body, dict(nested_value)
 
     def _get_diffusion_extra_output_params(
         self,
@@ -737,19 +464,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
-        diffusion_contract: _DiffusionRequestContract | None = None
+        diffusion_plan: DiffusionChatRequestPlan | None = None
         if self._serves_diffusion_requests():
             try:
-                diffusion_contract = self._compile_diffusion_request_contract(request)
+                diffusion_plan = compile_diffusion_chat_request_plan(
+                    request=request,
+                    sampling_root_fields=self._diffusion_sampling_root_fields,
+                    standard_sampling_fields=self._OPENAI_SAMPLING_FIELDS,
+                    control_root_fields=self._diffusion_control_root_fields,
+                    **self._get_diffusion_request_plan_inputs(),
+                )
             except ValueError as exc:
                 return self._create_error_response(str(exc), status_code=400)
 
         # Handle diffusion mode
         if self._diffusion_mode:
-            assert diffusion_contract is not None
+            assert diffusion_plan is not None
             return await self._create_diffusion_chat_completion(
                 request,
-                diffusion_contract,
+                diffusion_plan,
                 raw_request,
             )
 
@@ -872,8 +605,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Some models will return a list like ["text", None, "audio"], better
         # to strip None in the list
         engine_output_modalities = [x for x in self.engine_client.output_modalities if x is not None]
-        if diffusion_contract is not None and "modalities" in diffusion_contract.control_overrides:
-            output_modalities = diffusion_contract.control_overrides["modalities"]
+        if diffusion_plan is not None and "modalities" in diffusion_plan.controls:
+            output_modalities = diffusion_plan.controls["modalities"]
         else:
             output_modalities = getattr(request, "modalities", engine_output_modalities)
         request.modalities = output_modalities if output_modalities is not None else engine_output_modalities
@@ -895,14 +628,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if isinstance(audio_format_check, ErrorResponse):
                 return audio_format_check
 
-        if diffusion_contract is None:
-            try:
-                root_extra_body, nested_extra_body = self._split_diffusion_request_extra_body(request)
-            except ValueError as exc:
-                return self.create_error_response(str(exc))
-            extra_body = {**nested_extra_body, **root_extra_body}
-        else:
-            extra_body = diffusion_contract.extra_body
+        extra_body: dict[str, Any] = {}
         # Omni multistage image generation: Stage-0 (AR) should receive a clean
         # text prompt (and optional conditioning image/size) so the model's own
         # processor can construct the correct inputs.
@@ -916,13 +642,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if not extracted_prompt:
                     return self.create_error_response("No text prompt found in messages")
 
-                if diffusion_contract is None:
+                if diffusion_plan is None:
+                    # No configured stage serves diffusion in this legacy branch.
+                    extra_body = getattr(request, "extra_body", None) or request.model_extra or {}
                     height, width = self._resolve_height_width_from_extra_body(extra_body)
                     negative_prompt = extra_body.get("negative_prompt")
                 else:
-                    height = diffusion_contract.control_overrides.get("height")
-                    width = diffusion_contract.control_overrides.get("width")
-                    negative_prompt = diffusion_contract.control_overrides.get("negative_prompt")
+                    height = diffusion_plan.controls.get("height")
+                    width = diffusion_plan.controls.get("width")
+                    negative_prompt = diffusion_plan.controls.get("negative_prompt")
                 engine_prompt_image: dict[str, Any] | None = None
                 if reference_images:
                     # Best-effort decode first reference image for i2i.
@@ -1005,18 +733,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
             for engine_prompt in engine_prompts:
-                if diffusion_contract is None:
+                if diffusion_plan is None:
                     raw_sampling_params_list = getattr(request, "sampling_params_list", None)
                     if raw_sampling_params_list is not None:
                         sampling_params_list = self._to_sampling_params_list(raw_sampling_params_list)
                     else:
                         sampling_params_list = self._build_sampling_params_list_from_request(request)
                 else:
-                    assert diffusion_contract.sampling_params_list is not None
-                    sampling_params_list = [
-                        clone_sampling_params(sampling_params)
-                        for sampling_params in diffusion_contract.sampling_params_list
-                    ]
+                    sampling_params_list = diffusion_plan.clone_sampling_params_list()
 
                 # If this is a streaming (output) request, coerce cumulative outputs
                 # to delta to ensure emitted outputs are correctly drained. Otherwise
@@ -1028,18 +752,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         output_modalities,
                     )
 
-                # Apply user-specified overrides to diffusion stage(s) for image generation
-                for sp in sampling_params_list:
-                    if isinstance(sp, OmniDiffusionSamplingParams):
-                        assert diffusion_contract is not None
-                        self._apply_diffusion_request_contract(sp, diffusion_contract)
-                    elif diffusion_contract is not None and diffusion_contract.declared_extra_args:
-                        apply_declared_extra_args(
-                            sp,
-                            frozenset(diffusion_contract.declared_extra_args),
-                            diffusion_contract.declared_extra_args,
-                        )
-                    elif diffusion_contract is None:
+                if diffusion_plan is None:
+                    # Legacy non-diffusion Chat paths still apply model extras
+                    # here. Diffusion plans already contain final stage params.
+                    for sp in sampling_params_list:
                         apply_declared_extra_args(
                             sp,
                             self._get_diffusion_extra_body_params(),
@@ -1462,12 +1178,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return new_messages
 
-    def _to_sampling_params_list(
-        self,
-        sampling_params_list: list[dict],
-        *,
-        stage_owner: Any | None = None,
-    ) -> list[Any]:
+    def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[Any]:
         """Convert request dicts to stage-typed sampling params objects.
 
         For diffusion stages, build ``OmniDiffusionSamplingParams`` so
@@ -1477,9 +1188,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         (for example AURA has three semantic models but four engine stages),
         append cloned deploy defaults for the omitted tail stages.
         """
-        stage_owner = self.engine_client if stage_owner is None else stage_owner
-        stage_configs = list(getattr(stage_owner, "stage_configs", []) or [])
-        default_params_list = list(getattr(stage_owner, "default_sampling_params_list", []) or [])
+        stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
+        default_params_list = list(getattr(self.engine_client, "default_sampling_params_list", []) or [])
         final_sampling_params_list: list[Any] = []
         for idx, sampling_params in enumerate(sampling_params_list):
             stage_type = get_stage_type(stage_configs[idx]) if idx < len(stage_configs) else "llm"
@@ -1534,8 +1244,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         self,
         default_params: SamplingParams,
         request: ChatCompletionRequest,
-        *,
-        excluded_fields: frozenset[str] = frozenset(),
     ) -> SamplingParams:
         """Clone default params and override with user-provided request values.
 
@@ -1562,7 +1270,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             explicit_fields = getattr(request, "__fields_set__", set())
 
         for field_name in self._OPENAI_SAMPLING_FIELDS:
-            if field_name in excluded_fields or field_name not in explicit_fields:
+            if field_name not in explicit_fields:
                 continue
 
             value = getattr(request, field_name, None)
@@ -1615,8 +1323,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     def _build_sampling_params_list_from_request(
         self,
         request: ChatCompletionRequest,
-        *,
-        excluded_fields: frozenset[str] = frozenset(),
     ) -> list[SamplingParams]:
         """Build sampling_params_list using standard OpenAI API parameters.
 
@@ -1640,11 +1346,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if isinstance(default_params, dict):
                 default_params = SamplingParams(**default_params)
             if idx == comprehension_idx:
-                params = self._apply_request_overrides(
-                    default_params,
-                    request,
-                    excluded_fields=excluded_fields,
-                )
+                params = self._apply_request_overrides(default_params, request)
                 sampling_params_list.append(params)
             else:
                 # For other stages, clone default params
@@ -3748,13 +3450,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     async def _create_diffusion_chat_completion(
         self,
         request: ChatCompletionRequest,
-        diffusion_contract: _DiffusionRequestContract,
+        diffusion_plan: DiffusionChatRequestPlan,
         raw_request: Request | None = None,
     ) -> ChatCompletionResponse | ErrorResponse:
         """Generate images via chat completion interface for diffusion models.
 
         Args:
             request: Chat completion request
+            diffusion_plan: Final request controls and typed stage parameters
             raw_request: Raw FastAPI request object
 
         Returns:
@@ -3779,16 +3482,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 messages
             )
 
-            # Request extras were compiled once at the shared serving boundary.
-            extra_body = diffusion_contract.extra_body
-            negative_prompt = diffusion_contract.control_overrides.get("negative_prompt")
+            negative_prompt = diffusion_plan.controls.get("negative_prompt")
 
             logger.info(
                 "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
                 request_id,
                 prompt[:50] + "..." if len(prompt) > 50 else prompt,
                 len(reference_images),
-                {k: v for k, v in extra_body.items() if v is not None},
+                {k: v for k, v in diffusion_plan.request_sources.items() if v is not None},
             )
 
             # Decode reference images if provided
@@ -3806,11 +3507,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 "negative_prompt": negative_prompt,
                 "modalities": ["image"],
             }
-            gen_params = OmniDiffusionSamplingParams()
-            self._apply_diffusion_request_contract(gen_params, diffusion_contract)
-
             # Route text modality for single-stage diffusion (img2text / text2text)
-            requested_modalities = diffusion_contract.control_overrides.get("modalities") or []
+            requested_modalities = diffusion_plan.controls.get("modalities") or []
             is_text_request = "text" in requested_modalities
 
             if is_text_request:
@@ -3840,52 +3538,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             # Generate image or audio (e.g. AudioX) via AsyncOmni
             diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
-            stage_configs = list(getattr(diffusion_engine, "stage_configs", []) or [])
-            default_sampling_params_list = get_default_sampling_params_list(diffusion_engine)
-            if diffusion_contract.sampling_params_list is None:
-                sampling_params_list = build_stage_sampling_params_list(
-                    stage_configs,
-                    default_sampling_params_list,
-                    diffusion_params=gen_params,
-                    replace_diffusion_params=True,
-                )
-            else:
-                sampling_params_list = [
-                    clone_sampling_params(sampling_params)
-                    for sampling_params in diffusion_contract.sampling_params_list
-                ]
-                for sampling_params in sampling_params_list:
-                    if isinstance(sampling_params, OmniDiffusionSamplingParams):
-                        self._apply_diffusion_request_contract(
-                            sampling_params,
-                            diffusion_contract,
-                        )
-
-            # This endpoint replaces diffusion sampling params as a whole, but
-            # model-specific stage defaults remain defaults: request extras
-            # override matching keys without discarding unrelated defaults.
-            for idx, (stage_config, sampling_params) in enumerate(zip(stage_configs, sampling_params_list)):
-                if get_stage_type(stage_config) != "diffusion":
+            sampling_params_list = diffusion_plan.clone_sampling_params_list()
+            for sampling_params in sampling_params_list:
+                if not isinstance(sampling_params, OmniDiffusionSamplingParams):
                     continue
-                default_extra_args = (
-                    getattr(default_sampling_params_list[idx], "extra_args", None)
-                    if idx < len(default_sampling_params_list)
-                    else None
-                )
-                if default_extra_args:
-                    sampling_params.extra_args = {
-                        **default_extra_args,
-                        **(getattr(sampling_params, "extra_args", None) or {}),
-                    }
-                if (reference_videos or reference_audios) and sampling_params.extra_args is None:
-                    sampling_params.extra_args = {}
+                if reference_videos or reference_audios:
+                    sampling_params.extra_args = dict(sampling_params.extra_args or {})
                 if reference_videos:
                     sampling_params.extra_args["video_path"] = reference_videos[0]
                 if reference_audios:
                     sampling_params.extra_args["audio_path"] = reference_audios[0]
-
-            if not sampling_params_list:
-                sampling_params_list = [gen_params]
 
             result = None
             async for output in diffusion_engine.generate(

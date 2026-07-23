@@ -3,240 +3,363 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.sampling_params import SamplingParams
 
 from vllm_omni.entrypoints.openai.diffusion_request_utils import (
-    compile_diffusion_request_overrides,
-    normalize_diffusion_request_extra_args,
+    DiffusionChatRequestPlan,
+    compile_diffusion_chat_request_plan,
 )
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+SAMPLING_FIELDS = {
+    "height": "height",
+    "width": "width",
+    "seed": "seed",
+    "num_inference_steps": "num_inference_steps",
+    "guidance_scale": "guidance_scale",
+    "cfg_scale": "true_cfg_scale",
+    "true_cfg_scale": "true_cfg_scale",
+    "layers": "layers",
+}
+STANDARD_FIELDS = {"temperature", "max_tokens", "seed"}
+CONTROL_FIELDS = {"size", "negative_prompt", "lora", "modalities"}
 
-def test_normalize_diffusion_request_extra_args_preserves_unknown_model_keys() -> None:
-    extra_args = {"cfg_text_scale": 7.0, "sample_solver": "euler"}
 
-    normalized = normalize_diffusion_request_extra_args(
-        provided_root_fields={"seed"},
-        extra_args=extra_args,
+def _request(**kwargs: Any) -> ChatCompletionRequest:
+    return ChatCompletionRequest(model="test", messages=[], **kwargs)
+
+
+def _compile(
+    request: ChatCompletionRequest,
+    *,
+    stage_types: tuple[str, ...] = ("diffusion",),
+    defaults: tuple[object, ...] = (),
+    comprehension_stage_index: int | None = None,
+    declared: frozenset[str] = frozenset(),
+    fan_out_declared: bool = False,
+) -> DiffusionChatRequestPlan:
+    return compile_diffusion_chat_request_plan(
+        request=request,
+        stage_types=stage_types,
+        default_sampling_params_list=defaults,
+        comprehension_stage_index=comprehension_stage_index,
+        sampling_root_fields=SAMPLING_FIELDS,
+        standard_sampling_fields=STANDARD_FIELDS,
+        control_root_fields=CONTROL_FIELDS,
+        declared_extra_fields=declared,
+        apply_declared_to_non_diffusion=fan_out_declared,
     )
 
-    assert normalized == extra_args
-    assert normalized is not extra_args
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"model_option": 1},
+        {"extra_body": {"model_option": 1}},
+        {"extra_args": {"model_option": 1}},
+        {"extra_params": {"model_option": 1}},
+        {"extra_body": {"extra_args": {"model_option": 1}}},
+        {"extra_body": {"extra_params": {"model_option": 1}}},
+    ],
+)
+def test_all_global_sources_reach_the_same_diffusion_consumer(body: dict[str, object]) -> None:
+    declared = frozenset({"model_option"}) if "model_option" in body or "extra_body" in body else frozenset()
+    plan = _compile(_request(**body), declared=declared)
+
+    assert plan.clone_sampling_params_list()[0].extra_args["model_option"] == 1
 
 
-def test_normalize_diffusion_request_extra_args_accepts_non_overlapping_legacy_keys(mocker) -> None:
-    warning_once = mocker.patch("vllm_omni.entrypoints.openai.diffusion_request_utils.logger.warning_once")
+@pytest.mark.parametrize(
+    "body, expected_sources",
+    [
+        (
+            {"seed": 1, "extra_args": {"seed": 2}},
+            "request.seed, request.extra_args.seed",
+        ),
+        (
+            {"cfg_scale": 1.0, "extra_args": {"true_cfg_scale": 2.0}},
+            "request.cfg_scale, request.extra_args.true_cfg_scale",
+        ),
+        (
+            {"model_option": 1, "extra_body": {"model_option": 2}},
+            "request.model_option, request.extra_body.model_option",
+        ),
+    ],
+)
+def test_global_duplicate_sources_are_rejected(
+    body: dict[str, object],
+    expected_sources: str,
+) -> None:
+    with pytest.raises(ValueError, match=expected_sources):
+        _compile(_request(**body), declared=frozenset({"model_option"}))
 
-    normalized = normalize_diffusion_request_extra_args(
-        extra_args={"cfg_text_scale": 7.0},
-        extra_params={"sample_solver": "euler"},
+
+def test_flattened_size_is_compiled_before_pure_diffusion_dispatch() -> None:
+    plan = _compile(_request(size="768x512"))
+
+    params = plan.clone_sampling_params_list()[0]
+    assert (params.height, params.width) == (512, 768)
+    assert plan.controls["height"] == 512
+    assert plan.controls["width"] == 768
+
+
+def test_declared_dimension_keeps_prompt_control_and_moves_sampling_owner() -> None:
+    plan = _compile(_request(height=512), declared=frozenset({"height"}))
+
+    params = plan.clone_sampling_params_list()[0]
+    assert plan.controls["height"] == 512
+    assert params.height is None
+    assert params.extra_args["height"] == 512
+
+
+def test_nested_controls_are_preserved_without_dispatcher_rereads() -> None:
+    plan = _compile(
+        _request(
+            extra_body={
+                "modalities": ["image"],
+                "negative_prompt": "low quality",
+            }
+        )
     )
 
-    assert normalized == {"cfg_text_scale": 7.0, "sample_solver": "euler"}
-    warning_once.assert_called_once_with(
-        "extra_params is deprecated; use extra_args for model-specific diffusion request parameters."
+    assert plan.controls["modalities"] == ["image"]
+    assert plan.controls["negative_prompt"] == "low quality"
+
+
+def test_internal_diffusion_state_is_not_a_public_root_field() -> None:
+    plan = _compile(
+        _request(
+            modules={"must": "not become request state"},
+            extra_args={"modules": {"pipeline": "owned"}},
+        )
     )
 
+    params = plan.clone_sampling_params_list()[0]
+    assert params.modules == {}
+    assert params.extra_args["modules"] == {"pipeline": "owned"}
 
-def test_normalize_diffusion_request_extra_args_merges_non_overlapping_nested_compatibility_form() -> None:
-    normalized = normalize_diffusion_request_extra_args(
-        extra_args={"cfg_text_scale": 7.0},
-        nested_extra_args={"sample_solver": "euler"},
+
+def test_flattened_size_reaches_mixed_final_consumers_and_preserves_defaults() -> None:
+    ar_default = SamplingParams(max_tokens=4353)
+    ar_default.extra_args = {"ar_default": True}
+    diffusion_default = OmniDiffusionSamplingParams(extra_args={"diffusion_default": True})
+
+    plan = _compile(
+        _request(size="768x512"),
+        stage_types=("llm", "diffusion"),
+        defaults=(ar_default, diffusion_default),
+        comprehension_stage_index=0,
     )
 
-    assert normalized == {"cfg_text_scale": 7.0, "sample_solver": "euler"}
+    ar_params, diffusion_params = plan.clone_sampling_params_list()
+    assert ar_params.max_tokens == 4353
+    assert ar_params.extra_args == {
+        "ar_default": True,
+        "target_h": 512,
+        "target_w": 768,
+    }
+    assert (diffusion_params.height, diffusion_params.width) == (512, 768)
+    assert diffusion_params.extra_args == {"diffusion_default": True}
 
 
-def test_normalize_diffusion_request_extra_args_rejects_flattened_nested_conflict() -> None:
+@pytest.mark.parametrize("fan_out", [False, True])
+def test_registry_declaration_controls_non_diffusion_fan_out(fan_out: bool) -> None:
+    ar_default = SamplingParams(max_tokens=100)
+    diffusion_default = OmniDiffusionSamplingParams()
+    plan = _compile(
+        _request(max_tokens=32),
+        stage_types=("llm", "diffusion"),
+        defaults=(ar_default, diffusion_default),
+        comprehension_stage_index=0,
+        declared=frozenset({"max_tokens"}),
+        fan_out_declared=fan_out,
+    )
+
+    ar_params, diffusion_params = plan.clone_sampling_params_list()
+    assert ar_params.max_tokens == (32 if fan_out else 100)
+    assert ("max_tokens" in (ar_params.extra_args or {})) is fan_out
+    assert diffusion_params.extra_args["max_tokens"] == 32
+
+
+def test_fanned_out_root_conflicts_with_the_same_non_diffusion_stage_key() -> None:
+    with pytest.raises(ValueError, match="provided more than once"):
+        _compile(
+            _request(
+                max_tokens=32,
+                sampling_params_list=[{"extra_args": {"max_tokens": 64}}],
+            ),
+            stage_types=("llm", "diffusion"),
+            defaults=(SamplingParams(), OmniDiffusionSamplingParams()),
+            comprehension_stage_index=0,
+            declared=frozenset({"max_tokens"}),
+            fan_out_declared=True,
+        )
+
+
+def test_request_stage_values_overlay_defaults_once() -> None:
+    plan = _compile(
+        _request(
+            extra_args={"global": 1},
+            sampling_params_list=[
+                {"temperature": 0.7, "stop": "END"},
+                {"guidance_scale": 4.0, "extra_args": {"local": 2}},
+            ],
+        ),
+        stage_types=("llm", "diffusion"),
+        defaults=(
+            SamplingParams(temperature=0.2, max_tokens=99),
+            OmniDiffusionSamplingParams(extra_args={"default": 3}),
+        ),
+        comprehension_stage_index=0,
+    )
+
+    ar_params, diffusion_params = plan.clone_sampling_params_list()
+    assert (ar_params.temperature, ar_params.max_tokens) == (0.7, 99)
+    assert ar_params.stop == ["END"]
+    assert ar_params.output_text_buffer_length == 2
+    assert diffusion_params.guidance_scale == 4.0
+    assert diffusion_params.extra_args == {"default": 3, "global": 1, "local": 2}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"sampling_params_list": [{"guidance_scale": 4.0}]},
+        {"extra_body": {"sampling_params_list": [{"guidance_scale": 4.0}]}},
+    ],
+)
+def test_stage_list_ingress_reaches_the_same_consumer(body: dict[str, object]) -> None:
+    params = _compile(_request(**body)).clone_sampling_params_list()[0]
+
+    assert params.guidance_scale == 4.0
+
+
+def test_root_and_nested_stage_lists_conflict() -> None:
+    with pytest.raises(ValueError, match="request.sampling_params_list, request.extra_body.sampling_params_list"):
+        _compile(
+            _request(
+                sampling_params_list=[{}],
+                extra_body={"sampling_params_list": [{}]},
+            )
+        )
+
+
+def test_global_and_stage_request_values_cannot_overwrite_each_other() -> None:
     with pytest.raises(ValueError) as exc_info:
-        normalize_diffusion_request_extra_args(
-            provided_root_fields={"cfg_text_scale"},
-            nested_extra_args={"cfg_text_scale": 7.0},
+        _compile(
+            _request(
+                extra_args={"seed": 1},
+                sampling_params_list=[{"extra_args": {"seed": 2}}],
+            )
         )
 
     assert str(exc_info.value) == (
-        'Parameter "cfg_text_scale" was provided more than once: '
-        "request.cfg_text_scale, request.extra_body.extra_args.cfg_text_scale."
+        'Parameter "seed" was provided more than once: '
+        "request.extra_args.seed, request.sampling_params_list[0].extra_args.seed."
     )
 
 
-@pytest.mark.parametrize("name", ["extra_args", "extra_params"])
-def test_normalize_diffusion_request_extra_args_rejects_non_object_containers(name: str) -> None:
-    kwargs = {name: ["not", "an", "object"]}
-
-    with pytest.raises(ValueError, match=rf"^{name} must be a JSON object\.$"):
-        normalize_diffusion_request_extra_args(**kwargs)
-
-
-def test_normalize_diffusion_request_extra_args_rejects_non_string_keys() -> None:
-    with pytest.raises(ValueError, match=r"^extra_args must be a JSON object with string keys\.$"):
-        normalize_diffusion_request_extra_args(extra_args={1: "not a JSON object key"})
-
-
-def test_normalize_diffusion_request_extra_args_rejects_root_conflict() -> None:
-    with pytest.raises(ValueError) as exc_info:
-        normalize_diffusion_request_extra_args(
-            provided_root_fields={"flow_shift", "extra_args"},
-            extra_args={"flow_shift": 3.0},
+def test_duplicate_detection_precedes_value_parsing() -> None:
+    with pytest.raises(ValueError, match="provided more than once"):
+        _compile(
+            _request(
+                num_inference_steps=[],
+                sampling_params_list=[{"num_inference_steps": 2}],
+            )
         )
 
-    assert str(exc_info.value) == (
-        'Parameter "flow_shift" was provided more than once: request.flow_shift, request.extra_args.flow_shift.'
-    )
 
+def test_deprecation_is_logged_only_after_a_request_compiles(mocker) -> None:
+    from vllm_omni.entrypoints.openai import diffusion_request_utils
 
-def test_normalize_diffusion_request_extra_args_rejects_root_alias_conflict() -> None:
-    with pytest.raises(ValueError) as exc_info:
-        normalize_diffusion_request_extra_args(
-            provided_root_fields={"cfg_scale", "true_cfg_scale"},
-            root_field_aliases={"cfg_scale": "true_cfg_scale"},
+    warning_once = mocker.patch.object(diffusion_request_utils.logger, "warning_once")
+    _compile(_request(extra_params={"key": 1}))
+    warning_once.assert_called_once()
+
+    warning_once.reset_mock()
+    with pytest.raises(ValueError, match="provided more than once"):
+        _compile(
+            _request(
+                extra_params={"key": 1},
+                sampling_params_list=[{"extra_args": {"key": 2}}],
+            )
         )
-
-    assert str(exc_info.value) == (
-        'Parameter "true_cfg_scale" was provided more than once: request.cfg_scale, request.true_cfg_scale.'
-    )
-
-
-def test_normalize_diffusion_request_extra_args_rejects_alias_conflict_without_warning(mocker) -> None:
-    warning_once = mocker.patch("vllm_omni.entrypoints.openai.diffusion_request_utils.logger.warning_once")
-    with pytest.raises(ValueError) as exc_info:
-        normalize_diffusion_request_extra_args(
-            extra_args={"sample_solver": "euler"},
-            extra_params={"sample_solver": "euler"},
-        )
-
     warning_once.assert_not_called()
-    assert str(exc_info.value) == (
-        'Parameter "sample_solver" was provided more than once: '
-        "request.extra_args.sample_solver, request.extra_params.sample_solver."
+
+
+def test_same_key_is_allowed_in_distinct_stages() -> None:
+    plan = _compile(
+        _request(sampling_params_list=[{"extra_args": {"key": 1}}, {"extra_args": {"key": 2}}]),
+        stage_types=("llm", "diffusion"),
     )
 
+    first, second = plan.clone_sampling_params_list()
+    assert first.extra_args["key"] == 1
+    assert second.extra_args["key"] == 2
 
-def test_normalize_diffusion_request_extra_args_reports_all_conflicts_deterministically() -> None:
-    with pytest.raises(ValueError) as exc_info:
-        normalize_diffusion_request_extra_args(
-            provided_root_fields={"seed", "flow_shift"},
-            extra_args={"seed": 1, "flow_shift": 3.0},
-            extra_params={"seed": 2},
-        )
 
-    assert str(exc_info.value) == (
-        'Diffusion request parameters were provided more than once: "flow_shift": '
-        'request.flow_shift, request.extra_args.flow_shift; "seed": request.seed, '
-        "request.extra_args.seed, request.extra_params.seed."
+@pytest.mark.parametrize(
+    "field, value, message",
+    [
+        ("num_inference_steps", [], "num_inference_steps must be an integer."),
+        ("layers", 999, "layers must be between 2 and 10"),
+    ],
+)
+def test_value_parsers_run_before_dispatch(field: str, value: object, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        _compile(_request(**{field: value}))
+
+
+def test_undeclared_container_values_remain_pipeline_owned() -> None:
+    raw = {
+        "layers": "pipeline-specific",
+        "num_inference_steps": {"schedule": "custom"},
+    }
+
+    params = _compile(_request(extra_args=raw)).clone_sampling_params_list()[0]
+
+    assert params.extra_args == raw
+
+
+def test_declared_container_value_uses_the_serving_parser() -> None:
+    params = _compile(
+        _request(extra_args={"num_inference_steps": "12"}),
+        declared=frozenset({"num_inference_steps"}),
+    ).clone_sampling_params_list()[0]
+
+    assert params.extra_args["num_inference_steps"] == 12
+
+
+def test_sampling_params_list_entries_must_be_objects() -> None:
+    with pytest.raises(ValueError, match=r"sampling_params_list\[0\] must be a JSON object"):
+        _compile(_request(sampling_params_list=[None]))
+
+
+def test_unknown_direct_stage_field_is_rejected_by_the_target_stage() -> None:
+    with pytest.raises(ValueError, match="unsupported parameter"):
+        _compile(_request(sampling_params_list=[{"unknown_runtime_field": 1}]))
+
+
+def test_too_many_stage_entries_are_rejected() -> None:
+    with pytest.raises(ValueError, match="pipeline has 1 stages"):
+        _compile(_request(sampling_params_list=[{}, {}]))
+
+
+def test_plan_returns_isolated_stage_parameters() -> None:
+    plan = _compile(
+        _request(extra_args={"nested": {"value": 1}}),
+        defaults=(OmniDiffusionSamplingParams(extra_args={"default": True}),),
     )
 
+    first = plan.clone_sampling_params_list()
+    second = plan.clone_sampling_params_list()
+    first[0].extra_args["nested"]["value"] = 9
 
-def test_normalize_diffusion_request_extra_args_does_not_treat_stage_defaults_as_request_conflicts() -> None:
-    normalized = normalize_diffusion_request_extra_args(
-        provided_root_fields=(),
-        extra_args={"flow_shift": 3.0},
-    )
-
-    assert normalized == {"flow_shift": 3.0}
-
-
-def test_normalize_diffusion_request_extra_args_rejects_stage_request_conflict() -> None:
-    with pytest.raises(ValueError) as exc_info:
-        normalize_diffusion_request_extra_args(
-            provided_root_fields={"seed"},
-            stage_extra_args={1: {"seed": 111}},
-        )
-
-    assert str(exc_info.value) == (
-        'Parameter "seed" was provided more than once: request.seed, request.sampling_params_list[1].extra_args.seed.'
-    )
-
-
-def test_normalize_diffusion_request_extra_args_allows_same_key_in_distinct_stages() -> None:
-    normalized = normalize_diffusion_request_extra_args(
-        stage_extra_args={
-            1: {"seed": 111},
-            2: {"seed": 222},
-        },
-    )
-
-    assert normalized == {}
-
-
-def test_normalize_diffusion_request_extra_args_rejects_non_object_stage_extra_args() -> None:
-    with pytest.raises(
-        ValueError,
-        match=r"^sampling_params_list\[1\]\.extra_args must be a JSON object\.$",
-    ):
-        normalize_diffusion_request_extra_args(
-            stage_extra_args={1: ["not", "an", "object"]},
-        )
-
-
-def test_compile_routes_registry_declared_root_to_extra_args() -> None:
-    compiled = compile_diffusion_request_overrides(
-        root_values={"max_tokens": 32},
-        nested_root_values={},
-        sampling_root_fields={},
-        declared_extra_fields={"max_tokens"},
-        control_root_fields=set(),
-    )
-
-    assert compiled.sampling_overrides == {}
-    assert compiled.extra_args == {"max_tokens": 32}
-
-
-def test_compile_uses_sampling_alias_without_model_declaration() -> None:
-    compiled = compile_diffusion_request_overrides(
-        root_values={"cfg_scale": 3.0},
-        nested_root_values={},
-        sampling_root_fields={"cfg_scale": "true_cfg_scale"},
-        declared_extra_fields=set(),
-        control_root_fields=set(),
-    )
-
-    assert compiled.sampling_overrides == {"true_cfg_scale": 3.0}
-    assert compiled.extra_args == {}
-
-
-def test_compile_preserves_shared_control_for_model_declared_root() -> None:
-    compiled = compile_diffusion_request_overrides(
-        root_values={"negative_prompt": "avoid blur"},
-        nested_root_values={},
-        sampling_root_fields={},
-        declared_extra_fields={"negative_prompt"},
-        control_root_fields={"negative_prompt"},
-    )
-
-    assert compiled.extra_args == {"negative_prompt": "avoid blur"}
-    assert compiled.control_overrides == {"negative_prompt": "avoid blur"}
-
-
-def test_compile_registry_declaration_changes_cfg_scale_conflict_key() -> None:
-    with pytest.raises(ValueError) as exc_info:
-        compile_diffusion_request_overrides(
-            root_values={"cfg_scale": 3.0},
-            nested_root_values={},
-            sampling_root_fields={"cfg_scale": "true_cfg_scale"},
-            declared_extra_fields={"cfg_scale"},
-            control_root_fields=set(),
-            extra_args={"cfg_scale": 7.0},
-        )
-
-    assert str(exc_info.value) == (
-        'Parameter "cfg_scale" was provided more than once: request.cfg_scale, request.extra_args.cfg_scale.'
-    )
-
-
-def test_compile_uses_model_aware_aliases_for_stage_conflicts() -> None:
-    with pytest.raises(ValueError) as exc_info:
-        compile_diffusion_request_overrides(
-            root_values={"cfg_scale": 3.0},
-            nested_root_values={},
-            sampling_root_fields={"cfg_scale": "true_cfg_scale"},
-            declared_extra_fields={"cfg_scale"},
-            control_root_fields=set(),
-            stage_extra_args={1: {"cfg_scale": 7.0}},
-        )
-
-    assert str(exc_info.value) == (
-        'Parameter "cfg_scale" was provided more than once: '
-        "request.cfg_scale, request.sampling_params_list[1].extra_args.cfg_scale."
-    )
+    assert second[0].extra_args["nested"]["value"] == 1
+    assert second[0].extra_args["default"] is True
