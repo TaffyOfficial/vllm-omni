@@ -110,6 +110,54 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
     return normalized
 
 
+def _normalize_flat_diffusion_parallel_fields(
+    engine_kwargs: dict[str, Any],
+    flattened_values: dict[str, Any],
+    *,
+    overwrite: bool,
+) -> None:
+    """Move flat diffusion parallel fields into ``parallel_config``.
+
+    ``overwrite`` distinguishes CLI/runtime overrides from deploy YAML values:
+    runtime values take precedence, while deploy values only fill fields that
+    are not already present in a nested config.
+    """
+    parallel_fields = frozenset(config_field.name for config_field in fields(DiffusionParallelConfig))
+    flat_keys = [name for name in flattened_values if name in parallel_fields]
+    if not flat_keys:
+        return
+
+    parallel_config = engine_kwargs.get("parallel_config")
+    if parallel_config is None:
+        parallel_config_dict: dict[str, Any] = {}
+    elif isinstance(parallel_config, Mapping):
+        parallel_config_dict = dict(parallel_config)
+    else:
+        parallel_config_dict = {
+            name: getattr(parallel_config, name) for name in parallel_fields if hasattr(parallel_config, name)
+        }
+
+    moved_value = False
+    degree_overridden = False
+    sequence_parallel_explicit = flattened_values.get("sequence_parallel_size") is not None
+    for name in flat_keys:
+        value = flattened_values.pop(name)
+        if value is None or (not overwrite and name in parallel_config_dict):
+            continue
+        moved_value = True
+        if name in {"ulysses_degree", "ring_degree"}:
+            degree_overridden = True
+        parallel_config_dict[name] = value
+
+    if degree_overridden and not sequence_parallel_explicit:
+        ulysses_degree = parallel_config_dict.get("ulysses_degree") or 1
+        ring_degree = parallel_config_dict.get("ring_degree") or 1
+        parallel_config_dict["sequence_parallel_size"] = ulysses_degree * ring_degree
+
+    if parallel_config is not None or moved_value:
+        engine_kwargs["parallel_config"] = parallel_config_dict
+
+
 def normalize_omni_diffusion_engine_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize legacy engine ingress before diffusion config construction."""
     engine_kwargs = dict(kwargs)
@@ -122,6 +170,8 @@ def normalize_omni_diffusion_engine_kwargs(kwargs: Mapping[str, Any]) -> dict[st
     # recognize and remove the shared engine field below.
     if vllm_kv_cache_dtype is not None:
         normalized["kv_cache_dtype"] = vllm_kv_cache_dtype
+
+    _normalize_flat_diffusion_parallel_fields(normalized, normalized, overwrite=False)
 
     diffusion_quantization = normalized.pop("diffusion_quantization_config", None)
     engine_quantization = diffusion_quantization if diffusion_quantization is not None else quantization

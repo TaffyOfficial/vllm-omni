@@ -1079,7 +1079,6 @@ def get_stage_connector_spec(
 def _strict_diffusion_config_kwargs(engine_args: dict[str, Any]) -> dict[str, Any]:
     """Return the diffusion-owned startup payload and reject unowned keys."""
     normalized = normalize_omni_diffusion_engine_kwargs(engine_args)
-    normalized = {key: value for key, value in normalized.items() if value is not None}
 
     diffusion_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
     shared_engine_fields = frozenset(config_field.name for config_field in fields(OmniEngineArgs))
@@ -1089,7 +1088,7 @@ def _strict_diffusion_config_kwargs(engine_args: dict[str, Any]) -> dict[str, An
         names = ", ".join(repr(name) for name in unknown_fields)
         raise ValueError(f"Unknown diffusion config field(s) for stage {stage_id}: {names}")
 
-    return {name: value for name, value in normalized.items() if name in diffusion_fields}
+    return {name: value for name, value in normalized.items() if name in diffusion_fields and value is not None}
 
 
 def build_diffusion_config(

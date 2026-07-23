@@ -16,7 +16,7 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, TypedDict, cast
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, TypeAdapter
 from vllm.config.utils import config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
@@ -47,6 +47,7 @@ _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str |
 _PIPELINE_DEPLOY_CLI_FIELDS = PIPELINE_WIDE_ENGINE_FIELDS
 
 _QuantizationConfigType: TypeAlias = QuantizationConfig | str | Mapping[str, Any] | None
+_INT_ADAPTER = TypeAdapter(int)
 
 
 class _QuantizationEngineOverrides(TypedDict, total=False):
@@ -137,6 +138,7 @@ class _StageEngineValues:
     runtime: _RuntimeEngineOverrides
     parallel: _ParallelEngineOverrides
     diffusion: _DiffusionEngineOverrides
+    shared_engine_args: dict[str, Any]
     unclaimed: dict[str, Any]
 
 
@@ -448,6 +450,7 @@ class _DiffusionConfigProjection:
     revision: str | None = None
     distributed_executor_backend: str = "mp"
     engine_backend: str = "default"
+    diffusion_model_runner_cls: str | None = None
     dist_timeout: int | None = None
     nccl_port: int | None = None
     master_port: int | None = None
@@ -726,15 +729,17 @@ _KNOWN_STAGE_ENGINE_FIELDS = (
 )
 
 
-def _global_stage_cli_fields() -> frozenset[str]:
+def _omni_engine_arg_fields() -> frozenset[str]:
     # Lazy import avoids vllm_omni.config -> omni_config -> engine.arg_utils ->
     # vllm_omni.config during package-level config imports.
     from vllm_omni.engine.arg_utils import OmniEngineArgs
 
+    return frozenset(f.name for f in fields(OmniEngineArgs))
+
+
+def _global_stage_cli_fields() -> frozenset[str]:
     return (
-        frozenset(f.name for f in fields(OmniEngineArgs))
-        | frozenset(_STAGE_DEPLOY_ENGINE_FIELDS)
-        | frozenset(_PIPELINE_DEPLOY_CLI_FIELDS)
+        _omni_engine_arg_fields() | frozenset(_STAGE_DEPLOY_ENGINE_FIELDS) | frozenset(_PIPELINE_DEPLOY_CLI_FIELDS)
     ) - {"model", "stage_id", "stage_configs_path", "async_chunk"}
 
 
@@ -768,12 +773,14 @@ def _stage_engine_values(
     if stage_cli_overrides:
         engine.update(_copy_value(stage_cli_overrides))
 
+    shared_engine_fields = _omni_engine_arg_fields() - _KNOWN_STAGE_ENGINE_FIELDS
+    shared_engine_args = _select_engine_overrides(engine, shared_engine_fields)
     unclaimed: dict[str, Any] = {}
     if execution_type == StageExecutionType.DIFFUSION:
         from vllm_omni.diffusion.data import normalize_omni_diffusion_engine_kwargs
 
         engine = normalize_omni_diffusion_engine_kwargs(engine)
-        unclaimed_names = set(engine) - _KNOWN_STAGE_ENGINE_FIELDS
+        unclaimed_names = set(engine) - _KNOWN_STAGE_ENGINE_FIELDS - _omni_engine_arg_fields()
         unclaimed = {name: _copy_value(engine[name]) for name in sorted(unclaimed_names)}
 
     return _StageEngineValues(
@@ -791,6 +798,7 @@ def _stage_engine_values(
         runtime=cast(_RuntimeEngineOverrides, _select_engine_overrides(engine, _RUNTIME_ENGINE_FIELDS)),
         parallel=cast(_ParallelEngineOverrides, _select_engine_overrides(engine, _PARALLEL_ENGINE_FIELDS)),
         diffusion=_DiffusionEngineOverrides.from_engine(engine),
+        shared_engine_args=shared_engine_args,
         unclaimed=unclaimed,
     )
 
@@ -847,6 +855,11 @@ class BaseVllmOmniStageConfig:
     runtime_config: OmniStageRuntimeConfig = field(default_factory=OmniStageRuntimeConfig)
     parallel_config: OmniStageParallelConfig = field(default_factory=OmniStageParallelConfig)
     quantization_config: _QuantizationConfigType = None
+
+    @property
+    def shared_engine_args(self) -> dict[str, Any]:
+        """Valid engine args awaiting a dedicated structured owner."""
+        return _copy_value(getattr(self, "_shared_engine_args", {}))
 
     @property
     def stage_id(self) -> int:
@@ -979,9 +992,11 @@ def _with_resolved_processors(
     stage_config: StageConfigType,
     input_proc: str | None,
     next_stage_proc: str | None,
+    shared_engine_args: Mapping[str, Any],
 ) -> StageConfigType:
     stage_config._resolved_custom_process_input_func = input_proc
     stage_config._resolved_custom_process_next_stage_input_func = next_stage_proc
+    stage_config._shared_engine_args = _copy_value(shared_engine_args)
     return stage_config
 
 
@@ -1006,6 +1021,7 @@ def _build_ar_stage_config(
             VllmOmniARStageConfig(**common_kwargs),
             input_proc,
             next_stage_proc,
+            engine.shared_engine_args,
         ),
     )
 
@@ -1031,6 +1047,7 @@ def _build_generation_stage_config(
             VllmOmniGenerationStageConfig(**common_kwargs),
             input_proc,
             next_stage_proc,
+            engine.shared_engine_args,
         ),
     )
 
@@ -1069,6 +1086,7 @@ def _build_diffusion_stage_config(
             VllmOmniDiffusionStageConfig(**common_kwargs),
             input_proc,
             next_stage_proc,
+            engine.shared_engine_args,
         ),
     )
 
@@ -1184,6 +1202,10 @@ def _build_parallel_config(
     config_cls: type[OmniStageParallelConfig] = OmniStageParallelConfig,
 ) -> OmniStageParallelConfig:
     parallel_config = _mapping_or_empty(engine.get("parallel_config"))
+    explicit_sequence_parallel_size = _first_defined(
+        parallel_config.get("sequence_parallel_size"),
+        engine.get("sequence_parallel_size"),
+    )
     config_fields = {
         config_field.name
         for config_field in fields(config_cls)
@@ -1198,7 +1220,17 @@ def _build_parallel_config(
         kwargs["pipeline_parallel_size"] = _copy_value(deploy.pipeline_parallel_size)
     if "data_parallel_size" not in kwargs and deploy.data_parallel_size is not None:
         kwargs["data_parallel_size"] = _copy_value(deploy.data_parallel_size)
-    return config_cls(**kwargs)
+    result = config_cls(**kwargs)
+    if (
+        explicit_sequence_parallel_size is not None
+        and isinstance(result, OmniStageDiffusionParallelConfig)
+        and _INT_ADAPTER.validate_python(explicit_sequence_parallel_size) != result.sequence_parallel_size
+    ):
+        raise ValueError(
+            "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
+            f" but got {explicit_sequence_parallel_size} != {result.ulysses_degree} * {result.ring_degree}"
+        )
+    return result
 
 
 def _build_diffusion_config_projection(

@@ -134,35 +134,11 @@ def _apply_diffusion_parallel_runtime_overrides(
     engine_args: dict[str, Any],
     runtime_overrides: dict[str, Any],
 ) -> None:
-    """Move diffusion parallel overrides into nested ``parallel_config``."""
-    from vllm_omni.diffusion.data import DiffusionParallelConfig
+    """Nest deploy values, then overlay diffusion parallel runtime values."""
+    from vllm_omni.diffusion.data import _normalize_flat_diffusion_parallel_fields
 
-    parallel_fields = frozenset(f.name for f in fields(DiffusionParallelConfig))
-    parallel_config = engine_args.get("parallel_config")
-    parallel_config_dict = dict(parallel_config) if parallel_config is not None else None
-    degree_overridden = False
-    sequence_parallel_explicit = runtime_overrides.get("sequence_parallel_size") is not None
-
-    for key in list(runtime_overrides.keys()):
-        value = runtime_overrides.get(key)
-        if value is None or key not in parallel_fields:
-            continue
-        if parallel_config_dict is None:
-            parallel_config_dict = {}
-        if key in ("ulysses_degree", "ring_degree", "allgather_degree"):
-            degree_overridden = True
-        parallel_config_dict[key] = runtime_overrides.pop(key)
-
-    if parallel_config_dict is not None and degree_overridden and not sequence_parallel_explicit:
-        ulysses_degree = parallel_config_dict.get("ulysses_degree") or 1
-        ring_degree = parallel_config_dict.get("ring_degree") or 1
-        allgather_degree = parallel_config_dict.get("allgather_degree") or 1
-        parallel_config_dict["sequence_parallel_size"] = (
-            allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
-        )
-
-    if parallel_config_dict is not None:
-        engine_args["parallel_config"] = parallel_config_dict
+    _normalize_flat_diffusion_parallel_fields(engine_args, engine_args, overwrite=False)
+    _normalize_flat_diffusion_parallel_fields(engine_args, runtime_overrides, overwrite=True)
 
 
 class StageType(str, Enum):
