@@ -1118,11 +1118,7 @@ def test_default_diffusion_factory_builds_without_orchestrator_only_field(monkey
     from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 
     stage = AsyncOmniEngine._create_default_diffusion_stage_cfg({})[0]
-    stage_config = SimpleNamespace(
-        stage_id=0,
-        stage_type="diffusion",
-        engine_args=stage["engine_args"],
-    )
+    stage_config = SimpleNamespace(**stage)
     monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
 
     config = build_diffusion_config("unused", stage_config, extract_stage_metadata(stage_config))
