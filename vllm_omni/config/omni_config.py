@@ -34,6 +34,7 @@ from vllm_omni.config.stage_config import (
     _resolve_scheduler,
     _scheduler_path,
     _select_processor_funcs,
+    build_diffusion_stage_runtime_overrides,
     build_stage_runtime_overrides,
     load_deploy_config,
 )
@@ -207,8 +208,15 @@ def _resolve_scheduler_path(execution_type: StageExecutionType, async_scheduling
     return _scheduler_path(_resolve_scheduler(execution_type, async_scheduling))
 
 
-def _stage_cli_overrides(stage_id: int, cli_overrides: Mapping[str, Any]) -> dict[str, Any]:
-    runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
+def _stage_cli_overrides(
+    stage_id: int,
+    execution_type: StageExecutionType,
+    cli_overrides: Mapping[str, Any],
+) -> dict[str, Any]:
+    if execution_type == StageExecutionType.DIFFUSION:
+        runtime_overrides = build_diffusion_stage_runtime_overrides(stage_id, dict(cli_overrides))
+    else:
+        runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
     global_stage_fields = _global_stage_cli_fields()
     result: dict[str, Any] = {}
     for key, value in runtime_overrides.items():
@@ -427,7 +435,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             self.world_size = other_parallel_world_size
 
 
-@config(config=ConfigDict(arbitrary_types_allowed=True))
+@config(config=ConfigDict(arbitrary_types_allowed=True, extra="forbid"))
 class _DiffusionConfigProjection:
     """Diffusion-specific per-stage settings.
 
@@ -441,6 +449,8 @@ class _DiffusionConfigProjection:
     model: str | None = None
     model_class_name: str | None = None
     model_arch: str | None = None
+    engine_backend: str = "default"
+    diffusion_model_runner_cls: str | None = None
     dtype: Any = "auto"
     trust_remote_code: bool = False
     revision: str | None = None
@@ -457,6 +467,7 @@ class _DiffusionConfigProjection:
     cache_backend: str = "none"
     cache_config: Any = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
+    enable_session_state_manager: bool = False
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = Field(default=32, ge=1)
     diffusion_load_format: str = "default"
@@ -504,16 +515,18 @@ class _DiffusionConfigProjection:
     additional_config: dict[str, Any] = field(default_factory=dict)
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
+    request_batch_max_wait_ms: float = 0.0
+    streaming_output: bool = False
     quantization_config: _QuantizationConfigType = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> _DiffusionConfigProjection:
-        from vllm_omni.diffusion.data import normalize_omni_diffusion_kwargs
+        from vllm_omni.diffusion.data import normalize_and_validate_omni_diffusion_kwargs
 
-        normalized_kwargs = normalize_omni_diffusion_kwargs(kwargs)
-        valid_fields = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in normalized_kwargs.items() if k in valid_fields})
+        valid_fields = frozenset(f.name for f in fields(cls))
+        normalized = normalize_and_validate_omni_diffusion_kwargs(kwargs, valid_fields)
+        return cls(**{name: value for name, value in normalized.items() if value is not None})
 
     def __post_init__(self) -> None:
         # Keep diffusion imports lazy so importing vllm_omni.config does not
@@ -733,6 +746,16 @@ _SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
 _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
 _PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(_ParallelConfigEngineOverrides.__annotations__)
 _PARALLEL_ENGINE_FIELDS = _PARALLEL_CONFIG_ENGINE_FIELDS | {"parallel_config"}
+_KNOWN_STAGE_ENGINE_FIELDS = (
+    _QUANTIZATION_ENGINE_FIELDS
+    | _MODEL_ENGINE_FIELDS
+    | _LOAD_ENGINE_FIELDS
+    | _CACHE_ENGINE_FIELDS
+    | _SCHEDULER_ENGINE_FIELDS
+    | _RUNTIME_ENGINE_FIELDS
+    | _PARALLEL_ENGINE_FIELDS
+    | _DIFFUSION_STAGE_ENGINE_FIELDS
+) - {"model_arch"}
 
 
 def _global_stage_cli_fields() -> frozenset[str]:
@@ -744,7 +767,7 @@ def _global_stage_cli_fields() -> frozenset[str]:
         frozenset(f.name for f in fields(OmniEngineArgs))
         | frozenset(_STAGE_DEPLOY_ENGINE_FIELDS)
         | frozenset(_PIPELINE_DEPLOY_CLI_FIELDS)
-    ) - {"model", "stage_id", "stage_configs_path", "async_chunk"}
+    ) - {"model", "model_arch", "stage_id", "stage_configs_path", "async_chunk"}
 
 
 def _mapping_or_empty(value: Any) -> Mapping[str, Any]:
@@ -770,11 +793,33 @@ def _stage_engine_overrides(stage_deploy: StageDeployConfig | None) -> dict[str,
 
 def _stage_engine_values(
     stage_deploy: StageDeployConfig | None,
+    execution_type: StageExecutionType,
+    stage_id: int,
     stage_cli_overrides: Mapping[str, Any] | None = None,
 ) -> _StageEngineValues:
+    if execution_type == StageExecutionType.DIFFUSION:
+        from vllm_omni.diffusion.data import (
+            normalize_and_validate_omni_diffusion_kwargs,
+            omni_diffusion_engine_input_fields,
+        )
+
+        if stage_deploy is not None:
+            normalize_and_validate_omni_diffusion_kwargs(
+                stage_deploy.engine_extras,
+                omni_diffusion_engine_input_fields() - {"model", "model_arch", "stage_id"},
+                engine_ingress=True,
+                stage_id=stage_id,
+            )
     engine = _stage_engine_overrides(stage_deploy)
     if stage_cli_overrides:
         engine.update(_copy_value(stage_cli_overrides))
+    if execution_type == StageExecutionType.DIFFUSION:
+        engine = normalize_and_validate_omni_diffusion_kwargs(
+            engine,
+            _KNOWN_STAGE_ENGINE_FIELDS,
+            engine_ingress=True,
+            stage_id=stage_id,
+        )
     return _StageEngineValues(
         quantization=cast(
             _QuantizationEngineOverrides,
@@ -1206,11 +1251,7 @@ def _build_diffusion_config_projection(
 ) -> _DiffusionConfigProjection:
     diffusion_kwargs = engine.to_kwargs()
     diffusion_kwargs["stage_id"] = topology.stage_id
-    diffusion_kwargs["model_arch"] = _first_defined(
-        diffusion_kwargs.get("model_arch"),
-        topology.model_arch,
-        pipeline.model_arch,
-    )
+    diffusion_kwargs["model_arch"] = _first_defined(topology.model_arch, pipeline.model_arch)
     if "dtype" not in diffusion_kwargs and deploy.dtype is not None:
         diffusion_kwargs["dtype"] = _copy_value(deploy.dtype)
     if "trust_remote_code" not in diffusion_kwargs and deploy.trust_remote_code is not None:
@@ -1279,7 +1320,9 @@ class VllmOmniConfig:
                 deploy_by_id.get(topology.stage_id),
                 _stage_engine_values(
                     deploy_by_id.get(topology.stage_id),
-                    _stage_cli_overrides(topology.stage_id, cli_overrides),
+                    topology.execution_type,
+                    topology.stage_id,
+                    _stage_cli_overrides(topology.stage_id, topology.execution_type, cli_overrides),
                 ),
                 model=model,
             )

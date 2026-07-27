@@ -15,7 +15,7 @@ import os
 import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
@@ -25,7 +25,10 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    OmniDiffusionConfig,
+    normalize_and_validate_omni_diffusion_kwargs,
+)
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
@@ -1076,6 +1079,32 @@ def get_stage_connector_spec(
     return {}
 
 
+def _strict_diffusion_config_kwargs(engine_args: dict[str, Any]) -> dict[str, Any]:
+    """Return only normalized fields owned by the diffusion runtime."""
+    from vllm_omni.config.omni_config import _KNOWN_STAGE_ENGINE_FIELDS
+
+    diffusion_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
+    producer_metadata_fields = {
+        "async_chunk",
+        "custom_process_next_stage_input_func",
+        "engine_output_type",
+        "has_sampling_extra_args",
+        "hf_config_name",
+        "model_arch",
+        "model_stage",
+        "scheduler_cls",
+        "stage_connector_spec",
+        "worker_type",
+    }
+    normalized = normalize_and_validate_omni_diffusion_kwargs(
+        engine_args,
+        diffusion_fields | producer_metadata_fields | _KNOWN_STAGE_ENGINE_FIELDS,
+        engine_ingress=True,
+        stage_id=engine_args.get("stage_id", "unknown"),
+    )
+    return {name: value for name, value in normalized.items() if name in diffusion_fields and value is not None}
+
+
 def build_diffusion_config(
     model: str,
     stage_cfg: Any,
@@ -1084,7 +1113,7 @@ def build_diffusion_config(
     """Build diffusion config for a stage."""
 
     engine_args_dict = build_engine_args_dict(stage_cfg, model)
-    od_config = OmniDiffusionConfig.from_kwargs(**engine_args_dict)
+    od_config = OmniDiffusionConfig.from_kwargs(**_strict_diffusion_config_kwargs(engine_args_dict))
 
     num_devices_per_stage = od_config.parallel_config.world_size
     device_control_env = current_omni_platform.device_control_env_var
