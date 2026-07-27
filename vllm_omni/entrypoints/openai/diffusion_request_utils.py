@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, is_dataclass
+from dataclasses import replace as dataclass_replace
 from types import MappingProxyType
 from typing import Any
 
@@ -34,7 +35,6 @@ class DiffusionChatRequestPlan:
     """Final controls and private per-stage parameter prototypes."""
 
     controls: Mapping[str, object]
-    request_sources: Mapping[str, object]
     _stage_params: tuple[Any, ...]
 
     def clone_sampling_params_list(self) -> list[Any]:
@@ -104,15 +104,15 @@ def _stage_params(stage_type: str, default: object | None) -> Any:
     )
 
 
-def _init_values(params: Any) -> dict[str, object]:
+def _replace_params(params: Any, overrides: Mapping[str, object]) -> Any:
     if is_dataclass(params):
-        names = [field.name for field in fields(params) if field.init]
-    else:
-        names = list(getattr(type(params), "__struct_fields__", ()))
-        if not names:
-            names = list(getattr(params, "__dict__", ()))
-        names = [name for name in names if not name.startswith("_") and name != "output_text_buffer_length"]
-    return {name: getattr(params, name) for name in names}
+        return dataclass_replace(params, **overrides)
+    values = {
+        name: getattr(params, name)
+        for name in type(params).__struct_fields__
+        if not name.startswith("_") and name != "output_text_buffer_length"
+    }
+    return type(params)(**(values | overrides))
 
 
 class _Assignments:
@@ -168,7 +168,7 @@ class _Assignments:
                     **extra_args,
                 }
             try:
-                self.params[stage] = type(params)(**{**_init_values(params), **overrides})
+                self.params[stage] = _replace_params(params, overrides)
             except Exception as exc:
                 raise ValueError(f"Invalid sampling parameters for stage {stage}: {exc}") from exc
 
@@ -184,6 +184,7 @@ def compile_diffusion_chat_request_plan(
     control_root_fields: Collection[str],
     declared_extra_fields: Collection[str],
     apply_declared_to_non_diffusion: bool,
+    supported_modalities: Collection[str],
 ) -> DiffusionChatRequestPlan:
     """Compile all Chat request sources into final typed stage parameters."""
     declared = frozenset(declared_extra_fields)
@@ -257,6 +258,14 @@ def compile_diffusion_chat_request_plan(
         not isinstance(modalities, list) or not all(isinstance(modality, str) for modality in modalities)
     ):
         raise ValueError("'modalities' must be a list of strings.")
+    if modalities is not None:
+        allowed = set(supported_modalities)
+        unsupported = set(modalities) - allowed
+        if unsupported:
+            raise ValueError(
+                f"Unsupported output modalities {', '.join(sorted(unsupported))} for this model. "
+                f"Supported modalities: {', '.join(sorted(allowed))}"
+            )
     height = serving_by_key.get("height", (None, ""))[0]
     width = serving_by_key.get("width", (None, ""))[0]
     invalid_size: object | None = None
@@ -395,14 +404,8 @@ def compile_diffusion_chat_request_plan(
                 assignments.add(stage, "lora_scale", lora_scale, source)
 
     assignments.apply()
-    # Source-qualified keys are disjoint; this expansion has no precedence.
-    request_sources = {
-        **{f"request.extra_body.{key}": value for key, value in nested.items()},
-        **{f"request.{key}": value for key, value in flat.items()},
-    }
     plan = DiffusionChatRequestPlan(
         controls=MappingProxyType(copy.deepcopy(controls)),
-        request_sources=MappingProxyType(copy.deepcopy(request_sources)),
         _stage_params=tuple(params),
     )
     if invalid_size is not None:

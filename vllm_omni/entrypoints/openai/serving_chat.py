@@ -353,6 +353,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         self._diffusion_extra_body_params = declared_extra_fields
 
         stage_types = [get_stage_type(stage_config) for stage_config in stage_configs]
+        supported_modalities = {
+            modality for modality in getattr(stage_owner, "output_modalities", ()) if modality is not None
+        }
+        if is_single_stage_diffusion(stage_owner):
+            supported_modalities.add("text")
         comprehension_stage_index = next(
             (
                 index
@@ -367,6 +372,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             "comprehension_stage_index": comprehension_stage_index,
             "declared_extra_fields": declared_extra_fields,
             "apply_declared_to_non_diffusion": apply_declared_to_non_diffusion,
+            "supported_modalities": supported_modalities,
         }
 
     def _get_diffusion_extra_output_params(
@@ -476,24 +482,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
             except ValueError as exc:
                 return self._create_error_response(str(exc), status_code=400)
-
-        if diffusion_plan is not None and "modalities" in diffusion_plan.controls:
-            requested_modalities = diffusion_plan.controls["modalities"]
-            if self._diffusion_mode:
-                allowed_modalities = {"audio", "image", "text"}
-            else:
-                allowed_modalities = {
-                    modality for modality in self.engine_client.output_modalities if modality is not None
-                }
-                if is_single_stage_diffusion(self.engine_client):
-                    allowed_modalities.add("text")
-            unsupported = set(requested_modalities) - allowed_modalities
-            if unsupported:
-                return self._create_error_response(
-                    f"Unsupported output modalities {', '.join(sorted(unsupported))} for this model. "
-                    f"Supported modalities: {', '.join(sorted(allowed_modalities))}",
-                    status_code=400,
-                )
 
         # Handle diffusion mode
         if self._diffusion_mode:
@@ -3504,11 +3492,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             negative_prompt = diffusion_plan.controls.get("negative_prompt")
 
             logger.info(
-                "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
+                "Diffusion chat request %s: prompt=%r, ref_images=%d",
                 request_id,
                 prompt[:50] + "..." if len(prompt) > 50 else prompt,
                 len(reference_images),
-                {k: v for k, v in diffusion_plan.request_sources.items() if v is not None},
             )
 
             # Decode reference images if provided

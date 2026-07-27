@@ -102,6 +102,30 @@ def _compile_diffusion_plan(serving_chat, request):
     )
 
 
+def _configure_single_diffusion_topology(
+    serving_chat,
+    *,
+    diffusion_mode: bool,
+    output_modalities: tuple[str, ...] = ("image",),
+):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    stages = [SimpleNamespace(stage_type="diffusion", is_comprehension=False)]
+    defaults = [OmniDiffusionSamplingParams()]
+    serving_chat._diffusion_mode = diffusion_mode
+    serving_chat._diffusion_extra_body_params = frozenset()
+    serving_chat.engine_client.stage_configs = stages
+    serving_chat.engine_client.default_sampling_params_list = defaults
+    serving_chat.engine_client.output_modalities = list(output_modalities)
+    serving_chat.engine_client.get_diffusion_od_config.return_value = None
+    serving_chat._diffusion_engine = SimpleNamespace(
+        stage_configs=stages,
+        default_sampling_params_list=defaults,
+        output_modalities=list(output_modalities),
+        od_config=None,
+    )
+
+
 @pytest.fixture
 def mock_request(mocker: MockerFixture):
     """Create a mock request with all OpenAI sampling params set to None."""
@@ -210,98 +234,60 @@ def test_registry_owns_declared_extra_fan_out(
         assert getattr(ar_params, field) == expected_ar_value
 
 
-def test_duplicate_error_uses_the_shared_boundary_before_either_dispatcher(
+@pytest.mark.parametrize("diffusion_mode", [True, False], ids=["pure", "mixed"])
+@pytest.mark.parametrize(
+    ("request_body", "error_message"),
+    [
+        pytest.param(
+            {"seed": 1, "sampling_params_list": [{"seed": 2}]},
+            'Parameter "seed" was provided more than once: request.seed, request.sampling_params_list[0].seed.',
+            id="duplicate",
+        ),
+        pytest.param(
+            {"extra_body": {"modalities": "text"}},
+            "'modalities' must be a list of strings.",
+            id="modalities-type",
+        ),
+        pytest.param(
+            {"extra_body": {"modalities": ["audio"]}},
+            "Unsupported output modalities audio",
+            id="unsupported-audio",
+        ),
+        pytest.param(
+            {"extra_body": {"modalities": ["video"]}},
+            "Unsupported output modalities video",
+            id="unsupported-video",
+        ),
+    ],
+)
+def test_invalid_request_uses_the_shared_boundary_before_dispatch(
     serving_chat,
     mocker: MockerFixture,
+    diffusion_mode: bool,
+    request_body: dict[str, object],
+    error_message: str,
 ):
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-    diffusion_dispatch = mocker.patch.object(
-        serving_chat,
-        "_create_diffusion_chat_completion",
-        new=mocker.AsyncMock(),
-    )
-    serving_chat._check_model = mocker.AsyncMock()
-    responses = []
-    for diffusion_mode in (True, False):
-        serving_chat._diffusion_mode = diffusion_mode
-        serving_chat._diffusion_extra_body_params = frozenset()
-        stages = [SimpleNamespace(stage_type="diffusion", is_comprehension=False)]
-        defaults = [OmniDiffusionSamplingParams()]
-        serving_chat.engine_client.stage_configs = stages
-        serving_chat.engine_client.default_sampling_params_list = defaults
-        serving_chat.engine_client.get_diffusion_od_config.return_value = None
-        serving_chat._diffusion_engine = SimpleNamespace(
-            stage_configs=stages,
-            default_sampling_params_list=defaults,
-            od_config=None,
-        )
-        request = ChatCompletionRequest(
-            model="test",
-            messages=[],
-            seed=1,
-            sampling_params_list=[{"seed": 2}],
-        )
-        responses.append(asyncio.run(serving_chat._create_chat_completion(request)))
-
-    assert [response.error.code for response in responses] == [400, 400]
-    assert all(
-        response.error.message
-        == 'Parameter "seed" was provided more than once: request.seed, request.sampling_params_list[0].seed.'
-        for response in responses
-    )
-    diffusion_dispatch.assert_not_awaited()
-    serving_chat._check_model.assert_not_awaited()
-
-
-@pytest.mark.parametrize("modalities", ["text", ["video"]])
-def test_nested_modalities_use_the_shared_boundary_before_either_dispatcher(
-    serving_chat,
-    mocker: MockerFixture,
-    modalities,
-):
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
     diffusion_dispatch = mocker.patch.object(
         serving_chat,
         "_create_diffusion_chat_completion",
         new=mocker.AsyncMock(),
     )
     serving_chat._check_model = mocker.AsyncMock(return_value=None)
-    serving_chat.engine_client.output_modalities = ["image"]
-    responses = []
-    for diffusion_mode in (True, False):
-        serving_chat._diffusion_mode = diffusion_mode
-        serving_chat._diffusion_extra_body_params = frozenset()
-        stages = [SimpleNamespace(stage_type="diffusion", is_comprehension=False)]
-        defaults = [OmniDiffusionSamplingParams()]
-        serving_chat.engine_client.stage_configs = stages
-        serving_chat.engine_client.default_sampling_params_list = defaults
-        serving_chat.engine_client.get_diffusion_od_config.return_value = None
-        serving_chat._diffusion_engine = SimpleNamespace(
-            stage_configs=stages,
-            default_sampling_params_list=defaults,
-            od_config=None,
-        )
-        request = ChatCompletionRequest(
-            model="test",
-            messages=[],
-            extra_body={"modalities": modalities},
-        )
-        responses.append(asyncio.run(serving_chat._create_chat_completion(request)))
+    _configure_single_diffusion_topology(serving_chat, diffusion_mode=diffusion_mode)
+    request = ChatCompletionRequest(model="test", messages=[], **request_body)
+    response = asyncio.run(serving_chat._create_chat_completion(request))
 
-    assert [response.error.code for response in responses] == [400, 400]
-    if isinstance(modalities, str):
-        assert all(response.error.message == "'modalities' must be a list of strings." for response in responses)
-    else:
-        assert all("Unsupported output modalities video" in response.error.message for response in responses)
+    assert response.error.code == 400
+    assert error_message in response.error.message
     diffusion_dispatch.assert_not_awaited()
     serving_chat._check_model.assert_not_awaited()
 
 
-def test_pure_dispatcher_receives_the_compiled_size(
+@pytest.mark.parametrize("modality", ["image", "text"])
+def test_pure_dispatcher_receives_the_compiled_controls(
     serving_chat,
     mocker: MockerFixture,
+    modality: str,
 ):
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -319,15 +305,21 @@ def test_pure_dispatcher_receives_the_compiled_size(
     serving_chat._diffusion_engine = SimpleNamespace(
         stage_configs=[SimpleNamespace(stage_type="diffusion")],
         default_sampling_params_list=[OmniDiffusionSamplingParams()],
+        output_modalities=["image"],
         od_config=None,
         generate=generate,
     )
     serving_chat._extract_diffusion_prompt_and_media = mocker.Mock(return_value=("prompt", [], [], []))
-    request = ChatCompletionRequest(model="test", messages=[], size="768x512")
-    plan = _compile_diffusion_plan(serving_chat, request)
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        size="768x512",
+        extra_body={"modalities": [modality]},
+    )
 
-    response = asyncio.run(serving_chat._create_diffusion_chat_completion(request, plan))
+    response = asyncio.run(serving_chat._create_chat_completion(request))
 
+    assert captured["prompt"]["modalities"] == [modality]
     (params,) = captured["sampling_params_list"]
     assert (params.height, params.width) == (512, 768)
     assert response.error.message == "No output generated from AsyncOmni"

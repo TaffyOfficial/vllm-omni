@@ -35,15 +35,23 @@ def _request(**kwargs: Any) -> ChatCompletionRequest:
     return ChatCompletionRequest(model="test", messages=[], **kwargs)
 
 
-def _global_sources(key: str, value: object) -> list[dict[str, object]]:
-    return [
-        {key: value},
-        {"extra_body": {key: value}},
-        {"extra_args": {key: value}},
-        {"extra_params": {key: value}},
-        {"extra_body": {"extra_args": {key: value}}},
-        {"extra_body": {"extra_params": {key: value}}},
-    ]
+GLOBAL_SOURCE_PATHS = (
+    "request",
+    "extra_body",
+    "extra_args",
+    "extra_params",
+    "extra_body.extra_args",
+    "extra_body.extra_params",
+)
+
+
+def _global_source(path: str, key: str, value: object) -> dict[str, object]:
+    body: dict[str, object] = {key: value}
+    if path == "request":
+        return body
+    for container in reversed(path.split(".")):
+        body = {container: body}
+    return body
 
 
 def _compile(
@@ -54,6 +62,7 @@ def _compile(
     comprehension_stage_index: int | None = None,
     declared: frozenset[str] = frozenset(),
     fan_out_declared: bool = False,
+    supported_modalities: frozenset[str] = frozenset({"audio", "image", "text"}),
 ) -> DiffusionChatRequestPlan:
     return compile_diffusion_chat_request_plan(
         request=request,
@@ -65,57 +74,49 @@ def _compile(
         control_root_fields=CONTROL_FIELDS,
         declared_extra_fields=declared,
         apply_declared_to_non_diffusion=fan_out_declared,
+        supported_modalities=supported_modalities,
     )
 
 
+@pytest.mark.parametrize("source", GLOBAL_SOURCE_PATHS)
 @pytest.mark.parametrize(
-    "body",
-    _global_sources("model_option", 1),
+    ("dispatcher", "consumer", "key", "value"),
+    [
+        pytest.param("pure", "diffusion", "model_option", 1, id="pure-diffusion"),
+        pytest.param("mixed", "fan-out", "seed", 32, id="mixed-fan-out"),
+        pytest.param("mixed", "defaults", "seed", None, id="mixed-defaults"),
+    ],
 )
-def test_all_global_sources_reach_the_same_diffusion_consumer(body: dict[str, object]) -> None:
-    plan = _compile(_request(**body), declared=frozenset({"model_option"}))
+def test_global_source_dispatcher_consumer_matrix(
+    source: str,
+    dispatcher: str,
+    consumer: str,
+    key: str,
+    value: object,
+) -> None:
+    body = _global_source(source, key, value)
+    if dispatcher == "pure":
+        plan = _compile(_request(**body), declared=frozenset({key}))
+        assert plan.clone_sampling_params_list()[0].extra_args[key] == value
+        return
 
-    assert plan.clone_sampling_params_list()[0].extra_args["model_option"] == 1
-
-
-@pytest.mark.parametrize("body", _global_sources("seed", 32))
-def test_declared_global_sources_reach_the_same_mixed_stage_consumers(body: dict[str, object]) -> None:
     plan = _compile(
         _request(**body),
         stage_types=("llm", "diffusion"),
-        defaults=(
-            SamplingParams(seed=7),
-            OmniDiffusionSamplingParams(extra_args={"default": True}),
-        ),
+        defaults=(SamplingParams(seed=7), OmniDiffusionSamplingParams(extra_args={"default": True})),
         comprehension_stage_index=0,
-        declared=frozenset({"seed"}),
+        declared=frozenset({key}),
         fan_out_declared=True,
     )
-
     ar_params, diffusion_params = plan.clone_sampling_params_list()
-    assert ar_params.seed == 32
-    assert ar_params.extra_args["seed"] == 32
-    assert diffusion_params.extra_args == {"default": True, "seed": 32}
-
-
-@pytest.mark.parametrize("body", _global_sources("seed", None))
-def test_declared_global_none_preserves_mixed_stage_defaults(body: dict[str, object]) -> None:
-    plan = _compile(
-        _request(**body),
-        stage_types=("llm", "diffusion"),
-        defaults=(
-            SamplingParams(seed=7),
-            OmniDiffusionSamplingParams(extra_args={"default": True}),
-        ),
-        comprehension_stage_index=0,
-        declared=frozenset({"seed"}),
-        fan_out_declared=True,
-    )
-
-    ar_params, diffusion_params = plan.clone_sampling_params_list()
-    assert ar_params.seed == 7
-    assert "seed" not in (ar_params.extra_args or {})
-    assert diffusion_params.extra_args == {"default": True}
+    if consumer == "fan-out":
+        assert ar_params.seed == value
+        assert ar_params.extra_args[key] == value
+        assert diffusion_params.extra_args == {"default": True, key: value}
+    else:
+        assert ar_params.seed == 7
+        assert key not in (ar_params.extra_args or {})
+        assert diffusion_params.extra_args == {"default": True}
 
 
 @pytest.mark.parametrize(
@@ -282,6 +283,29 @@ def test_request_stage_values_overlay_defaults_once() -> None:
     assert ar_params.output_text_buffer_length == 2
     assert diffusion_params.guidance_scale == 4.0
     assert diffusion_params.extra_args == {"default": 3, "global": 1, "local": 2}
+
+
+def test_stage_replacement_revalidates_sampling_params() -> None:
+    with pytest.raises(ValueError, match="Invalid sampling parameters for stage 0"):
+        _compile(
+            _request(sampling_params_list=[{"top_p": 0}]),
+            stage_types=("llm",),
+            defaults=(SamplingParams(),),
+            comprehension_stage_index=0,
+        )
+
+
+def test_stage_replacement_resets_sampling_params_derived_state() -> None:
+    plan = _compile(
+        _request(sampling_params_list=[{"stop": [], "stop_token_ids": [2]}]),
+        stage_types=("llm",),
+        defaults=(SamplingParams(stop=["END"], stop_token_ids=[1]),),
+        comprehension_stage_index=0,
+    )
+
+    (params,) = plan.clone_sampling_params_list()
+    assert params.output_text_buffer_length == 0
+    assert params._all_stop_token_ids == {2}
 
 
 @pytest.mark.parametrize(
