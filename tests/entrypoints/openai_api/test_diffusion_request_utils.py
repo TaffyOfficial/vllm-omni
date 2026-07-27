@@ -35,6 +35,17 @@ def _request(**kwargs: Any) -> ChatCompletionRequest:
     return ChatCompletionRequest(model="test", messages=[], **kwargs)
 
 
+def _global_sources(key: str, value: object) -> list[dict[str, object]]:
+    return [
+        {key: value},
+        {"extra_body": {key: value}},
+        {"extra_args": {key: value}},
+        {"extra_params": {key: value}},
+        {"extra_body": {"extra_args": {key: value}}},
+        {"extra_body": {"extra_params": {key: value}}},
+    ]
+
+
 def _compile(
     request: ChatCompletionRequest,
     *,
@@ -59,20 +70,52 @@ def _compile(
 
 @pytest.mark.parametrize(
     "body",
-    [
-        {"model_option": 1},
-        {"extra_body": {"model_option": 1}},
-        {"extra_args": {"model_option": 1}},
-        {"extra_params": {"model_option": 1}},
-        {"extra_body": {"extra_args": {"model_option": 1}}},
-        {"extra_body": {"extra_params": {"model_option": 1}}},
-    ],
+    _global_sources("model_option", 1),
 )
 def test_all_global_sources_reach_the_same_diffusion_consumer(body: dict[str, object]) -> None:
-    declared = frozenset({"model_option"}) if "model_option" in body or "extra_body" in body else frozenset()
-    plan = _compile(_request(**body), declared=declared)
+    plan = _compile(_request(**body), declared=frozenset({"model_option"}))
 
     assert plan.clone_sampling_params_list()[0].extra_args["model_option"] == 1
+
+
+@pytest.mark.parametrize("body", _global_sources("seed", 32))
+def test_declared_global_sources_reach_the_same_mixed_stage_consumers(body: dict[str, object]) -> None:
+    plan = _compile(
+        _request(**body),
+        stage_types=("llm", "diffusion"),
+        defaults=(
+            SamplingParams(seed=7),
+            OmniDiffusionSamplingParams(extra_args={"default": True}),
+        ),
+        comprehension_stage_index=0,
+        declared=frozenset({"seed"}),
+        fan_out_declared=True,
+    )
+
+    ar_params, diffusion_params = plan.clone_sampling_params_list()
+    assert ar_params.seed == 32
+    assert ar_params.extra_args["seed"] == 32
+    assert diffusion_params.extra_args == {"default": True, "seed": 32}
+
+
+@pytest.mark.parametrize("body", _global_sources("seed", None))
+def test_declared_global_none_preserves_mixed_stage_defaults(body: dict[str, object]) -> None:
+    plan = _compile(
+        _request(**body),
+        stage_types=("llm", "diffusion"),
+        defaults=(
+            SamplingParams(seed=7),
+            OmniDiffusionSamplingParams(extra_args={"default": True}),
+        ),
+        comprehension_stage_index=0,
+        declared=frozenset({"seed"}),
+        fan_out_declared=True,
+    )
+
+    ar_params, diffusion_params = plan.clone_sampling_params_list()
+    assert ar_params.seed == 7
+    assert "seed" not in ar_params.extra_args
+    assert diffusion_params.extra_args == {"default": True}
 
 
 @pytest.mark.parametrize(
@@ -85,6 +128,14 @@ def test_all_global_sources_reach_the_same_diffusion_consumer(body: dict[str, ob
         (
             {"cfg_scale": 1.0, "extra_args": {"true_cfg_scale": 2.0}},
             "request.cfg_scale, request.extra_args.true_cfg_scale",
+        ),
+        (
+            {"cfg_scale": 1.0, "extra_args": {"cfg_scale": 2.0}},
+            "request.cfg_scale, request.extra_args.cfg_scale",
+        ),
+        (
+            {"true_cfg_scale": 1.0, "extra_args": {"cfg_scale": 2.0}},
+            "request.true_cfg_scale, request.extra_args.cfg_scale",
         ),
         (
             {"model_option": 1, "extra_body": {"model_option": 2}},
@@ -130,6 +181,12 @@ def test_nested_controls_are_preserved_without_dispatcher_rereads() -> None:
 
     assert plan.controls["modalities"] == ["image"]
     assert plan.controls["negative_prompt"] == "low quality"
+
+
+@pytest.mark.parametrize("modalities", ["text", ["text", 1]])
+def test_nested_modalities_must_be_a_list_of_strings(modalities: object) -> None:
+    with pytest.raises(ValueError, match="'modalities' must be a list of strings"):
+        _compile(_request(extra_body={"modalities": modalities}))
 
 
 def test_internal_diffusion_state_is_not_a_public_root_field() -> None:

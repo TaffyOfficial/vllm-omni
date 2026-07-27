@@ -477,6 +477,24 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             except ValueError as exc:
                 return self._create_error_response(str(exc), status_code=400)
 
+        if diffusion_plan is not None and "modalities" in diffusion_plan.controls:
+            requested_modalities = diffusion_plan.controls["modalities"]
+            if self._diffusion_mode:
+                allowed_modalities = {"audio", "image", "text"}
+            else:
+                allowed_modalities = {
+                    modality for modality in self.engine_client.output_modalities if modality is not None
+                }
+                if is_single_stage_diffusion(self.engine_client):
+                    allowed_modalities.add("text")
+            unsupported = set(requested_modalities) - allowed_modalities
+            if unsupported:
+                return self._create_error_response(
+                    f"Unsupported output modalities {', '.join(sorted(unsupported))} for this model. "
+                    f"Supported modalities: {', '.join(sorted(allowed_modalities))}",
+                    status_code=400,
+                )
+
         # Handle diffusion mode
         if self._diffusion_mode:
             assert diffusion_plan is not None
@@ -613,15 +631,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         if not isinstance(request.modalities, list) or not all(isinstance(m, str) for m in request.modalities):
             return self.create_error_response("'modalities' must be a list of strings.")
-        allowed_modalities = set(engine_output_modalities)
-        if is_single_stage_diffusion(self.engine_client):
-            allowed_modalities.add("text")
-        unsupported = set(request.modalities) - allowed_modalities
-        if unsupported:
-            return self.create_error_response(
-                f"Unsupported output modalities {', '.join(sorted(unsupported))} for this model. "
-                f"Supported modalities: {', '.join(sorted(allowed_modalities))}",
-            )
+        if diffusion_plan is None:
+            allowed_modalities = set(engine_output_modalities)
+            if is_single_stage_diffusion(self.engine_client):
+                allowed_modalities.add("text")
+            unsupported = set(request.modalities) - allowed_modalities
+            if unsupported:
+                return self.create_error_response(
+                    f"Unsupported output modalities {', '.join(sorted(unsupported))} for this model. "
+                    f"Supported modalities: {', '.join(sorted(allowed_modalities))}",
+                )
 
         if request.modalities and "audio" in request.modalities:
             audio_format_check = self._resolve_audio_format(request)

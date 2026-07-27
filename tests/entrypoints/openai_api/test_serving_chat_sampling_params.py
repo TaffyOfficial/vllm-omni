@@ -254,6 +254,51 @@ def test_duplicate_error_uses_the_shared_boundary_before_either_dispatcher(
     serving_chat._check_model.assert_not_awaited()
 
 
+@pytest.mark.parametrize("modalities", ["text", ["video"]])
+def test_nested_modalities_use_the_shared_boundary_before_either_dispatcher(
+    serving_chat,
+    mocker: MockerFixture,
+    modalities,
+):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    diffusion_dispatch = mocker.patch.object(
+        serving_chat,
+        "_create_diffusion_chat_completion",
+        new=mocker.AsyncMock(),
+    )
+    serving_chat._check_model = mocker.AsyncMock(return_value=None)
+    serving_chat.engine_client.output_modalities = ["image"]
+    responses = []
+    for diffusion_mode in (True, False):
+        serving_chat._diffusion_mode = diffusion_mode
+        serving_chat._diffusion_extra_body_params = frozenset()
+        stages = [SimpleNamespace(stage_type="diffusion", is_comprehension=False)]
+        defaults = [OmniDiffusionSamplingParams()]
+        serving_chat.engine_client.stage_configs = stages
+        serving_chat.engine_client.default_sampling_params_list = defaults
+        serving_chat.engine_client.get_diffusion_od_config.return_value = None
+        serving_chat._diffusion_engine = SimpleNamespace(
+            stage_configs=stages,
+            default_sampling_params_list=defaults,
+            od_config=None,
+        )
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[],
+            extra_body={"modalities": modalities},
+        )
+        responses.append(asyncio.run(serving_chat._create_chat_completion(request)))
+
+    assert [response.error.code for response in responses] == [400, 400]
+    if isinstance(modalities, str):
+        assert all(response.error.message == "'modalities' must be a list of strings." for response in responses)
+    else:
+        assert all("Unsupported output modalities video" in response.error.message for response in responses)
+    diffusion_dispatch.assert_not_awaited()
+    serving_chat._check_model.assert_not_awaited()
+
+
 def test_pure_dispatcher_receives_the_compiled_size(
     serving_chat,
     mocker: MockerFixture,

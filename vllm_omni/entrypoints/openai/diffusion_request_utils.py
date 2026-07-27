@@ -221,12 +221,14 @@ def compile_diffusion_chat_request_plan(
         ("request.extra_body.extra_params", nested.get("extra_params")),
     )
     containers = [(name, _mapping(name.removeprefix("request."), value)) for name, value in raw_containers]
+    global_values = [(key, value, source, False) for key, value, source in roots]
+    global_values.extend(
+        (key, values[key], f"{name}.{key}", True) for name, values in containers for key in sorted(values)
+    )
     global_claims: dict[str, list[str]] = {}
-    for key, _value, source in roots:
-        global_claims.setdefault(sampling_fields.get(key, key), []).append(source)
-    for name, values in containers:
-        for key in values:
-            global_claims.setdefault(key, []).append(f"{name}.{key}")
+    for key, _value, source, _is_container in global_values:
+        conflict_key = key if key in declared else sampling_root_fields.get(key, key)
+        global_claims.setdefault(conflict_key, []).append(source)
     _reject_duplicates(global_claims)
 
     types = list(stage_types) or ["diffusion"]
@@ -239,63 +241,75 @@ def compile_diffusion_chat_request_plan(
     ]
     diffusion_stages = [index for index, stage_type in enumerate(types) if stage_type == "diffusion"]
     assignments = _Assignments(params)
-    root_by_key = {key: (value, source) for key, value, source in roots}
+    serving_by_key = {
+        key: (value, source)
+        for key, value, source, is_container in global_values
+        if not is_container or key in declared
+    }
 
     controls = {
         key: value
-        for key, (value, _source) in root_by_key.items()
+        for key, (value, _source) in serving_by_key.items()
         if key in controls_fields and key not in {"size", "lora"} and value is not None
     }
-    height = root_by_key.get("height", (None, ""))[0]
-    width = root_by_key.get("width", (None, ""))[0]
+    modalities = controls.get("modalities")
+    if modalities is not None and (
+        not isinstance(modalities, list) or not all(isinstance(modality, str) for modality in modalities)
+    ):
+        raise ValueError("'modalities' must be a list of strings.")
+    height = serving_by_key.get("height", (None, ""))[0]
+    width = serving_by_key.get("width", (None, ""))[0]
     invalid_size: object | None = None
-    if "size" in root_by_key and (height is None or width is None):
-        size, source = root_by_key["size"]
+    if "size" in serving_by_key and (height is None or width is None):
+        size, source = serving_by_key["size"]
         try:
             if isinstance(size, str) and "x" in size.lower():
                 parsed_width, parsed_height = (int(part) for part in size.lower().split("x"))
                 if height is None:
                     height = parsed_height
-                    root_by_key["height"] = (height, source)
+                    serving_by_key["height"] = (height, source)
                 if width is None:
                     width = parsed_width
-                    root_by_key["width"] = (width, source)
+                    serving_by_key["width"] = (width, source)
         except ValueError:
             invalid_size = size
 
-    for request_key, (value, source) in root_by_key.items():
+    for request_key, value, source, is_container in global_values:
         if request_key in declared:
-            targets = diffusion_stages
-            if apply_declared_to_non_diffusion:
-                targets = list(range(len(types)))
+            targets = list(range(len(types))) if apply_declared_to_non_diffusion else diffusion_stages
             for stage in targets:
-                assignments.add(stage, request_key, value, source, target="extra_args")
+                assignments.add(
+                    stage,
+                    request_key,
+                    value,
+                    source,
+                    target="extra_args",
+                )
+        elif is_container:
+            for stage in diffusion_stages:
+                assignments.add(
+                    stage,
+                    request_key,
+                    value,
+                    source,
+                    target="extra_args",
+                    keep_none=True,
+                    parse_value=False,
+                )
         elif request_key in sampling_fields:
             target = sampling_fields[request_key]
             for stage in diffusion_stages:
                 assignments.add(stage, target, value, source)
 
-    for name, values in containers:
-        for key in sorted(values):
-            value = values[key]
-            for stage in diffusion_stages:
-                assignments.add(
-                    stage,
-                    key,
-                    value,
-                    f"{name}.{key}",
-                    target="extra_args",
-                    keep_none=True,
-                    parse_value=key in declared,
-                )
-
     if comprehension_stage_index is not None:
+        if apply_declared_to_non_diffusion and types[comprehension_stage_index] != "diffusion":
+            for key, value, source, _is_container in global_values:
+                if key in declared and key in standard_sampling_fields:
+                    assignments.add(comprehension_stage_index, key, value, source)
         for key in standard_sampling_fields:
             if key not in explicit:
                 continue
-            if key in declared and (
-                not apply_declared_to_non_diffusion or types[comprehension_stage_index] == "diffusion"
-            ):
+            if key in declared:
                 continue
             if types[comprehension_stage_index] == "diffusion" and key in sampling_fields:
                 continue
@@ -309,7 +323,7 @@ def compile_diffusion_chat_request_plan(
                     comprehension_stage_index,
                     key,
                     value,
-                    root_by_key[source_key][1],
+                    serving_by_key[source_key][1],
                     target="extra_args",
                 )
 
@@ -366,8 +380,8 @@ def compile_diffusion_chat_request_plan(
     controls.update(
         {key: _parse(key, value) for key, value in (("height", height), ("width", width)) if value is not None}
     )
-    if "lora" in root_by_key and root_by_key["lora"][0] is not None:
-        value, source = root_by_key["lora"]
+    if "lora" in serving_by_key and serving_by_key["lora"][0] is not None:
+        value, source = serving_by_key["lora"]
         try:
             lora_request, lora_scale = parse_lora_request(value)
         except (TypeError, ValueError, OverflowError) as exc:
