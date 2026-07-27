@@ -3,7 +3,7 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -26,9 +26,8 @@ from vllm.entrypoints.chat_utils import (
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.diffusion_request_utils import (
-    DiffusionChatRequestPlan,
-    compile_diffusion_chat_request_plan,
-    resolve_diffusion_chat_request_context,
+    apply_normalized_diffusion_request_extra_args,
+    normalize_diffusion_request_extra_args,
 )
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
@@ -103,7 +102,10 @@ from vllm.utils.collection_utils import as_list
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
-from vllm_omni.entrypoints.openai.image_api_utils import encode_image_base64_with_compression
+from vllm_omni.entrypoints.openai.image_api_utils import (
+    encode_image_base64_with_compression,
+    validate_layered_layers,
+)
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import (
     DEFAULT_AUDIO_FORMAT,
@@ -160,6 +162,26 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     _supported_speakers: set[str] | None = None
     _diffusion_extra_body_params: frozenset[str] | None = None
     _diffusion_extra_output_params: frozenset[str] | None = None
+    # Common fields stay at the request root, but still participate in
+    # conflicts with model-specific compatibility forms.
+    _diffusion_common_root_fields = frozenset(
+        {
+            "height",
+            "width",
+            "num_outputs_per_prompt",
+            "seed",
+            "num_inference_steps",
+            "guidance_scale",
+            "true_cfg_scale",
+            "cfg_scale",
+            "num_frames",
+            "guidance_scale_2",
+            "layers",
+            "resolution",
+        }
+    )
+    _diffusion_root_field_aliases = {"cfg_scale": "true_cfg_scale"}
+
     # Harmony flag (always False for vllm-omni models)
     use_harmony: bool = False
 
@@ -298,11 +320,49 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         self._diffusion_extra_body_params = params
         return params
 
-    def _serves_diffusion_requests(self) -> bool:
-        if self._diffusion_mode:
-            return True
-        stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
-        return any(get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs)
+    def _normalize_diffusion_request_extra_args(
+        self,
+        request: ChatCompletionRequest,
+    ) -> dict[str, object]:
+        root, nested = self._split_diffusion_request_extra_body(request)
+        explicit = getattr(request, "model_fields_set", None)
+        if explicit is None:
+            explicit = getattr(request, "__fields_set__", ())
+        explicit = set(explicit)
+
+        common = self._diffusion_common_root_fields
+        declared = self._get_diffusion_extra_body_params() - common
+        root_declared = {
+            key: getattr(request, key, root.get(key)) for key in declared if key in explicit or key in root
+        }
+        nested_declared = {key: nested[key] for key in declared if key in nested}
+        return normalize_diffusion_request_extra_args(
+            provided_root_fields=(set(root) | explicit) & common,
+            root_extra_args=root_declared,
+            extra_args=root.get("extra_args"),
+            extra_params=root.get("extra_params"),
+            nested_provided_root_fields=set(nested) & common,
+            nested_root_extra_args=nested_declared,
+            nested_extra_args=nested.get("extra_args"),
+            nested_extra_params=nested.get("extra_params"),
+            root_field_aliases=self._diffusion_root_field_aliases,
+        )
+
+    @staticmethod
+    def _split_diffusion_request_extra_body(
+        request: ChatCompletionRequest,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        root = dict(request.model_extra or {})
+        nested_value = root.pop("extra_body", None)
+        if nested_value is None:
+            nested_value = getattr(request, "extra_body", None)
+        if nested_value is None:
+            return root, {}
+        if not isinstance(nested_value, Mapping):
+            raise ValueError("extra_body must be a JSON object.")
+        if any(not isinstance(key, str) for key in nested_value):
+            raise ValueError("extra_body must be a JSON object with string keys.")
+        return root, dict(nested_value)
 
     def _get_diffusion_extra_output_params(
         self,
@@ -399,30 +459,22 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
-        diffusion_plan: DiffusionChatRequestPlan | None = None
-        if self._serves_diffusion_requests():
+        stage_configs = getattr(self.engine_client, "stage_configs", ()) or ()
+        serves_diffusion = self._diffusion_mode or any(
+            get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs
+        )
+        normalized_extra_args: dict[str, object] = {}
+        if serves_diffusion:
             try:
-                diffusion_context = resolve_diffusion_chat_request_context(
-                    engine_client=self.engine_client,
-                    diffusion_engine=self._diffusion_engine,
-                    diffusion_mode=self._diffusion_mode,
-                    standard_sampling_fields=self._OPENAI_SAMPLING_FIELDS,
-                    declared_extra_fields=self._diffusion_extra_body_params,
-                )
-                self._diffusion_extra_body_params = diffusion_context.declared_extra_fields
-                diffusion_plan = compile_diffusion_chat_request_plan(
-                    request=request,
-                    context=diffusion_context,
-                )
+                normalized_extra_args = self._normalize_diffusion_request_extra_args(request)
             except ValueError as exc:
                 return self._create_error_response(str(exc), status_code=400)
 
         # Handle diffusion mode
         if self._diffusion_mode:
-            assert diffusion_plan is not None
             return await self._create_diffusion_chat_completion(
                 request,
-                diffusion_plan,
+                normalized_extra_args,
                 raw_request,
             )
 
@@ -545,30 +597,27 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Some models will return a list like ["text", None, "audio"], better
         # to strip None in the list
         engine_output_modalities = [x for x in self.engine_client.output_modalities if x is not None]
-        if diffusion_plan is not None and "modalities" in diffusion_plan.controls:
-            output_modalities = diffusion_plan.controls["modalities"]
-        else:
-            output_modalities = getattr(request, "modalities", engine_output_modalities)
+        output_modalities = getattr(request, "modalities", engine_output_modalities)
         request.modalities = output_modalities if output_modalities is not None else engine_output_modalities
 
         if not isinstance(request.modalities, list) or not all(isinstance(m, str) for m in request.modalities):
             return self.create_error_response("'modalities' must be a list of strings.")
-        if diffusion_plan is None:
-            allowed_modalities = set(engine_output_modalities)
-            if is_single_stage_diffusion(self.engine_client):
-                allowed_modalities.add("text")
-            unsupported = set(request.modalities) - allowed_modalities
-            if unsupported:
-                return self.create_error_response(
-                    f"Unsupported output modalities {', '.join(sorted(unsupported))} for this model. "
-                    f"Supported modalities: {', '.join(sorted(allowed_modalities))}",
-                )
+        allowed_modalities = set(engine_output_modalities)
+        if is_single_stage_diffusion(self.engine_client):
+            allowed_modalities.add("text")
+        unsupported = set(request.modalities) - allowed_modalities
+        if unsupported:
+            return self.create_error_response(
+                f"Unsupported output modalities {', '.join(sorted(unsupported))} for this model. "
+                f"Supported modalities: {', '.join(sorted(allowed_modalities))}",
+            )
 
         if request.modalities and "audio" in request.modalities:
             audio_format_check = self._resolve_audio_format(request)
             if isinstance(audio_format_check, ErrorResponse):
                 return audio_format_check
 
+        num_inference_steps = None
         extra_body: dict[str, Any] = {}
         # Omni multistage image generation: Stage-0 (AR) should receive a clean
         # text prompt (and optional conditioning image/size) so the model's own
@@ -583,15 +632,22 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if not extracted_prompt:
                     return self.create_error_response("No text prompt found in messages")
 
-                if diffusion_plan is None:
-                    # No configured stage serves diffusion in this legacy branch.
-                    extra_body = getattr(request, "extra_body", None) or request.model_extra or {}
-                    height, width = self._resolve_height_width_from_extra_body(extra_body)
-                    negative_prompt = extra_body.get("negative_prompt")
-                else:
-                    height = diffusion_plan.controls.get("height")
-                    width = diffusion_plan.controls.get("width")
-                    negative_prompt = diffusion_plan.controls.get("negative_prompt")
+                # [NOTE] When sending request via openai client Python library,
+                #   `extra_body` is flattented and merged into the payload's root.
+                #   These extra fields are accessible via `model_extra` property (from Pydantic base class).
+                #   When sending raw request with curl, no flattening happens. Directly read the `extra_body` dict.
+                extra_body = getattr(request, "extra_body", None) or request.model_extra or {}
+
+                height, width = self._resolve_height_width_from_extra_body(extra_body)
+
+                num_inference_steps = extra_body.get("num_inference_steps")
+                if num_inference_steps is not None:
+                    try:
+                        num_inference_steps = int(num_inference_steps)
+                    except Exception:
+                        num_inference_steps = None
+
+                negative_prompt = extra_body.get("negative_prompt")
                 engine_prompt_image: dict[str, Any] | None = None
                 if reference_images:
                     # Best-effort decode first reference image for i2i.
@@ -641,8 +697,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     }
 
                 engine_prompts = [tprompt]
+                # Store height/width for applying to diffusion stage sampling params later
+                _image_gen_height = height
+                _image_gen_width = width
             except Exception as e:
                 logger.warning("Failed to build image-generation prompt for omni multistage: %s", e)
+                _image_gen_height = None
+                _image_gen_width = None
         elif request.modalities and ("text" in request.modalities) and is_single_stage_diffusion(self.engine_client):
             # Single-stage diffusion text output (img2text / text2text).
             # Build a diffusion-style prompt with modalities=["text"] so the
@@ -669,19 +730,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 engine_prompts = [tprompt]
             except Exception as e:
                 logger.warning("Failed to build text-output prompt for single-stage diffusion: %s", e)
+            _image_gen_height = None
+            _image_gen_width = None
+        else:
+            _image_gen_height = None
+            _image_gen_width = None
 
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
-            for engine_prompt in engine_prompts:
-                if diffusion_plan is None:
-                    raw_sampling_params_list = getattr(request, "sampling_params_list", None)
-                    if raw_sampling_params_list is not None:
-                        sampling_params_list = self._to_sampling_params_list(raw_sampling_params_list)
-                    else:
-                        sampling_params_list = self._build_sampling_params_list_from_request(request)
+            for i, engine_prompt in enumerate(engine_prompts):
+                if hasattr(request, "sampling_params_list"):
+                    sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
                 else:
-                    sampling_params_list = diffusion_plan.clone_sampling_params_list()
+                    # Use standard OpenAI API parameters for comprehension stage
+                    sampling_params_list = self._build_sampling_params_list_from_request(request)
 
                 # If this is a streaming (output) request, coerce cumulative outputs
                 # to delta to ensure emitted outputs are correctly drained. Otherwise
@@ -693,10 +756,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         output_modalities,
                     )
 
-                if diffusion_plan is None:
-                    # Legacy non-diffusion Chat paths still apply model extras
-                    # here. Diffusion plans already contain final stage params.
-                    for sp in sampling_params_list:
+                # Apply user-specified overrides to diffusion stage(s) for image generation
+                for idx, sp in enumerate(sampling_params_list):
+                    if hasattr(sp, "height") and _image_gen_height is not None:
+                        sp.height = _image_gen_height
+                    if hasattr(sp, "width") and _image_gen_width is not None:
+                        sp.width = _image_gen_width
+                    if hasattr(sp, "num_inference_steps") and num_inference_steps is not None:
+                        sp.num_inference_steps = num_inference_steps
+                    if isinstance(sp, OmniDiffusionSamplingParams):
+                        apply_normalized_diffusion_request_extra_args(sp, normalized_extra_args)
+                    else:
                         apply_declared_extra_args(
                             sp,
                             self._get_diffusion_extra_body_params(),
@@ -3391,14 +3461,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     async def _create_diffusion_chat_completion(
         self,
         request: ChatCompletionRequest,
-        diffusion_plan: DiffusionChatRequestPlan,
+        normalized_extra_args: dict[str, object],
         raw_request: Request | None = None,
     ) -> ChatCompletionResponse | ErrorResponse:
         """Generate images via chat completion interface for diffusion models.
 
         Args:
             request: Chat completion request
-            diffusion_plan: Final request controls and typed stage parameters
+            normalized_extra_args: Validated model-specific request arguments
             raw_request: Raw FastAPI request object
 
         Returns:
@@ -3423,13 +3493,51 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 messages
             )
 
-            negative_prompt = diffusion_plan.controls.get("negative_prompt")
+            # Extract generation parameters from extra_body (preferred)
+            # Reference: text_to_image.py and text_to_video.py for supported parameters
+            # [NOTE] When sending request via openai client Python library,
+            #   `extra_body` is flattented and merged into the payload's root.
+            #   These extra fields are accessible via `model_extra` property (from Pydantic base class).
+            #   When sending raw request with curl, no flattening happens. Directly read the `extra_body` dict.
+            extra_body = getattr(request, "extra_body", None)
+            if not extra_body:
+                extra_body = request.model_extra or {}
+
+            # Parse size if provided (supports "1024x1024" format)
+            height, width = self._resolve_height_width_from_extra_body(extra_body)
+
+            # Get request parameters from extra_body.
+            # Avoid hardcoded defaults here — let each pipeline's forward()
+            # method apply its own model-specific default when the user does
+            # not provide a value.
+            num_inference_steps = extra_body.get("num_inference_steps")
+            guidance_scale = extra_body.get("guidance_scale")
+            true_cfg_scale = extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale")
+            seed = extra_body.get("seed")
+            if seed is None:
+                seed = getattr(request, "seed", None)
+            negative_prompt = extra_body.get("negative_prompt")
+            num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
+
+            # Text-to-video parameters (ref: text_to_video.py)
+            num_frames = extra_body.get("num_frames")
+            guidance_scale_2 = extra_body.get("guidance_scale_2")
+            lora_body = extra_body.get("lora")
+
+            # Qwen-Image-Layered parameters
+            layers = extra_body.get("layers")
+            resolution = extra_body.get("resolution")
+            try:
+                layers = validate_layered_layers(layers)
+            except ValueError as exc:
+                return self._create_error_response(str(exc), status_code=400)
 
             logger.info(
-                "Diffusion chat request %s: prompt=%r, ref_images=%d",
+                "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
                 request_id,
                 prompt[:50] + "..." if len(prompt) > 50 else prompt,
                 len(reference_images),
+                {key: value for key, value in extra_body.items() if value is not None},
             )
 
             # Decode reference images if provided
@@ -3447,8 +3555,43 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 "negative_prompt": negative_prompt,
                 "modalities": ["image"],
             }
+            gen_params = OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_outputs_per_prompt=num_outputs_per_prompt,
+                seed=seed,
+            )
+
+            # Only override defaults when the user explicitly provides values
+            if num_inference_steps is not None:
+                gen_params.num_inference_steps = num_inference_steps
+            if guidance_scale is not None:
+                gen_params.guidance_scale = guidance_scale
+            if true_cfg_scale is not None:
+                gen_params.true_cfg_scale = true_cfg_scale
+            apply_normalized_diffusion_request_extra_args(gen_params, normalized_extra_args)
+            if num_frames is not None:
+                gen_params.num_frames = num_frames
+            if guidance_scale_2 is not None:
+                gen_params.guidance_scale_2 = guidance_scale_2
+            if layers is not None:
+                gen_params.layers = layers
+            if resolution is not None:
+                gen_params.resolution = resolution
+
+            # Parse per-request LoRA.
+            if lora_body and isinstance(lora_body, dict):
+                try:
+                    lora_req, lora_scale = parse_lora_request(lora_body)
+                    if lora_req is not None:
+                        gen_params.lora_request = lora_req
+                        if lora_scale is not None:
+                            gen_params.lora_scale = lora_scale
+                except Exception as exc:  # pragma: no cover - safeguard
+                    logger.warning("Failed to parse LoRA request: %s", exc)
+
             # Route text modality for single-stage diffusion (img2text / text2text)
-            requested_modalities = diffusion_plan.controls.get("modalities") or []
+            requested_modalities = extra_body.get("modalities") or []
             is_text_request = "text" in requested_modalities
 
             if is_text_request:
@@ -3476,18 +3619,32 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             status_code=400,
                         )
 
+            if reference_videos:
+                gen_params.extra_args["video_path"] = reference_videos[0]
+            if reference_audios:
+                gen_params.extra_args["audio_path"] = reference_audios[0]
+
             # Generate image or audio (e.g. AudioX) via AsyncOmni
             diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
-            sampling_params_list = diffusion_plan.clone_sampling_params_list()
-            for sampling_params in sampling_params_list:
-                if not isinstance(sampling_params, OmniDiffusionSamplingParams):
+            stage_configs = list(getattr(diffusion_engine, "stage_configs", []) or [])
+            default_sampling_params_list = get_default_sampling_params_list(diffusion_engine)
+            sampling_params_list = build_stage_sampling_params_list(
+                stage_configs,
+                default_sampling_params_list,
+                diffusion_params=gen_params,
+                replace_diffusion_params=True,
+            )
+            for index, (stage_config, sampling_params) in enumerate(zip(stage_configs, sampling_params_list)):
+                if get_stage_type(stage_config) != "diffusion" or index >= len(default_sampling_params_list):
                     continue
-                if reference_videos or reference_audios:
-                    sampling_params.extra_args = dict(sampling_params.extra_args or {})
-                if reference_videos:
-                    sampling_params.extra_args["video_path"] = reference_videos[0]
-                if reference_audios:
-                    sampling_params.extra_args["audio_path"] = reference_audios[0]
+                default_extra_args = getattr(default_sampling_params_list[index], "extra_args", None)
+                if default_extra_args:
+                    sampling_params.extra_args = {
+                        **default_extra_args,
+                        **(getattr(sampling_params, "extra_args", None) or {}),
+                    }
+            if not sampling_params_list:
+                sampling_params_list = [gen_params]
 
             result = None
             async for output in diffusion_engine.generate(
