@@ -268,9 +268,11 @@ def compile_diffusion_chat_request_plan(
                 if height is None:
                     height = parsed_height
                     serving_by_key["height"] = (height, source)
+                    global_values.append(("height", height, source, False))
                 if width is None:
                     width = parsed_width
                     serving_by_key["width"] = (width, source)
+                    global_values.append(("width", width, source, False))
         except ValueError:
             invalid_size = size
 

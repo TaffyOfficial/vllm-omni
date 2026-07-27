@@ -114,7 +114,7 @@ def test_declared_global_none_preserves_mixed_stage_defaults(body: dict[str, obj
 
     ar_params, diffusion_params = plan.clone_sampling_params_list()
     assert ar_params.seed == 7
-    assert "seed" not in ar_params.extra_args
+    assert "seed" not in (ar_params.extra_args or {})
     assert diffusion_params.extra_args == {"default": True}
 
 
