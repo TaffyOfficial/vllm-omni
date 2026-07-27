@@ -49,6 +49,7 @@ from vllm_omni.config.stage_config import (
     _resolve_scheduler,
     _scheduler_path,
     _select_processor_funcs,
+    build_diffusion_stage_runtime_overrides,
     build_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
@@ -359,7 +360,10 @@ def _stage_cli_overrides(
     *,
     execution_type: StageExecutionType | None = None,
 ) -> dict[str, Any]:
-    runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
+    if execution_type == StageExecutionType.DIFFUSION:
+        runtime_overrides = build_diffusion_stage_runtime_overrides(stage_id, dict(cli_overrides))
+    else:
+        runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
     global_stage_fields = _global_stage_cli_fields()
     owned_fields = None if execution_type is None else _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
     result: dict[str, Any] = {}
@@ -736,7 +740,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             self.world_size = other_parallel_world_size
 
 
-@config(config=ConfigDict(arbitrary_types_allowed=True))
+@config(config=ConfigDict(arbitrary_types_allowed=True, extra="forbid"))
 class _DiffusionConfigProjection:
     """Diffusion-specific per-stage settings.
 
@@ -838,6 +842,8 @@ class _DiffusionConfigProjection:
     kv_transfer_config: KVTransferConfig | None = None
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
+    request_batch_max_wait_ms: float = 0.0
+    streaming_output: bool = False
     quantization_config: _QuantizationConfigType = None
     # Internal provenance, retained across config projection and worker transport.
     quantization_config_is_auto_detected: bool = False
@@ -852,15 +858,15 @@ class _DiffusionConfigProjection:
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> _DiffusionConfigProjection:
-        from vllm_omni.diffusion.data import normalize_omni_diffusion_kwargs
+        from vllm_omni.diffusion.data import normalize_and_validate_omni_diffusion_kwargs
         from vllm_omni.diffusion.offloader.config import parse_diffusion_offload_config
 
-        config_kwargs = normalize_omni_diffusion_kwargs(kwargs)
+        valid_fields = frozenset(f.name for f in fields(cast(Any, cls)))
+        config_kwargs = normalize_and_validate_omni_diffusion_kwargs(kwargs, valid_fields)
         # Validate before stage construction while retaining the raw mapping
         # needed by dataclass/config serialization across process boundaries.
         parse_diffusion_offload_config(config_kwargs.get("diffusion_offload_config"))
-        valid_fields = {f.name for f in fields(cast(Any, cls))}
-        return cls(**{k: v for k, v in config_kwargs.items() if k in valid_fields})
+        return cls(**{name: value for name, value in config_kwargs.items() if value is not None})
 
     def __post_init__(self) -> None:
         # Keep diffusion imports lazy so importing vllm_omni.config does not
@@ -1323,6 +1329,19 @@ def _stage_engine_values(
     topology: StagePipelineConfig,
     stage_cli_overrides: Mapping[str, Any] | None = None,
 ) -> _StageEngineValues:
+    if topology.execution_type == StageExecutionType.DIFFUSION:
+        from vllm_omni.diffusion.data import (
+            normalize_and_validate_omni_diffusion_kwargs,
+            omni_diffusion_engine_input_fields,
+        )
+
+        if stage_deploy is not None:
+            normalize_and_validate_omni_diffusion_kwargs(
+                stage_deploy.engine_extras,
+                omni_diffusion_engine_input_fields() - {"model", "model_arch", "stage_id"},
+                engine_ingress=True,
+                stage_id=topology.stage_id,
+            )
     engine = _stage_engine_overrides(stage_deploy)
     # Preserve legacy ordering: topology-owned KV roles override deploy
     # extras, while an explicit CLI override remains highest priority.
@@ -1343,6 +1362,13 @@ def _stage_engine_values(
                 engine[key] = _get_recursively_merged_dict(existing, dict(value))
             else:
                 engine[key] = _copy_value(value)
+    if topology.execution_type == StageExecutionType.DIFFUSION:
+        engine = normalize_and_validate_omni_diffusion_kwargs(
+            engine,
+            _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS,
+            engine_ingress=True,
+            stage_id=topology.stage_id,
+        )
     _validate_stage_engine_override_ownership(
         topology.stage_id,
         topology.execution_type,
