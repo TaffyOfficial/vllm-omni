@@ -34,6 +34,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_DEFAULT_STAGE_PASSTHROUGH = "default_stage_passthrough"
+
 
 def _normalize_diffusion_alias(
     normalized: dict[str, Any],
@@ -112,9 +114,13 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
     return _normalize_omni_diffusion_kwargs(kwargs, engine_ingress=False)
 
 
-def _omni_diffusion_config_field_names() -> frozenset[str]:
-    """Return the schema-owned diffusion config field names."""
-    return frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
+def _default_diffusion_stage_passthrough_fields() -> frozenset[str]:
+    """Return schema fields explicitly safe for default-stage serialization."""
+    return frozenset(
+        config_field.name
+        for config_field in fields(OmniDiffusionConfig)
+        if config_field.metadata.get(_DEFAULT_STAGE_PASSTHROUGH)
+    )
 
 
 def _normalize_flat_diffusion_parallel_fields(
@@ -131,8 +137,6 @@ def _normalize_flat_diffusion_parallel_fields(
     """
     parallel_fields = frozenset(config_field.name for config_field in fields(DiffusionParallelConfig))
     flat_keys = [name for name in flattened_values if name in parallel_fields]
-    if not flat_keys:
-        return
 
     parallel_config = engine_kwargs.get("parallel_config")
     if parallel_config is None:
@@ -143,6 +147,14 @@ def _normalize_flat_diffusion_parallel_fields(
         parallel_config_dict = {
             name: getattr(parallel_config, name) for name in parallel_fields if hasattr(parallel_config, name)
         }
+
+    if not flat_keys:
+        allgather_degree = parallel_config_dict.get("allgather_degree") or 1
+        sequence_parallel_size = parallel_config_dict.get("sequence_parallel_size")
+        if allgather_degree > 1 and sequence_parallel_size not in (None, allgather_degree):
+            parallel_config_dict["sequence_parallel_size"] = allgather_degree
+            engine_kwargs["parallel_config"] = parallel_config_dict
+        return
 
     moved_value = False
     degree_overridden = False
@@ -158,7 +170,10 @@ def _normalize_flat_diffusion_parallel_fields(
             degree_overridden = True
         parallel_config_dict[name] = value
 
-    if degree_overridden and not sequence_parallel_explicit:
+    allgather_degree = parallel_config_dict.get("allgather_degree") or 1
+    if allgather_degree > 1:
+        parallel_config_dict["sequence_parallel_size"] = allgather_degree
+    elif degree_overridden and not sequence_parallel_explicit:
         ulysses_degree = parallel_config_dict.get("ulysses_degree") or 1
         ring_degree = parallel_config_dict.get("ring_degree") or 1
         parallel_config_dict["sequence_parallel_size"] = ulysses_degree * ring_degree
@@ -772,7 +787,10 @@ class OmniDiffusionConfig:
     # Precedence in the worker: this override > the runner declared by the
     # selected engine class (``default_diffusion_model_runner_cls``) > the
     # platform default. Never mutated by engines.
-    diffusion_model_runner_cls: str | None = None
+    diffusion_model_runner_cls: str | None = field(
+        default=None,
+        metadata={_DEFAULT_STAGE_PASSTHROUGH: True},
+    )
 
     # HuggingFace specific parameters
     trust_remote_code: bool = False

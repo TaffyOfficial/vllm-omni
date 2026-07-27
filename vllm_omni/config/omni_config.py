@@ -770,15 +770,18 @@ def _stage_engine_values(
     stage_cli_overrides: Mapping[str, Any] | None = None,
 ) -> _StageEngineValues:
     engine = _stage_engine_overrides(stage_deploy)
-    if stage_cli_overrides:
-        engine.update(_copy_value(stage_cli_overrides))
+    runtime_overrides = _copy_value(stage_cli_overrides) if stage_cli_overrides else {}
 
     if execution_type == StageExecutionType.DIFFUSION:
         from vllm_omni.diffusion.data import (
+            _normalize_flat_diffusion_parallel_fields,
             _validate_normalized_diffusion_kwargs,
             normalize_omni_diffusion_engine_kwargs,
         )
 
+        _normalize_flat_diffusion_parallel_fields(engine, engine, overwrite=False)
+        _normalize_flat_diffusion_parallel_fields(engine, runtime_overrides, overwrite=True)
+        engine.update(runtime_overrides)
         engine = normalize_omni_diffusion_engine_kwargs(engine)
         shared_engine_fields = _omni_engine_arg_fields()
         _validate_normalized_diffusion_kwargs(
@@ -788,6 +791,7 @@ def _stage_engine_values(
         )
         shared_engine_args = _select_engine_overrides(engine, shared_engine_fields - _KNOWN_STAGE_ENGINE_FIELDS)
     else:
+        engine.update(runtime_overrides)
         shared_engine_args = {}
 
     return _StageEngineValues(

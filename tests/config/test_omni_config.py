@@ -41,7 +41,7 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
 )
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.engine.stage_init_utils import (
     _strict_diffusion_config_kwargs,
     build_diffusion_config,
@@ -1115,6 +1115,61 @@ def test_nested_none_parallel_field_has_legacy_structured_parity(monkeypatch):
     assert structured_stage.parallel_config.vae_parallel_mode == "spatial_shard_height"
 
 
+def test_flat_parallel_cli_override_has_legacy_structured_parity():
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    deploy = DeployConfig(
+        async_chunk=False,
+        stages=[
+            StageDeployConfig(
+                stage_id=0,
+                engine_extras={"parallel_config": {"vae_parallel_mode": "tile"}},
+            )
+        ],
+    )
+    cli_overrides = {"stage_0_vae_parallel_mode": "spatial_shard_height"}
+    legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0]
+    legacy_stage.runtime_overrides = StageConfigFactory._merge_cli_overrides(legacy_stage, cli_overrides)
+    legacy_config = legacy_stage.to_omegaconf()
+    structured_stage = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
+        cli_overrides=cli_overrides,
+    ).stage_by_id(0)
+
+    assert legacy_config.engine_args.parallel_config.vae_parallel_mode == "spatial_shard_height"
+    assert structured_stage.parallel_config.vae_parallel_mode == "spatial_shard_height"
+
+
+def test_allgather_sequence_size_derivation_has_legacy_structured_parity(monkeypatch):
+    from vllm_omni.engine import stage_init_utils
+
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    deploy = DeployConfig(
+        async_chunk=False,
+        stages=[
+            StageDeployConfig(
+                stage_id=0,
+                engine_extras={
+                    "parallel_config": {
+                        "sequence_parallel_size": 99,
+                        "allgather_degree": 2,
+                    }
+                },
+            )
+        ],
+    )
+    legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
+    structured_stage = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
+    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 2)
+
+    legacy_config = build_diffusion_config("unused", legacy_stage, extract_stage_metadata(legacy_stage))
+
+    assert legacy_config.parallel_config.sequence_parallel_size == 2
+    assert structured_stage.parallel_config.sequence_parallel_size == 2
+
+
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
@@ -1171,6 +1226,28 @@ def test_default_diffusion_factory_builds_without_orchestrator_only_field(monkey
 
     assert "enable_ar_profiler" not in stage["engine_args"]
     assert config.stage_id == 0
+
+
+def test_default_diffusion_factory_serializes_declared_passthrough_fields(monkeypatch):
+    from vllm_omni.config.yaml_util import create_config
+    from vllm_omni.engine import stage_init_utils
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+    from vllm_omni.entrypoints.utils import _convert_dataclasses_to_dict
+
+    stage = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "diffusion_model_runner_cls": "example.Runner",
+            "tf_model_config": TransformerConfig(),
+        }
+    )[0]
+    stage_config = create_config(_convert_dataclasses_to_dict([stage]))[0]
+    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
+
+    config = build_diffusion_config("unused", stage_config, extract_stage_metadata(stage_config))
+
+    assert "tf_model_config" not in stage["engine_args"]
+    assert config.diffusion_model_runner_cls == "example.Runner"
+    assert isinstance(config.tf_model_config, TransformerConfig)
 
 
 @pytest.mark.parametrize(

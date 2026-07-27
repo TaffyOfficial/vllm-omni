@@ -38,7 +38,7 @@ from vllm_omni.config.stage_config import (
 )
 from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
-    _omni_diffusion_config_field_names,
+    _default_diffusion_stage_passthrough_fields,
     normalize_omni_diffusion_engine_kwargs,
     parse_attention_config,
 )
@@ -1060,7 +1060,7 @@ class AsyncOmniEngine:
                 else {}
             ),
         }
-        for name in _omni_diffusion_config_field_names() - stage_engine_args.keys():
+        for name in _default_diffusion_stage_passthrough_fields() - stage_engine_args.keys():
             if kwargs.get(name) is not None:
                 stage_engine_args[name] = kwargs[name]
 
