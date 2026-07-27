@@ -50,6 +50,8 @@ def build_stage_runtime_overrides(
     cli_overrides: dict[str, Any],
     *,
     internal_keys: set[str] | frozenset[str] | None = None,
+    excluded_global_keys: set[str] | frozenset[str] = frozenset(),
+    allowed_stage_keys: set[str] | frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Build per-stage runtime overrides from global and ``stage_<id>_*`` kwargs.
 
@@ -74,17 +76,20 @@ def build_stage_runtime_overrides(
     result: dict[str, Any] = {}
 
     for key, value in cli_overrides.items():
-        if value is None or key in internal_keys:
-            continue
-
         match = _STAGE_OVERRIDE_PATTERN.match(key)
         if match is not None:
             override_stage_id = int(match.group(1))
             param_name = match.group(2)
-            if override_stage_id == stage_id and param_name not in internal_keys:
+            if override_stage_id != stage_id or param_name in internal_keys:
+                continue
+            if allowed_stage_keys is not None and param_name not in allowed_stage_keys:
+                raise ValueError(f"Unknown diffusion config field(s) for stage {stage_id}: {param_name!r}")
+            if value is not None:
                 result[param_name] = value
             continue
 
+        if value is None or key in internal_keys or key in excluded_global_keys:
+            continue
         result[key] = value
 
     return result
@@ -411,10 +416,6 @@ class StageDeployConfig:
 
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
-
-    # Modality/service constraints consumed outside the core engine config.
-    max_generated_image_size: int | None = None
-    tts_max_instructions_length: int | None = None
 
     # === Pass-through stage engine fields ===
     # Pass-through stage engine args that are not represented above.
@@ -808,6 +809,27 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
 PIPELINE_WIDE_ENGINE_FIELDS = _PIPELINE_WIDE_ENGINE_FIELDS
 
 
+def diffusion_stage_runtime_override_keys() -> frozenset[str]:
+    """Stage-scoped keys with a real diffusion, path, or runtime consumer."""
+    from vllm_omni.diffusion.data import omni_diffusion_engine_input_fields
+
+    return omni_diffusion_engine_input_fields() | {
+        "devices",
+        "max_batch_size",
+        "model_subdir",
+        "num_replicas",
+    }
+
+
+def diffusion_unconsumed_global_engine_fields() -> frozenset[str]:
+    """Global EngineArgs that do not belong to a diffusion stage."""
+    from vllm_omni.diffusion.data import omni_diffusion_engine_input_fields
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
+
+    shared_engine_fields = frozenset(config_field.name for config_field in fields(OmniEngineArgs))
+    return shared_engine_fields - omni_diffusion_engine_input_fields()
+
+
 def _build_engine_args(
     ps: StagePipelineConfig,
     ds: StageDeployConfig | None,
@@ -821,23 +843,27 @@ def _build_engine_args(
     per-stage StageDeployConfig overrides take precedence when present (e.g.
     ``engine_extras`` can still carry a stage-specific ``dtype``).
     """
+    is_diffusion = ps.execution_type == StageExecutionType.DIFFUSION
+    diffusion_input_fields = diffusion_stage_runtime_override_keys() if is_diffusion else frozenset()
     engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch}
-    if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
+    if is_diffusion and ps.model_arch:
         engine_args.setdefault("model_class_name", ps.model_arch)
-    if ps.engine_output_type:
+    if ps.engine_output_type and not is_diffusion:
         engine_args["engine_output_type"] = ps.engine_output_type
-    if next_stage_proc:
+    if next_stage_proc and not is_diffusion:
         engine_args["custom_process_next_stage_input_func"] = next_stage_proc
     # Subdirectory indirections from StagePipelineConfig (structural, not
     # deployment knobs).  Deploy YAML ``engine_extras`` can still override
     # these per-stage if needed.
     if ps.model_subdir:
         engine_args["model_subdir"] = ps.model_subdir
-    if ps.tokenizer_subdir:
+    if ps.tokenizer_subdir and not is_diffusion:
         engine_args["tokenizer_subdir"] = ps.tokenizer_subdir
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:
+        if is_diffusion and name not in diffusion_input_fields:
+            continue
         value = getattr(deploy, name)
         if value is not None:
             engine_args[name] = value
@@ -851,7 +877,8 @@ def _build_engine_args(
         engine_args.update(ds.engine_extras)
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
-    engine_args["async_chunk"] = bool(deploy.async_chunk)
+    if not is_diffusion:
+        engine_args["async_chunk"] = bool(deploy.async_chunk)
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     return engine_args
@@ -929,7 +956,7 @@ def merge_pipeline_deploy(
         engine_args = _build_engine_args(ps, ds, pipeline, deploy, next_stage_proc)
         # Downstream stages may share a multimodal wrapper class without owning
         # an encoder. Do not make vLLM profile dummy multimodal inputs for them.
-        if not ps.requires_multimodal_data:
+        if not ps.requires_multimodal_data and ps.execution_type != StageExecutionType.DIFFUSION:
             engine_args.setdefault("skip_mm_profiling", True)
         sched_cls = _resolve_scheduler(
             ps.execution_type,

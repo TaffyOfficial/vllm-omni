@@ -4,7 +4,8 @@
 import copy
 import os
 import random
-from collections.abc import Callable, Mapping
+import warnings
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -34,37 +35,68 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalize legacy diffusion kwargs before config construction."""
+_DIFFUSION_ENGINE_COMPAT_FIELDS = frozenset(
+    {
+        "auxiliary_text_encoder",
+        "diffusion_attention_backend",
+        "diffusion_quantization_config",
+        "kv_cache_skip_layers",
+        "kv_cache_skip_steps",
+        "quantization",
+        "static_lora_scale",
+    }
+)
+
+
+def _normalize_diffusion_alias(
+    normalized: dict[str, Any],
+    legacy_name: str,
+    canonical_name: str,
+    *,
+    deprecated: bool,
+) -> None:
+    legacy_value = normalized.pop(legacy_name, None)
+    if legacy_value is None:
+        return
+
+    if normalized.get(canonical_name) is not None:
+        raise ValueError(f"Diffusion config fields {legacy_name!r} and {canonical_name!r} cannot be provided together.")
+
+    if deprecated:
+        warnings.warn(
+            f"Diffusion config field {legacy_name!r} is deprecated; use {canonical_name!r} instead.",
+            FutureWarning,
+            stacklevel=3,
+        )
+    normalized[canonical_name] = legacy_value
+
+
+def _normalize_omni_diffusion_kwargs(
+    kwargs: Mapping[str, Any],
+    *,
+    engine_ingress: bool,
+) -> dict[str, Any]:
     normalized = dict(kwargs)
 
-    # Backwards-compatibility: older callers may use a diffusion-specific
-    # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale".
-    if "static_lora_scale" in normalized:
-        if "lora_scale" not in normalized:
-            normalized["lora_scale"] = normalized["static_lora_scale"]
-        normalized.pop("static_lora_scale", None)
-
-    # Backwards-compatibility: map "quantization" to "quantization_config"
-    # so callers using the old field name still work.
-    if "quantization" in normalized and normalized.get("quantization_config", None) is None:
-        normalized["quantization_config"] = normalized.pop("quantization")
-    else:
-        normalized.pop("quantization", None)
-
-    # Renamed from kv_cache_* to avoid clashing with vLLM's --kv-cache-dtype.
-    if normalized.get("diffusion_kv_cache_dtype") is None and "kv_cache_dtype" in normalized:
-        normalized["diffusion_kv_cache_dtype"] = normalized.pop("kv_cache_dtype")
-    else:
-        normalized.pop("kv_cache_dtype", None)
-    if normalized.get("diffusion_kv_cache_skip_steps") is None and "kv_cache_skip_steps" in normalized:
-        normalized["diffusion_kv_cache_skip_steps"] = normalized.pop("kv_cache_skip_steps")
-    else:
-        normalized.pop("kv_cache_skip_steps", None)
-    if normalized.get("diffusion_kv_cache_skip_layers") is None and "kv_cache_skip_layers" in normalized:
-        normalized["diffusion_kv_cache_skip_layers"] = normalized.pop("kv_cache_skip_layers")
-    else:
-        normalized.pop("kv_cache_skip_layers", None)
+    aliases = [
+        ("static_lora_scale", "lora_scale", True),
+        ("kv_cache_skip_steps", "diffusion_kv_cache_skip_steps", False),
+        ("kv_cache_skip_layers", "diffusion_kv_cache_skip_layers", False),
+    ]
+    if not engine_ingress:
+        aliases.extend(
+            [
+                ("quantization", "quantization_config", True),
+                ("kv_cache_dtype", "diffusion_kv_cache_dtype", False),
+            ]
+        )
+    for legacy_name, canonical_name, deprecated in aliases:
+        _normalize_diffusion_alias(
+            normalized,
+            legacy_name,
+            canonical_name,
+            deprecated=deprecated,
+        )
 
     # Handle "diffusion_attention_backend" shorthand: merge into
     # diffusion_attention_config before field filtering.
@@ -88,6 +120,101 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
             normalized[key] = {}
 
     return normalized
+
+
+def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize direct diffusion-config kwargs before construction."""
+    return _normalize_omni_diffusion_kwargs(kwargs, engine_ingress=False)
+
+
+def _normalize_flat_diffusion_parallel_fields(
+    engine_kwargs: dict[str, Any],
+    flattened_values: dict[str, Any],
+    *,
+    overwrite: bool,
+) -> None:
+    """Move flat diffusion parallel fields into ``parallel_config``."""
+    parallel_fields = frozenset(config_field.name for config_field in fields(DiffusionParallelConfig))
+    flat_keys = [name for name in flattened_values if name in parallel_fields]
+
+    parallel_config = engine_kwargs.get("parallel_config")
+    if parallel_config is None:
+        parallel_config_dict: dict[str, Any] = {}
+    elif isinstance(parallel_config, Mapping):
+        parallel_config_dict = dict(parallel_config)
+    else:
+        parallel_config_dict = {
+            name: getattr(parallel_config, name) for name in parallel_fields if hasattr(parallel_config, name)
+        }
+
+    moved_value = False
+    degree_overridden = False
+    sequence_parallel_explicit = flattened_values.get("sequence_parallel_size") is not None or (
+        not overwrite and parallel_config_dict.get("sequence_parallel_size") is not None
+    )
+    for name in flat_keys:
+        value = flattened_values.pop(name)
+        if value is None or (not overwrite and parallel_config_dict.get(name) is not None):
+            continue
+        moved_value = True
+        if name in {"ulysses_degree", "ring_degree", "allgather_degree"}:
+            degree_overridden = True
+        parallel_config_dict[name] = value
+
+    if degree_overridden and not sequence_parallel_explicit:
+        allgather_degree = parallel_config_dict.get("allgather_degree") or 1
+        ulysses_degree = parallel_config_dict.get("ulysses_degree") or 1
+        ring_degree = parallel_config_dict.get("ring_degree") or 1
+        parallel_config_dict["sequence_parallel_size"] = (
+            allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
+        )
+
+    if parallel_config is not None or moved_value:
+        engine_kwargs["parallel_config"] = parallel_config_dict
+
+
+def normalize_omni_diffusion_engine_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize stage-engine ingress before diffusion payload validation."""
+    normalized = _normalize_omni_diffusion_kwargs(kwargs, engine_ingress=True)
+    _normalize_flat_diffusion_parallel_fields(normalized, normalized, overwrite=False)
+
+    quantization_sources = [
+        (name, normalized.pop(name, None)) for name in ("diffusion_quantization_config", "quantization")
+    ]
+    quantization_sources.append(("quantization_config", normalized.get("quantization_config")))
+    provided_quantization = [(name, value) for name, value in quantization_sources if value is not None]
+    if len(provided_quantization) > 1:
+        names = " and ".join(repr(name) for name, _ in provided_quantization)
+        raise ValueError(f"Diffusion engine fields {names} cannot be provided together.")
+    if provided_quantization:
+        normalized["quantization_config"] = provided_quantization[0][1]
+
+    auxiliary_text_encoder = normalized.pop("auxiliary_text_encoder", None)
+    if auxiliary_text_encoder is not None:
+        extras = dict(normalized.get("extras") or {})
+        if extras.get("auxiliary_text_encoder") is not None:
+            raise ValueError(
+                "Diffusion engine field 'auxiliary_text_encoder' cannot be "
+                "provided both at the top level and in 'extras'."
+            )
+        extras["auxiliary_text_encoder"] = auxiliary_text_encoder
+        normalized["extras"] = extras
+
+    return normalized
+
+
+def _validate_normalized_diffusion_kwargs(
+    kwargs: Mapping[str, Any],
+    allowed_fields: Collection[str],
+    *,
+    stage_id: int | str | None = None,
+) -> None:
+    """Reject keys left without an owner after ingress normalization."""
+    unknown = sorted(set(kwargs) - set(allowed_fields))
+    if unknown:
+        names = ", ".join(repr(name) for name in unknown)
+        resolved_stage_id = kwargs.get("stage_id", "unknown") if stage_id is None else stage_id
+        raise ValueError(f"Unknown diffusion config field(s) for stage {resolved_stage_id}: {names}")
 
 
 def parse_kv_cache_skip_selector(
@@ -1235,14 +1362,20 @@ class OmniDiffusionConfig:
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
-        kwargs = normalize_omni_diffusion_kwargs(kwargs)
+        normalized = normalize_omni_diffusion_kwargs(kwargs)
+        valid_fields = frozenset(config_field.name for config_field in fields(cls))
+        _validate_normalized_diffusion_kwargs(normalized, valid_fields)
+        return cls(**{name: value for name, value in normalized.items() if value is not None})
 
-        # Filter kwargs to only include valid fields
-        valid_fields = {f.name for f in fields(cls)}
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
 
-        instance = cls(**filtered_kwargs)
-        return instance
+def omni_diffusion_engine_input_fields() -> frozenset[str]:
+    """Fields with a diffusion-stage consumer before startup validation."""
+    direct_only_fields = {"cfg_kv_collect_func", "scheduler_port"}
+    return (
+        frozenset(config_field.name for config_field in fields(OmniDiffusionConfig)) - direct_only_fields
+        | frozenset(config_field.name for config_field in fields(DiffusionParallelConfig))
+        | _DIFFUSION_ENGINE_COMPAT_FIELDS
+    )
 
 
 @dataclass

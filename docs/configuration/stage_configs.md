@@ -32,7 +32,7 @@ Note: for diffusion path, `distributed_executor_backend` currently defaults to
 
 ### Stage fields
 
-Each entry under `stages:` accepts any `StageDeployConfig` field directly (no nested `engine_args:`). Only fields whose value legitimately varies across stages live here; pipeline-wide settings (trust_remote_code, distributed_executor_backend, dtype, quantization, prefix/chunked prefill, DP/PP sizes) are declared at the top level and applied to every stage. Unknown keys fall through to `engine_extras:` and are forwarded to the engine.
+Each entry under `stages:` accepts any `StageDeployConfig` field directly (no nested `engine_args:`). Only fields whose value legitimately varies across stages live here; pipeline-wide settings (trust_remote_code, distributed_executor_backend, dtype, quantization, prefix/chunked prefill, DP/PP sizes) are declared at the top level and applied to every stage. Unknown keys fall through to `engine_extras:`. AR and generation stages forward those extras to their engine. Diffusion stages use a closed config schema and reject extras that are not owned by a shared, stage, or diffusion config field.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -48,7 +48,7 @@ Each entry under `stages:` accepts any `StageDeployConfig` field directly (no ne
 | `output_connectors` | dict \| null | optional | `null` | Keyed by `to_stage_<n>`; values are names registered under top-level `connectors:`. |
 | `input_connectors` | dict \| null | optional | `null` | Keyed by `from_stage_<n>`; values are names registered under top-level `connectors:`. |
 | `default_sampling_params` | dict \| null | optional | `null` | Baseline sampling params. Deep-merged with pipeline `sampling_constraints` (pipeline wins). |
-| `engine_extras` | dict | optional | `{}` | Catch-all for keys not listed above; deep-merged across overlays. Also carries per-stage overrides of pipeline-wide settings (e.g. stage-specific `dtype`). |
+| `engine_extras` | dict | optional | `{}` | Deep-merged across overlays. AR and generation stages may use it for unmodeled engine arguments. Diffusion stages accept only known shared, stage, compatibility, or diffusion config fields; unknown keys fail validation instead of being silently ignored. It may also carry per-stage overrides of pipeline-wide settings (e.g. stage-specific `dtype`). |
 
 ### Connector schema
 

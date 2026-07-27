@@ -15,7 +15,7 @@ import os
 import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
@@ -25,7 +25,11 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    OmniDiffusionConfig,
+    _validate_normalized_diffusion_kwargs,
+    normalize_omni_diffusion_engine_kwargs,
+)
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
@@ -713,7 +717,7 @@ def build_engine_args_dict(
     # Stage id must come from stage config instead of inherited CLI kwargs
     # (e.g. `--stage-id` defaulting to None).
     engine_args_dict["stage_id"] = stage_id
-    if engine_args_dict.get("async_chunk", False):
+    if stage_type != "diffusion" and engine_args_dict.get("async_chunk", False):
         engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
 
     if stage_type == "diffusion":
@@ -735,8 +739,9 @@ def build_engine_args_dict(
         engine_args_dict.setdefault("enable_prefix_caching", False)
 
     # Check whether the stage's default_sampling_params defines extra_args.
-    default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
-    engine_args_dict["has_sampling_extra_args"] = bool(default_sp.get("extra_args"))
+    if stage_type != "diffusion":
+        default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
+        engine_args_dict["has_sampling_extra_args"] = bool(default_sp.get("extra_args"))
 
     # TODO: Remove this after the performance regression is fixed
     # Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni to avoid performance regression
@@ -1076,6 +1081,36 @@ def get_stage_connector_spec(
     return {}
 
 
+_DIFFUSION_STAGE_METADATA_FIELDS = frozenset(
+    {
+        "async_chunk",
+        "hf_config_name",
+        "model_stage",
+        "scheduler_cls",
+        "stage_connector_spec",
+        "worker_type",
+    }
+)
+
+
+def _strict_diffusion_config_kwargs(engine_args: dict[str, Any]) -> dict[str, Any]:
+    """Return the normalized, diffusion-owned part of mixed stage arguments."""
+    from vllm_omni.config.omni_config import _KNOWN_STAGE_ENGINE_FIELDS
+
+    stage_id = engine_args.get("stage_id", "unknown")
+    owned_stage_args = {
+        name: value for name, value in engine_args.items() if name not in _DIFFUSION_STAGE_METADATA_FIELDS
+    }
+    normalized = normalize_omni_diffusion_engine_kwargs(owned_stage_args)
+    diffusion_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
+    _validate_normalized_diffusion_kwargs(
+        normalized,
+        diffusion_fields | _KNOWN_STAGE_ENGINE_FIELDS,
+        stage_id=stage_id,
+    )
+    return {name: value for name, value in normalized.items() if name in diffusion_fields and value is not None}
+
+
 def build_diffusion_config(
     model: str,
     stage_cfg: Any,
@@ -1084,7 +1119,7 @@ def build_diffusion_config(
     """Build diffusion config for a stage."""
 
     engine_args_dict = build_engine_args_dict(stage_cfg, model)
-    od_config = OmniDiffusionConfig.from_kwargs(**engine_args_dict)
+    od_config = OmniDiffusionConfig.from_kwargs(**_strict_diffusion_config_kwargs(engine_args_dict))
 
     num_devices_per_stage = od_config.parallel_config.world_size
     device_control_env = current_omni_platform.device_control_env_var

@@ -26,6 +26,8 @@ from vllm_omni.config.stage_config import (
     StageConfig,
     StageType,
     build_stage_runtime_overrides,
+    diffusion_stage_runtime_override_keys,
+    diffusion_unconsumed_global_engine_fields,
     load_deploy_config,
     merge_pipeline_deploy,
 )
@@ -395,10 +397,8 @@ class StageConfigFactory:
         # Overlay declarative parallel strategies (opt-in) before CLI overrides.
         applied = cls._apply_strategy_specs(stages, strategy_specs)
 
-        explicit_overrides = {k: v for k, v in cli_overrides.items() if v is not None}
-
         for stage in stages:
-            stage.runtime_overrides = cls._merge_cli_overrides(stage, explicit_overrides)
+            stage.runtime_overrides = cls._merge_cli_overrides(stage, cli_overrides)
 
         # Re-validate the resolved layout now that CLI overrides are on top.
         cls._reconcile_strategy_with_cli(stages, applied)
@@ -553,7 +553,6 @@ class StageConfigFactory:
                 engine_args["parallel_config"] = parallel_config
 
         engine_args.setdefault("cache_backend", "none")
-        engine_args["model_stage"] = "diffusion"
 
         # Convert dtype to string for OmegaConf
         if "dtype" in engine_args:
@@ -563,6 +562,7 @@ class StageConfigFactory:
 
         config_dict: dict[str, Any] = {
             "stage_id": 0,
+            "model_stage": "diffusion",
             "stage_type": StageType.DIFFUSION.value,
             "runtime": {
                 "process": True,
@@ -588,4 +588,11 @@ class StageConfigFactory:
         server/uvicorn keys are dropped downstream by
         ``filter_dataclass_kwargs(OmniEngineArgs, ...)``.
         """
+        if StageType(stage.stage_type) == StageType.DIFFUSION:
+            return build_stage_runtime_overrides(
+                stage.stage_id,
+                cli_overrides,
+                excluded_global_keys=diffusion_unconsumed_global_engine_fields(),
+                allowed_stage_keys=diffusion_stage_runtime_override_keys(),
+            )
         return build_stage_runtime_overrides(stage.stage_id, cli_overrides)
