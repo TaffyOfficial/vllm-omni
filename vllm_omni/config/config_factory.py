@@ -26,6 +26,7 @@ from vllm_omni.config.stage_config import (
     StageConfig,
     StageType,
     build_stage_runtime_overrides,
+    diffusion_unconsumed_global_engine_fields,
     load_deploy_config,
     merge_pipeline_deploy,
 )
@@ -588,4 +589,13 @@ class StageConfigFactory:
         server/uvicorn keys are dropped downstream by
         ``filter_dataclass_kwargs(OmniEngineArgs, ...)``.
         """
-        return build_stage_runtime_overrides(stage.stage_id, cli_overrides)
+        excluded_global_keys = (
+            diffusion_unconsumed_global_engine_fields()
+            if StageType(stage.stage_type) == StageType.DIFFUSION
+            else frozenset()
+        )
+        return build_stage_runtime_overrides(
+            stage.stage_id,
+            cli_overrides,
+            excluded_global_keys=excluded_global_keys,
+        )

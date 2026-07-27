@@ -1084,10 +1084,9 @@ def _strict_diffusion_config_kwargs(engine_args: dict[str, Any]) -> dict[str, An
     """Return the diffusion-owned startup payload and reject unowned keys."""
     normalized = normalize_omni_diffusion_engine_kwargs(engine_args)
     diffusion_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
-    shared_engine_fields = frozenset(config_field.name for config_field in fields(OmniEngineArgs))
     _validate_normalized_diffusion_kwargs(
         normalized,
-        diffusion_fields | shared_engine_fields,
+        diffusion_fields,
     )
     return {name: value for name, value in normalized.items() if name in diffusion_fields and value is not None}
 

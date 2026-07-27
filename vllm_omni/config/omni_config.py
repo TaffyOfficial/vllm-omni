@@ -37,6 +37,7 @@ from vllm_omni.config.stage_config import (
     _scheduler_path,
     _select_processor_funcs,
     build_stage_runtime_overrides,
+    diffusion_unconsumed_global_engine_fields,
     load_deploy_config,
 )
 
@@ -140,7 +141,6 @@ class _StageEngineValues:
     runtime: _RuntimeEngineOverrides
     parallel: _ParallelEngineOverrides
     diffusion: _DiffusionEngineOverrides
-    shared_engine_args: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -212,8 +212,19 @@ def _resolve_scheduler_path(execution_type: StageExecutionType, async_scheduling
     return _scheduler_path(_resolve_scheduler(execution_type, async_scheduling))
 
 
-def _stage_cli_overrides(stage_id: int, cli_overrides: Mapping[str, Any]) -> dict[str, Any]:
-    runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
+def _stage_cli_overrides(
+    stage_id: int,
+    execution_type: StageExecutionType,
+    cli_overrides: Mapping[str, Any],
+) -> dict[str, Any]:
+    excluded_global_keys = (
+        diffusion_unconsumed_global_engine_fields() if execution_type == StageExecutionType.DIFFUSION else frozenset()
+    )
+    runtime_overrides = build_stage_runtime_overrides(
+        stage_id,
+        dict(cli_overrides),
+        excluded_global_keys=excluded_global_keys,
+    )
     global_stage_fields = _global_stage_cli_fields()
     result: dict[str, Any] = {}
     for key, value in runtime_overrides.items():
@@ -719,16 +730,6 @@ _SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
 _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
 _PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(_ParallelConfigEngineOverrides.__annotations__)
 _PARALLEL_ENGINE_FIELDS = _PARALLEL_CONFIG_ENGINE_FIELDS | {"parallel_config"}
-_KNOWN_STAGE_ENGINE_FIELDS = (
-    _QUANTIZATION_ENGINE_FIELDS
-    | _MODEL_ENGINE_FIELDS
-    | _LOAD_ENGINE_FIELDS
-    | _CACHE_ENGINE_FIELDS
-    | _SCHEDULER_ENGINE_FIELDS
-    | _RUNTIME_ENGINE_FIELDS
-    | _PARALLEL_ENGINE_FIELDS
-    | _DIFFUSION_STAGE_ENGINE_FIELDS
-)
 
 
 def _omni_engine_arg_fields() -> frozenset[str]:
@@ -784,16 +785,13 @@ def _stage_engine_values(
         _apply_diffusion_parallel_runtime_overrides(engine, runtime_overrides)
         engine.update(runtime_overrides)
         engine = normalize_omni_diffusion_engine_kwargs(engine)
-        shared_engine_fields = _omni_engine_arg_fields()
         _validate_normalized_diffusion_kwargs(
             engine,
-            _KNOWN_STAGE_ENGINE_FIELDS | shared_engine_fields,
+            _DIFFUSION_STAGE_ENGINE_FIELDS,
             stage_id=stage_id,
         )
-        shared_engine_args = _select_engine_overrides(engine, shared_engine_fields - _KNOWN_STAGE_ENGINE_FIELDS)
     else:
         engine.update(runtime_overrides)
-        shared_engine_args = {}
 
     return _StageEngineValues(
         quantization=cast(
@@ -810,7 +808,6 @@ def _stage_engine_values(
         runtime=cast(_RuntimeEngineOverrides, _select_engine_overrides(engine, _RUNTIME_ENGINE_FIELDS)),
         parallel=cast(_ParallelEngineOverrides, _select_engine_overrides(engine, _PARALLEL_ENGINE_FIELDS)),
         diffusion=_DiffusionEngineOverrides.from_engine(engine),
-        shared_engine_args=shared_engine_args,
     )
 
 
@@ -866,11 +863,6 @@ class BaseVllmOmniStageConfig:
     runtime_config: OmniStageRuntimeConfig = field(default_factory=OmniStageRuntimeConfig)
     parallel_config: OmniStageParallelConfig = field(default_factory=OmniStageParallelConfig)
     quantization_config: _QuantizationConfigType = None
-
-    @property
-    def shared_engine_args(self) -> dict[str, Any]:
-        """Valid engine args awaiting a dedicated structured owner."""
-        return _copy_value(getattr(self, "_shared_engine_args", {}))
 
     @property
     def stage_id(self) -> int:
@@ -1084,7 +1076,6 @@ def _build_diffusion_stage_config(
         quantization_config=common_kwargs["quantization_config"],
     )
     stage_config = VllmOmniDiffusionStageConfig(**common_kwargs)
-    stage_config._shared_engine_args = _copy_value(engine.shared_engine_args)
     return cast(
         VllmOmniDiffusionStageConfig,
         _with_resolved_processors(
@@ -1330,7 +1321,7 @@ class VllmOmniConfig:
                     deploy_by_id.get(topology.stage_id),
                     topology.execution_type,
                     topology.stage_id,
-                    _stage_cli_overrides(topology.stage_id, cli_overrides),
+                    _stage_cli_overrides(topology.stage_id, topology.execution_type, cli_overrides),
                 ),
                 model=model,
             )

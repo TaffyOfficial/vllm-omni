@@ -36,6 +36,24 @@ logger = init_logger(__name__)
 
 _DEFAULT_STAGE_PASSTHROUGH = "default_stage_passthrough"
 
+_COMMON_DIFFUSION_ALIASES = (
+    ("static_lora_scale", "lora_scale", True),
+    ("kv_cache_skip_steps", "diffusion_kv_cache_skip_steps", False),
+    ("kv_cache_skip_layers", "diffusion_kv_cache_skip_layers", False),
+)
+_DIRECT_DIFFUSION_ALIASES = (
+    ("quantization", "quantization_config", True),
+    ("kv_cache_dtype", "diffusion_kv_cache_dtype", False),
+)
+_ENGINE_DIFFUSION_COMPAT_FIELDS = frozenset(
+    {
+        "auxiliary_text_encoder",
+        "diffusion_attention_backend",
+        "diffusion_quantization_config",
+        "quantization",
+    }
+)
+
 
 def _normalize_diffusion_alias(
     normalized: dict[str, Any],
@@ -70,18 +88,9 @@ def _normalize_omni_diffusion_kwargs(
     engine_ingress: bool,
 ) -> dict[str, Any]:
     normalized = dict(kwargs)
-    aliases = [
-        ("static_lora_scale", "lora_scale", True),
-        ("kv_cache_skip_steps", "diffusion_kv_cache_skip_steps", False),
-        ("kv_cache_skip_layers", "diffusion_kv_cache_skip_layers", False),
-    ]
+    aliases = list(_COMMON_DIFFUSION_ALIASES)
     if not engine_ingress:
-        aliases.extend(
-            [
-                ("quantization", "quantization_config", True),
-                ("kv_cache_dtype", "diffusion_kv_cache_dtype", False),
-            ]
-        )
+        aliases.extend(_DIRECT_DIFFUSION_ALIASES)
     for legacy_name, canonical_name, deprecated in aliases:
         _normalize_diffusion_alias(normalized, legacy_name, canonical_name, deprecated=deprecated)
 
@@ -1383,6 +1392,16 @@ class OmniDiffusionConfig:
         normalized = normalize_omni_diffusion_kwargs(kwargs)
         _validate_normalized_diffusion_kwargs(normalized, (config_field.name for config_field in fields(cls)))
         return cls(**normalized)
+
+
+def omni_diffusion_engine_input_fields() -> frozenset[str]:
+    """Return engine-ingress keys with a diffusion runtime consumer."""
+    return (
+        frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
+        | frozenset(config_field.name for config_field in fields(DiffusionParallelConfig))
+        | frozenset(legacy_name for legacy_name, _, _ in _COMMON_DIFFUSION_ALIASES)
+        | _ENGINE_DIFFUSION_COMPAT_FIELDS
+    )
 
 
 @dataclass

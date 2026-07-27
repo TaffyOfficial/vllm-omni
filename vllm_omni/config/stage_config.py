@@ -50,6 +50,7 @@ def build_stage_runtime_overrides(
     cli_overrides: dict[str, Any],
     *,
     internal_keys: set[str] | frozenset[str] | None = None,
+    excluded_global_keys: set[str] | frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Build per-stage runtime overrides from global and ``stage_<id>_*`` kwargs.
 
@@ -85,9 +86,21 @@ def build_stage_runtime_overrides(
                 result[param_name] = value
             continue
 
+        if key in excluded_global_keys:
+            continue
         result[key] = value
 
     return result
+
+
+@functools.cache
+def diffusion_unconsumed_global_engine_fields() -> frozenset[str]:
+    """Return shared engine fields that no diffusion runtime config consumes."""
+    from vllm_omni.diffusion.data import omni_diffusion_engine_input_fields
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
+
+    shared_engine_fields = frozenset(config_field.name for config_field in fields(OmniEngineArgs))
+    return shared_engine_fields - omni_diffusion_engine_input_fields()
 
 
 def strip_parent_engine_args(
@@ -827,7 +840,9 @@ def _build_engine_args(
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:
         value = getattr(deploy, name)
-        if value is not None:
+        if value is not None and not (
+            ps.execution_type == StageExecutionType.DIFFUSION and name in diffusion_unconsumed_global_engine_fields()
+        ):
             engine_args[name] = value
 
     # Per-stage StageDeployConfig values override pipeline-wide settings.

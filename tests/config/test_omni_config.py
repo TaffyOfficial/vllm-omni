@@ -47,6 +47,7 @@ from vllm_omni.engine.stage_init_utils import (
     build_engine_args_dict,
     extract_stage_metadata,
     get_stage_devices_per_replica,
+    initialize_diffusion_stage,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -963,10 +964,8 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
             "model_config": {"default_robot_embodiment": "test"},
             "diffusion_model_runner_cls": "example.Runner",
         },
-        cli_overrides={"seed": 7, "kv_cache_dtype": "fp8"},
     )
 
-    assert stage.shared_engine_args == {"seed": 7, "kv_cache_dtype": "fp8"}
     assert stage.scheduler_config.max_num_seqs == 2
     assert stage.parallel_config.vae_parallel_mode == "spatial_shard_height"
     assert stage.diffusion_config.engine_backend == "custom.engine.Backend"
@@ -1034,13 +1033,53 @@ def test_omni_diffusion_config_rejects_deprecated_alias_conflicts(legacy_name, c
         OmniDiffusionConfig.from_kwargs(**{legacy_name: value, canonical_name: value})
 
 
-def test_startup_diffusion_payload_keeps_active_vllm_kv_cache_dtype_out_of_diffusion_config():
+def test_startup_diffusion_payload_rejects_unconsumed_shared_engine_field():
     with warnings.catch_warnings():
         warnings.simplefilter("error", FutureWarning)
-        payload = _strict_diffusion_config_kwargs({"kv_cache_dtype": "fp8", "diffusion_kv_cache_dtype": "auto"})
+        with pytest.raises(ValueError, match="kv_cache_dtype"):
+            _strict_diffusion_config_kwargs({"kv_cache_dtype": "fp8", "diffusion_kv_cache_dtype": "auto"})
 
-    assert "kv_cache_dtype" not in payload
-    assert payload["diffusion_kv_cache_dtype"] == "auto"
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("seed", 7),
+        ("kv_cache_dtype", "fp8"),
+    ],
+)
+def test_global_shared_cli_arg_skips_diffusion_but_reaches_llm_stage(field_name, value):
+    from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.config.stage_config import StageConfig, StageType
+
+    diffusion_stage = StageConfig(stage_id=0, model_stage="diffusion", stage_type=StageType.DIFFUSION)
+    llm_stage = StageConfig(stage_id=1, model_stage="thinker", stage_type=StageType.LLM)
+
+    assert field_name not in StageConfigFactory._merge_cli_overrides(diffusion_stage, {field_name: value})
+    assert StageConfigFactory._merge_cli_overrides(llm_stage, {field_name: value})[field_name] == value
+
+
+@pytest.mark.parametrize(
+    ("cli_overrides", "field_name"),
+    [
+        ({"stage_0_seed": 7}, "seed"),
+        ({"stage_0_kv_cache_dtype": "fp8"}, "kv_cache_dtype"),
+    ],
+)
+def test_explicit_diffusion_stage_shared_override_is_rejected(cli_overrides, field_name, monkeypatch):
+    from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.engine import stage_init_utils
+
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    legacy_stage_config = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))[0]
+    legacy_stage_config.runtime_overrides = StageConfigFactory._merge_cli_overrides(
+        legacy_stage_config,
+        cli_overrides,
+    )
+    legacy_stage = legacy_stage_config.to_omegaconf()
+    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
+
+    with pytest.raises(ValueError, match=rf"stage 0.*{field_name}"):
+        build_diffusion_config("unused", legacy_stage, extract_stage_metadata(legacy_stage))
 
 
 @pytest.mark.parametrize(
@@ -1122,6 +1161,53 @@ stages:
     assert get_stage_devices_per_replica(stage) == 2
     assert config.parallel_config.ulysses_degree == 2
     assert config.parallel_config.vae_parallel_mode == "spatial_shard_height"
+
+
+def test_initialize_diffusion_stage_rejects_merged_world_size_before_client_creation(monkeypatch):
+    from vllm_omni.diffusion import stage_diffusion_client
+    from vllm_omni.engine import stage_init_utils
+
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    deploy = DeployConfig(
+        async_chunk=False,
+        data_parallel_size=2,
+        stages=[
+            StageDeployConfig(
+                stage_id=0,
+                engine_extras={"tensor_parallel_size": 2},
+            )
+        ],
+    )
+    stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
+    metadata = extract_stage_metadata(stage)
+    device_env = stage_init_utils.current_omni_platform.device_control_env_var
+    if device_env:
+        monkeypatch.delenv(device_env, raising=False)
+    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 2)
+    monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda self: 29500)
+
+    client_created = False
+
+    def _unexpected_client_creation(*args, **kwargs):
+        nonlocal client_created
+        client_created = True
+        raise AssertionError("create_diffusion_client must not run after capacity validation fails")
+
+    monkeypatch.setattr(stage_diffusion_client, "create_diffusion_client", _unexpected_client_creation)
+
+    with pytest.raises(
+        ValueError,
+        match=r"Stage 0 requires 4 device\(s\).*2 device\(s\) are available: \[0, 1\]",
+    ):
+        initialize_diffusion_stage(
+            stage_id=0,
+            model="unused",
+            stage_cfg=stage,
+            metadata=metadata,
+            stage_init_timeout=1,
+        )
+
+    assert client_created is False
 
 
 def test_explicit_sequence_parallel_size_conflict_has_legacy_structured_parity():
@@ -1333,6 +1419,8 @@ def test_default_diffusion_factory_serializes_declared_passthrough_fields(monkey
     [
         ({"cli_overrides": {"stage_0_enable_sleep_mod": True}}, r"stage 0.*enable_sleep_mod"),
         ({"engine_extras": {"enable_sleep_mod": None}}, r"stage 0.*enable_sleep_mod"),
+        ({"cli_overrides": {"stage_0_seed": 7}}, r"stage 0.*seed"),
+        ({"engine_extras": {"kv_cache_dtype": "fp8"}}, r"stage 0.*kv_cache_dtype"),
     ],
 )
 def test_from_pipeline_config_rejects_invalid_diffusion_sources(build_kwargs, match):
