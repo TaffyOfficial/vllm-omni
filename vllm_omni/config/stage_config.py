@@ -8,7 +8,7 @@ import dataclasses
 import functools
 import re
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
@@ -298,8 +298,9 @@ class StageDeployConfig:
     pipeline live here (e.g. ``max_num_seqs`` on thinker vs talker,
     ``devices`` for GPU placement). Pipeline-wide settings
     (``trust_remote_code``, ``distributed_executor_backend``, ``dtype``,
-    ``quantization``, prefix/chunked prefill, DP/PP sizes) are declared at
-    the top level of ``DeployConfig`` and propagated to every stage.
+    ``quantization``, prefix/chunked prefill, DP/PP sizes, and session-state
+    management) are declared at the top level of ``DeployConfig`` and
+    propagated to every stage.
     """
 
     # === Omni stage wrapper fields ===
@@ -432,9 +433,10 @@ class DeployConfig:
     Top-level fields (``trust_remote_code``, ``distributed_executor_backend``,
     ``dtype``, ``quantization``, ``enable_prefix_caching``,
     ``enable_chunked_prefill``, ``data_parallel_size``,
-    ``pipeline_parallel_size``) are pipeline-wide: they apply uniformly to
-    every stage. Fields that legitimately vary per stage live in the
-    individual ``StageDeployConfig`` entries under ``stages:``.
+    ``pipeline_parallel_size``, ``enable_session_state_manager``) are
+    pipeline-wide: they apply uniformly to every stage. Fields that
+    legitimately vary per stage live in the individual ``StageDeployConfig``
+    entries under ``stages:``.
     """
 
     async_chunk: bool = True
@@ -459,6 +461,7 @@ class DeployConfig:
     data_parallel_size: int | None = None
     pipeline_parallel_size: int | None = None
     custom_voice_dir: str | None = None
+    enable_session_state_manager: bool | None = None
 
 
 _STAGE_RESERVED_KEYS = frozenset(
@@ -652,6 +655,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "data_parallel_size",
         "pipeline_parallel_size",
         "custom_voice_dir",
+        "enable_session_state_manager",
     ):
         if name in raw_dict:
             kwargs[name] = raw_dict[name]
@@ -776,8 +780,20 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "pipeline_parallel_size",
     "active_stream_window",
     "custom_voice_dir",
+    "enable_session_state_manager",
 )
 PIPELINE_WIDE_ENGINE_FIELDS = _PIPELINE_WIDE_ENGINE_FIELDS
+
+
+def _apply_stage_engine_extra_overrides(
+    engine_args: dict[str, Any],
+    engine_extras: Mapping[str, Any],
+) -> None:
+    """Apply stage extras while treating known pipeline-field ``None`` as unset."""
+    for name, value in engine_extras.items():
+        if value is None and name in _PIPELINE_WIDE_ENGINE_FIELDS:
+            continue
+        engine_args[name] = value
 
 
 def _build_engine_args(
@@ -820,7 +836,7 @@ def _build_engine_args(
             if k in _STAGE_RESERVED_KEYS or v is None:
                 continue
             engine_args[k] = v
-        engine_args.update(ds.engine_extras)
+        _apply_stage_engine_extra_overrides(engine_args, ds.engine_extras)
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)

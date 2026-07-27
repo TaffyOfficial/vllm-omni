@@ -166,7 +166,7 @@ def _normalize_flat_diffusion_parallel_fields(
         if value is None or (not overwrite and parallel_config_dict.get(name) is not None):
             continue
         moved_value = True
-        if name in {"ulysses_degree", "ring_degree"}:
+        if name in {"ulysses_degree", "ring_degree", "allgather_degree"}:
             degree_overridden = True
         parallel_config_dict[name] = value
 
@@ -769,7 +769,10 @@ class OmniDiffusionConfig:
     # Default off; the bespoke path remains the default. A *set*
     # OMNI_DIFFUSION_SESSION_STATE_MANAGER environment variable overrides this
     # in both directions. See docs/features/session_state_manager.md.
-    enable_session_state_manager: bool = False
+    enable_session_state_manager: bool = field(
+        default=False,
+        metadata={_DEFAULT_STAGE_PASSTHROUGH: True},
+    )
 
     # Distributed executor backend
     distributed_executor_backend: str = "mp"

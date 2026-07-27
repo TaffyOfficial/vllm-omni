@@ -30,7 +30,9 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
     StageType,
+    _apply_diffusion_parallel_runtime_overrides,
     _apply_platform_overrides,
+    _apply_stage_engine_extra_overrides,
     _resolve_scheduler,
     _scheduler_path,
     _select_processor_funcs,
@@ -464,6 +466,7 @@ class _DiffusionConfigProjection:
     enable_cache_dit_summary: bool = False
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = Field(default=32, ge=1)
+    enable_session_state_manager: bool = False
     diffusion_load_format: str = "default"
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -759,7 +762,7 @@ def _stage_engine_overrides(stage_deploy: StageDeployConfig | None) -> dict[str,
         value = getattr(stage_deploy, name)
         if value is not None:
             overrides[name] = _copy_value(value)
-    overrides.update(_copy_value(stage_deploy.engine_extras))
+    _apply_stage_engine_extra_overrides(overrides, _copy_value(stage_deploy.engine_extras))
     return overrides
 
 
@@ -774,13 +777,11 @@ def _stage_engine_values(
 
     if execution_type == StageExecutionType.DIFFUSION:
         from vllm_omni.diffusion.data import (
-            _normalize_flat_diffusion_parallel_fields,
             _validate_normalized_diffusion_kwargs,
             normalize_omni_diffusion_engine_kwargs,
         )
 
-        _normalize_flat_diffusion_parallel_fields(engine, engine, overwrite=False)
-        _normalize_flat_diffusion_parallel_fields(engine, runtime_overrides, overwrite=True)
+        _apply_diffusion_parallel_runtime_overrides(engine, runtime_overrides)
         engine.update(runtime_overrides)
         engine = normalize_omni_diffusion_engine_kwargs(engine)
         shared_engine_fields = _omni_engine_arg_fields()
@@ -1252,12 +1253,15 @@ def _build_diffusion_config_projection(
         topology.model_arch,
         pipeline.model_arch,
     )
-    if "dtype" not in diffusion_kwargs and deploy.dtype is not None:
-        diffusion_kwargs["dtype"] = _copy_value(deploy.dtype)
-    if "trust_remote_code" not in diffusion_kwargs and deploy.trust_remote_code is not None:
-        diffusion_kwargs["trust_remote_code"] = _copy_value(deploy.trust_remote_code)
-    if "distributed_executor_backend" not in diffusion_kwargs and deploy.distributed_executor_backend is not None:
-        diffusion_kwargs["distributed_executor_backend"] = _copy_value(deploy.distributed_executor_backend)
+    for name in (
+        "dtype",
+        "trust_remote_code",
+        "distributed_executor_backend",
+        "enable_session_state_manager",
+    ):
+        value = getattr(deploy, name)
+        if name not in diffusion_kwargs and value is not None:
+            diffusion_kwargs[name] = _copy_value(value)
     if model is not None:
         diffusion_kwargs["model"] = model
     if quantization_config is not None:

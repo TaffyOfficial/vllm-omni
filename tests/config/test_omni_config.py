@@ -7,7 +7,6 @@ from __future__ import annotations
 import warnings
 from dataclasses import fields
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -190,6 +189,60 @@ def test_from_pipeline_config_normalizes_stage_engine_extras_without_expanding_s
     assert stage.parallel_config.tensor_parallel_size == 1
     assert stage.parallel_config.cfg_parallel_size == 2
     assert stage.diffusion_config.model_config["default_robot_embodiment"] == "roboarena"
+
+
+@pytest.mark.parametrize(
+    ("engine_extras_yaml", "expected"),
+    [
+        pytest.param("", True, id="stage-value-absent"),
+        pytest.param(
+            """\
+    engine_extras:
+      enable_session_state_manager: null
+""",
+            True,
+            id="stage-null-is-unset",
+        ),
+        pytest.param(
+            """\
+    engine_extras:
+      enable_session_state_manager: false
+""",
+            False,
+            id="stage-false-overrides-pipeline-true",
+        ),
+    ],
+)
+def test_session_state_manager_deploy_reaches_legacy_and_structured_configs(
+    tmp_path,
+    monkeypatch,
+    engine_extras_yaml,
+    expected,
+):
+    from vllm_omni.engine import stage_init_utils
+
+    deploy_path = tmp_path / "dreamzero_session_state.yaml"
+    deploy_path.write_text(
+        f"""\
+pipeline: dreamzero
+async_chunk: false
+enable_session_state_manager: true
+stages:
+  - stage_id: 0
+{engine_extras_yaml}"""
+    )
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    deploy = load_deploy_config(deploy_path)
+    legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
+    structured_stage = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
+    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
+    monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda self: 29500)
+
+    legacy_config = build_diffusion_config("unused", legacy_stage, extract_stage_metadata(legacy_stage))
+
+    assert deploy.enable_session_state_manager is True
+    assert legacy_config.enable_session_state_manager is expected
+    assert structured_stage.diffusion_config.enable_session_state_manager is expected
 
 
 def test_from_pipeline_config_applies_cli_overrides_without_stage_config_runtime_bridge():
@@ -1091,7 +1144,74 @@ def test_explicit_sequence_parallel_size_conflict_has_legacy_structured_parity()
         VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
 
 
-def test_nested_none_parallel_field_has_legacy_structured_parity(monkeypatch):
+@pytest.mark.parametrize(
+    (
+        "stage_kwargs",
+        "engine_extras",
+        "cli_overrides",
+        "field_name",
+        "expected",
+        "device_count",
+    ),
+    [
+        pytest.param(
+            {"vae_parallel_mode": "spatial_shard_height"},
+            {"parallel_config": {"vae_parallel_mode": None}},
+            {},
+            "vae_parallel_mode",
+            "spatial_shard_height",
+            1,
+            id="deploy-flat-fills-nested-none",
+        ),
+        pytest.param(
+            {},
+            {"parallel_config": {"vae_parallel_mode": "tile"}},
+            {"stage_0_vae_parallel_mode": "spatial_shard_height"},
+            "vae_parallel_mode",
+            "spatial_shard_height",
+            1,
+            id="cli-flat-overrides-deploy-nested",
+        ),
+        pytest.param(
+            {},
+            {
+                "parallel_config": {
+                    "sequence_parallel_size": 99,
+                    "allgather_degree": 2,
+                }
+            },
+            {},
+            "sequence_parallel_size",
+            2,
+            2,
+            id="allgather-derives-sequence-size",
+        ),
+        pytest.param(
+            {},
+            {
+                "parallel_config": {
+                    "sequence_parallel_size": 2,
+                    "allgather_degree": 2,
+                }
+            },
+            {"stage_0_allgather_degree": 1},
+            "sequence_parallel_size",
+            1,
+            1,
+            id="cli-disables-allgather-and-rederives-sequence-size",
+        ),
+    ],
+)
+def test_diffusion_parallel_source_precedence_has_legacy_structured_parity(
+    monkeypatch,
+    stage_kwargs,
+    engine_extras,
+    cli_overrides,
+    field_name,
+    expected,
+    device_count,
+):
+    from vllm_omni.config.config_factory import StageConfigFactory
     from vllm_omni.engine import stage_init_utils
 
     pipeline = _resolve_pipeline_or_skip("dreamzero")
@@ -1100,74 +1220,29 @@ def test_nested_none_parallel_field_has_legacy_structured_parity(monkeypatch):
         stages=[
             StageDeployConfig(
                 stage_id=0,
-                vae_parallel_mode="spatial_shard_height",
-                engine_extras={"parallel_config": {"vae_parallel_mode": None}},
+                engine_extras=engine_extras,
+                **stage_kwargs,
             )
         ],
     )
-    legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
-    structured_stage = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
-    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
-
-    legacy_config = build_diffusion_config("unused", legacy_stage, extract_stage_metadata(legacy_stage))
-
-    assert legacy_config.parallel_config.vae_parallel_mode == "spatial_shard_height"
-    assert structured_stage.parallel_config.vae_parallel_mode == "spatial_shard_height"
-
-
-def test_flat_parallel_cli_override_has_legacy_structured_parity():
-    from vllm_omni.config.config_factory import StageConfigFactory
-
-    pipeline = _resolve_pipeline_or_skip("dreamzero")
-    deploy = DeployConfig(
-        async_chunk=False,
-        stages=[
-            StageDeployConfig(
-                stage_id=0,
-                engine_extras={"parallel_config": {"vae_parallel_mode": "tile"}},
-            )
-        ],
+    legacy_stage_config = merge_pipeline_deploy(pipeline, deploy)[0]
+    legacy_stage_config.runtime_overrides = StageConfigFactory._merge_cli_overrides(
+        legacy_stage_config,
+        cli_overrides,
     )
-    cli_overrides = {"stage_0_vae_parallel_mode": "spatial_shard_height"}
-    legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0]
-    legacy_stage.runtime_overrides = StageConfigFactory._merge_cli_overrides(legacy_stage, cli_overrides)
-    legacy_config = legacy_stage.to_omegaconf()
+    legacy_stage = legacy_stage_config.to_omegaconf()
     structured_stage = VllmOmniConfig.from_pipeline_config(
         pipeline,
         user_deploy_config=deploy,
         cli_overrides=cli_overrides,
     ).stage_by_id(0)
-
-    assert legacy_config.engine_args.parallel_config.vae_parallel_mode == "spatial_shard_height"
-    assert structured_stage.parallel_config.vae_parallel_mode == "spatial_shard_height"
-
-
-def test_allgather_sequence_size_derivation_has_legacy_structured_parity(monkeypatch):
-    from vllm_omni.engine import stage_init_utils
-
-    pipeline = _resolve_pipeline_or_skip("dreamzero")
-    deploy = DeployConfig(
-        async_chunk=False,
-        stages=[
-            StageDeployConfig(
-                stage_id=0,
-                engine_extras={
-                    "parallel_config": {
-                        "sequence_parallel_size": 99,
-                        "allgather_degree": 2,
-                    }
-                },
-            )
-        ],
-    )
-    legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
-    structured_stage = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
-    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 2)
+    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: device_count)
+    monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda self: 29500)
 
     legacy_config = build_diffusion_config("unused", legacy_stage, extract_stage_metadata(legacy_stage))
 
-    assert legacy_config.parallel_config.sequence_parallel_size == 2
-    assert structured_stage.parallel_config.sequence_parallel_size == 2
+    assert getattr(legacy_config.parallel_config, field_name) == expected
+    assert getattr(structured_stage.parallel_config, field_name) == expected
 
 
 @pytest.mark.parametrize(
@@ -1215,11 +1290,12 @@ stages:
 
 
 def test_default_diffusion_factory_builds_without_orchestrator_only_field(monkeypatch):
+    from vllm_omni.config.yaml_util import create_config
     from vllm_omni.engine import stage_init_utils
     from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 
     stage = AsyncOmniEngine._create_default_diffusion_stage_cfg({})[0]
-    stage_config = SimpleNamespace(**stage)
+    stage_config = create_config([stage])[0]
     monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
 
     config = build_diffusion_config("unused", stage_config, extract_stage_metadata(stage_config))
@@ -1237,6 +1313,7 @@ def test_default_diffusion_factory_serializes_declared_passthrough_fields(monkey
     stage = AsyncOmniEngine._create_default_diffusion_stage_cfg(
         {
             "diffusion_model_runner_cls": "example.Runner",
+            "enable_session_state_manager": True,
             "tf_model_config": TransformerConfig(),
         }
     )[0]
@@ -1247,6 +1324,7 @@ def test_default_diffusion_factory_serializes_declared_passthrough_fields(monkey
 
     assert "tf_model_config" not in stage["engine_args"]
     assert config.diffusion_model_runner_cls == "example.Runner"
+    assert config.enable_session_state_manager is True
     assert isinstance(config.tf_model_config, TransformerConfig)
 
 
