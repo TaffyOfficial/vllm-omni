@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, is_dataclass
 from dataclasses import replace as dataclass_replace
 from functools import partial
@@ -15,10 +15,36 @@ from vllm import SamplingParams
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
-from vllm_omni.entrypoints.openai.utils import parse_lora_request
+from vllm_omni.entrypoints.openai.stage_params import get_default_sampling_params_list
+from vllm_omni.entrypoints.openai.utils import (
+    get_stage_type,
+    is_single_stage_diffusion,
+    parse_lora_request,
+    resolve_diffusion_od_config,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_extras import (
+    get_extra_body_params,
+    should_init_extra_args_for_non_diffusion_stages,
+)
 
 logger = init_logger(__name__)
+
+_SAMPLING_ROOT_FIELDS = {
+    "height": "height",
+    "width": "width",
+    "num_outputs_per_prompt": "num_outputs_per_prompt",
+    "seed": "seed",
+    "num_inference_steps": "num_inference_steps",
+    "guidance_scale": "guidance_scale",
+    "true_cfg_scale": "true_cfg_scale",
+    "cfg_scale": "true_cfg_scale",
+    "num_frames": "num_frames",
+    "guidance_scale_2": "guidance_scale_2",
+    "layers": "layers",
+    "resolution": "resolution",
+}
+_CONTROL_ROOT_FIELDS = frozenset({"size", "negative_prompt", "lora", "modalities"})
 
 
 def _clone(params: Any, source: str) -> Any:
@@ -41,6 +67,70 @@ class DiffusionChatRequestPlan:
     def clone_sampling_params_list(self) -> list[Any]:
         """Return isolated parameters for one dispatcher invocation."""
         return [_clone(params, "sampling parameters") for params in self._stage_params]
+
+
+@dataclass(frozen=True)
+class DiffusionChatRequestContext:
+    """Model topology and request-field policy consumed by the compiler."""
+
+    stage_types: tuple[str, ...]
+    default_sampling_params_list: tuple[object, ...]
+    comprehension_stage_index: int | None
+    standard_sampling_fields: frozenset[str]
+    declared_extra_fields: frozenset[str]
+    apply_declared_to_non_diffusion: bool
+    supported_modalities: frozenset[str]
+
+
+def resolve_diffusion_chat_request_context(
+    *,
+    engine_client: object,
+    diffusion_engine: object | None,
+    diffusion_mode: bool,
+    standard_sampling_fields: Collection[str],
+    declared_extra_fields: Collection[str] | None,
+) -> DiffusionChatRequestContext:
+    """Resolve all model-owned compiler policy from the active topology."""
+    stage_owner = diffusion_engine if diffusion_mode else engine_client
+    stage_configs = list(getattr(stage_owner, "stage_configs", ()) or ())
+    declared = frozenset(declared_extra_fields) if declared_extra_fields is not None else None
+    fan_out_declared = False
+    try:
+        od_config = resolve_diffusion_od_config(engine_client, diffusion_engine)
+        model_class_name = getattr(od_config, "model_class_name", None)
+        if isinstance(model_class_name, str):
+            if declared is None:
+                declared = get_extra_body_params(model_class_name)
+            fan_out_declared = should_init_extra_args_for_non_diffusion_stages(model_class_name)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to resolve diffusion request model extras: {exc}") from exc
+
+    supported_modalities = {
+        modality for modality in getattr(stage_owner, "output_modalities", ()) if modality is not None
+    }
+    if is_single_stage_diffusion(stage_owner):
+        supported_modalities.add("text")
+    return DiffusionChatRequestContext(
+        stage_types=tuple(get_stage_type(stage) for stage in stage_configs),
+        default_sampling_params_list=tuple(get_default_sampling_params_list(stage_owner)),
+        comprehension_stage_index=next(
+            (index for index, stage in enumerate(stage_configs) if getattr(stage, "is_comprehension", False)),
+            None,
+        ),
+        standard_sampling_fields=frozenset(standard_sampling_fields),
+        declared_extra_fields=declared or frozenset(),
+        apply_declared_to_non_diffusion=fan_out_declared,
+        supported_modalities=frozenset(supported_modalities),
+    )
+
+
+@dataclass(frozen=True)
+class _Assignment:
+    key: str
+    target: str
+    value: object
+    source: str
+    parse_value: bool
 
 
 def _mapping(
@@ -115,36 +205,33 @@ class _PlanBuilder:
     def __init__(
         self,
         request: object,
-        stage_types: Sequence[str],
-        defaults: Sequence[object],
-        comprehension_stage: int | None,
-        root_fields: Mapping[str, str],
-        standard_fields: Collection[str],
-        control_fields: Collection[str],
-        declared_fields: Collection[str],
-        fan_out_declared: bool,
-        supported_modalities: Collection[str],
+        context: DiffusionChatRequestContext,
     ) -> None:
         self.request = request
-        self.declared = frozenset(declared_fields)
-        self.root_fields = root_fields
-        self.standard_fields = frozenset(standard_fields)
-        self.control_fields = frozenset(control_fields)
-        self.sampling_fields = {key: target for key, target in root_fields.items() if key not in self.declared}
-        self.fan_out_declared = fan_out_declared
-        self.supported_modalities = frozenset(supported_modalities)
-        self.comprehension_stage = comprehension_stage
-        self.types = list(stage_types) or ["diffusion"]
+        self.declared = context.declared_extra_fields
+        self.standard_fields = context.standard_sampling_fields
+        self.sampling_fields = {
+            key: target for key, target in _SAMPLING_ROOT_FIELDS.items() if key not in self.declared
+        }
+        self.fan_out_declared = context.apply_declared_to_non_diffusion
+        self.supported_modalities = context.supported_modalities
+        self.comprehension_stage = context.comprehension_stage_index
+        self.types = list(context.stage_types) or ["diffusion"]
         self.params = [
-            _stage_params(stage_type, defaults[index] if index < len(defaults) else None)
+            _stage_params(
+                stage_type,
+                context.default_sampling_params_list[index]
+                if index < len(context.default_sampling_params_list)
+                else None,
+            )
             for index, stage_type in enumerate(self.types)
         ]
         self.diffusion_stages = [index for index, stage_type in enumerate(self.types) if stage_type == "diffusion"]
-        self.items: list[list[tuple[str, str, object, str, bool]]] = [[] for _ in self.params]
+        self.items: list[list[_Assignment]] = [[] for _ in self.params]
         self.claims: list[dict[str, list[str]]] = [{} for _ in self.params]
 
     def collect_sources(self) -> None:
-        consumed = self.declared | self.sampling_fields.keys() | self.control_fields
+        consumed = self.declared | self.sampling_fields.keys() | _CONTROL_ROOT_FIELDS
         model_extra = getattr(self.request, "model_extra", None)
         self.flat = dict(model_extra) if isinstance(model_extra, Mapping) else {}
         nested_value = self.flat.pop("extra_body", None)
@@ -179,7 +266,7 @@ class _PlanBuilder:
         claims: dict[str, list[str]] = {}
         self.by_key: dict[str, tuple[object, str]] = {}
         for key, value, source, is_container in self.values:
-            conflict_key = key if key in self.declared else self.root_fields.get(key, key)
+            conflict_key = key if key in self.declared else _SAMPLING_ROOT_FIELDS.get(key, key)
             claims.setdefault(conflict_key, []).append(source)
             if not is_container or key in self.declared:
                 self.by_key[key] = (value, source)
@@ -189,7 +276,7 @@ class _PlanBuilder:
         self.controls = {
             key: value
             for key, (value, _source) in self.by_key.items()
-            if key in self.control_fields and key not in {"size", "lora"} and value is not None
+            if key in _CONTROL_ROOT_FIELDS and key not in {"size", "lora"} and value is not None
         }
         modalities = self.controls.get("modalities")
         if modalities is not None:
@@ -237,7 +324,15 @@ class _PlanBuilder:
     ) -> None:
         for stage in (stages,) if isinstance(stages, int) else stages:
             self.claims[stage].setdefault(key, []).append(source)
-            self.items[stage].append((key, target or key, value, source, parse_value))
+            self.items[stage].append(
+                _Assignment(
+                    key=key,
+                    target=target or key,
+                    value=value,
+                    source=source,
+                    parse_value=parse_value,
+                )
+            )
 
     def build_stage_assignments(self) -> None:
         assign = self._assign
@@ -245,7 +340,7 @@ class _PlanBuilder:
         diffusion = self.diffusion_stages
         declared_stages: Collection[int] = range(len(self.types)) if self.fan_out_declared else diffusion
         for key, value, source, is_container in self.values:
-            if value is None and (not is_container or key in self.declared):
+            if value is None:
                 continue
             if key in self.declared:
                 extra(declared_stages, key, value, source)
@@ -328,16 +423,20 @@ class _PlanBuilder:
         for stage, (params, items) in enumerate(zip(self.params, self.items)):
             overrides: dict[str, object] = {}
             extra_args: dict[str, object] = {}
-            for key, target, value, source, parse_value in items:
-                if target == "extra_args":
+            for assignment in items:
+                if assignment.target == "extra_args":
                     if not hasattr(params, "extra_args"):
-                        raise ValueError(f"{source} is not supported by stage {stage}.")
+                        raise ValueError(f"{assignment.source} is not supported by stage {stage}.")
                     destination = extra_args
-                elif hasattr(params, target):
+                elif hasattr(params, assignment.target):
                     destination = overrides
                 else:
-                    raise ValueError(f'{source} targets unsupported parameter "{target}" for stage {stage}.')
-                destination[key if target == "extra_args" else target] = _parse(key, value) if parse_value else value
+                    raise ValueError(
+                        f'{assignment.source} targets unsupported parameter "{assignment.target}" for stage {stage}.'
+                    )
+                destination[assignment.key if assignment.target == "extra_args" else assignment.target] = (
+                    _parse(assignment.key, assignment.value) if assignment.parse_value else assignment.value
+                )
             if not overrides and not extra_args:
                 continue
             if extra_args:
@@ -354,29 +453,10 @@ class _PlanBuilder:
 def compile_diffusion_chat_request_plan(
     *,
     request: object,
-    stage_types: Sequence[str],
-    default_sampling_params_list: Sequence[object],
-    comprehension_stage_index: int | None,
-    sampling_root_fields: Mapping[str, str],
-    standard_sampling_fields: Collection[str],
-    control_root_fields: Collection[str],
-    declared_extra_fields: Collection[str],
-    apply_declared_to_non_diffusion: bool,
-    supported_modalities: Collection[str],
+    context: DiffusionChatRequestContext,
 ) -> DiffusionChatRequestPlan:
     """Compile all Chat request sources into final typed stage parameters."""
-    builder = _PlanBuilder(
-        request,
-        stage_types,
-        default_sampling_params_list,
-        comprehension_stage_index,
-        sampling_root_fields,
-        standard_sampling_fields,
-        control_root_fields,
-        declared_extra_fields,
-        apply_declared_to_non_diffusion,
-        supported_modalities,
-    )
+    builder = _PlanBuilder(request, context)
     builder.collect_sources()
     builder.validate_sources()
     builder.build_stage_assignments()

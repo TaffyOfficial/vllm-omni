@@ -10,6 +10,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionReque
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.entrypoints.openai.diffusion_request_utils import (
+    DiffusionChatRequestContext,
     DiffusionChatRequestPlan,
     compile_diffusion_chat_request_plan,
 )
@@ -17,18 +18,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-SAMPLING_FIELDS = {
-    "height": "height",
-    "width": "width",
-    "seed": "seed",
-    "num_inference_steps": "num_inference_steps",
-    "guidance_scale": "guidance_scale",
-    "cfg_scale": "true_cfg_scale",
-    "true_cfg_scale": "true_cfg_scale",
-    "layers": "layers",
-}
 STANDARD_FIELDS = {"temperature", "max_tokens", "seed"}
-CONTROL_FIELDS = {"size", "negative_prompt", "lora", "modalities"}
 
 
 def _request(**kwargs: Any) -> ChatCompletionRequest:
@@ -66,15 +56,15 @@ def _compile(
 ) -> DiffusionChatRequestPlan:
     return compile_diffusion_chat_request_plan(
         request=request,
-        stage_types=stage_types,
-        default_sampling_params_list=defaults,
-        comprehension_stage_index=comprehension_stage_index,
-        sampling_root_fields=SAMPLING_FIELDS,
-        standard_sampling_fields=STANDARD_FIELDS,
-        control_root_fields=CONTROL_FIELDS,
-        declared_extra_fields=declared,
-        apply_declared_to_non_diffusion=fan_out_declared,
-        supported_modalities=supported_modalities,
+        context=DiffusionChatRequestContext(
+            stage_types=stage_types,
+            default_sampling_params_list=defaults,
+            comprehension_stage_index=comprehension_stage_index,
+            standard_sampling_fields=frozenset(STANDARD_FIELDS),
+            declared_extra_fields=declared,
+            apply_declared_to_non_diffusion=fan_out_declared,
+            supported_modalities=supported_modalities,
+        ),
     )
 
 
@@ -117,6 +107,19 @@ def test_global_source_dispatcher_consumer_matrix(
         assert ar_params.seed == 7
         assert key not in (ar_params.extra_args or {})
         assert diffusion_params.extra_args == {"default": True}
+
+
+@pytest.mark.parametrize(
+    "source",
+    ("extra_args", "extra_params", "extra_body.extra_args", "extra_body.extra_params"),
+)
+def test_pipeline_owned_global_none_preserves_stage_default(source: str) -> None:
+    plan = _compile(
+        _request(**_global_source(source, "solver", None)),
+        defaults=(OmniDiffusionSamplingParams(extra_args={"solver": "euler"}),),
+    )
+
+    assert plan.clone_sampling_params_list()[0].extra_args["solver"] == "euler"
 
 
 @pytest.mark.parametrize(

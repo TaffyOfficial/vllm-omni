@@ -91,14 +91,20 @@ def serving_chat(mock_engine_client):
 def _compile_diffusion_plan(serving_chat, request):
     from vllm_omni.entrypoints.openai.diffusion_request_utils import (
         compile_diffusion_chat_request_plan,
+        resolve_diffusion_chat_request_context,
     )
 
+    context = resolve_diffusion_chat_request_context(
+        engine_client=serving_chat.engine_client,
+        diffusion_engine=serving_chat._diffusion_engine,
+        diffusion_mode=serving_chat._diffusion_mode,
+        standard_sampling_fields=serving_chat._OPENAI_SAMPLING_FIELDS,
+        declared_extra_fields=serving_chat._diffusion_extra_body_params,
+    )
+    serving_chat._diffusion_extra_body_params = context.declared_extra_fields
     return compile_diffusion_chat_request_plan(
         request=request,
-        sampling_root_fields=serving_chat._diffusion_sampling_root_fields,
-        standard_sampling_fields=serving_chat._OPENAI_SAMPLING_FIELDS,
-        control_root_fields=serving_chat._diffusion_control_root_fields,
-        **serving_chat._get_diffusion_request_plan_inputs(),
+        context=context,
     )
 
 

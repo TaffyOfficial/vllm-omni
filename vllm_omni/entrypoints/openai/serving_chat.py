@@ -28,6 +28,7 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.diffusion_request_utils import (
     DiffusionChatRequestPlan,
     compile_diffusion_chat_request_plan,
+    resolve_diffusion_chat_request_context,
 )
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
@@ -40,7 +41,6 @@ from vllm_omni.metrics.modality import (
 from vllm_omni.model_extras import (
     get_extra_body_params,
     get_extra_output_params,
-    should_init_extra_args_for_non_diffusion_stages,
 )
 
 try:
@@ -160,33 +160,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     _supported_speakers: set[str] | None = None
     _diffusion_extra_body_params: frozenset[str] | None = None
     _diffusion_extra_output_params: frozenset[str] | None = None
-    # Only request fields with an explicit Chat serving consumer belong here.
-    # OmniDiffusionSamplingParams also stores runtime-only tensors and KV state;
-    # reflecting the whole dataclass would accidentally expose those internals
-    # as accepted request fields.
-    _diffusion_sampling_root_fields = {
-        "height": "height",
-        "width": "width",
-        "num_outputs_per_prompt": "num_outputs_per_prompt",
-        "seed": "seed",
-        "num_inference_steps": "num_inference_steps",
-        "guidance_scale": "guidance_scale",
-        "true_cfg_scale": "true_cfg_scale",
-        "cfg_scale": "true_cfg_scale",
-        "num_frames": "num_frames",
-        "guidance_scale_2": "guidance_scale_2",
-        "layers": "layers",
-        "resolution": "resolution",
-    }
-    _diffusion_control_root_fields = frozenset(
-        {
-            "size",
-            "negative_prompt",
-            "lora",
-            "modalities",
-        }
-    )
-
     # Harmony flag (always False for vllm-omni models)
     use_harmony: bool = False
 
@@ -331,50 +304,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
         return any(get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs)
 
-    def _get_diffusion_request_plan_inputs(self) -> dict[str, Any]:
-        """Resolve engine topology and registry policy for the sole compiler."""
-        stage_owner = self._diffusion_engine if self._diffusion_mode else self.engine_client
-        stage_configs = list(getattr(stage_owner, "stage_configs", []) or [])
-        declared_extra_fields = self._diffusion_extra_body_params
-        apply_declared_to_non_diffusion = False
-        try:
-            od_config = resolve_diffusion_od_config(self.engine_client, self._diffusion_engine)
-            model_class_name = getattr(od_config, "model_class_name", None)
-            if isinstance(model_class_name, str):
-                if declared_extra_fields is None:
-                    declared_extra_fields = get_extra_body_params(model_class_name)
-                # These pipelines have non-diffusion stage processors that
-                # consume the same declared request extras.
-                apply_declared_to_non_diffusion = should_init_extra_args_for_non_diffusion_stages(model_class_name)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to resolve diffusion request model extras: {exc}") from exc
-        if declared_extra_fields is None:
-            declared_extra_fields = frozenset()
-        self._diffusion_extra_body_params = declared_extra_fields
-
-        stage_types = [get_stage_type(stage_config) for stage_config in stage_configs]
-        supported_modalities = {
-            modality for modality in getattr(stage_owner, "output_modalities", ()) if modality is not None
-        }
-        if is_single_stage_diffusion(stage_owner):
-            supported_modalities.add("text")
-        comprehension_stage_index = next(
-            (
-                index
-                for index, stage_config in enumerate(stage_configs)
-                if getattr(stage_config, "is_comprehension", False)
-            ),
-            None,
-        )
-        return {
-            "stage_types": stage_types,
-            "default_sampling_params_list": get_default_sampling_params_list(stage_owner),
-            "comprehension_stage_index": comprehension_stage_index,
-            "declared_extra_fields": declared_extra_fields,
-            "apply_declared_to_non_diffusion": apply_declared_to_non_diffusion,
-            "supported_modalities": supported_modalities,
-        }
-
     def _get_diffusion_extra_output_params(
         self,
         output: object,
@@ -473,12 +402,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         diffusion_plan: DiffusionChatRequestPlan | None = None
         if self._serves_diffusion_requests():
             try:
+                diffusion_context = resolve_diffusion_chat_request_context(
+                    engine_client=self.engine_client,
+                    diffusion_engine=self._diffusion_engine,
+                    diffusion_mode=self._diffusion_mode,
+                    standard_sampling_fields=self._OPENAI_SAMPLING_FIELDS,
+                    declared_extra_fields=self._diffusion_extra_body_params,
+                )
+                self._diffusion_extra_body_params = diffusion_context.declared_extra_fields
                 diffusion_plan = compile_diffusion_chat_request_plan(
                     request=request,
-                    sampling_root_fields=self._diffusion_sampling_root_fields,
-                    standard_sampling_fields=self._OPENAI_SAMPLING_FIELDS,
-                    control_root_fields=self._diffusion_control_root_fields,
-                    **self._get_diffusion_request_plan_inputs(),
+                    context=diffusion_context,
                 )
             except ValueError as exc:
                 return self._create_error_response(str(exc), status_code=400)
