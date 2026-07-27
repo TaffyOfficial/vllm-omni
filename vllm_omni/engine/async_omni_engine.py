@@ -36,7 +36,12 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     strip_parent_engine_args,
 )
-from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
+from vllm_omni.diffusion.data import (
+    DiffusionParallelConfig,
+    _omni_diffusion_config_field_names,
+    normalize_omni_diffusion_engine_kwargs,
+    parse_attention_config,
+)
 from vllm_omni.diffusion.diffusion_engine import supports_audio_output
 from vllm_omni.engine.async_engine_utils import (
     SHUTDOWN_ENQUEUE_TIMEOUT_S,
@@ -983,6 +988,20 @@ class AsyncOmniEngine:
                 attention_backend=kwargs.get("diffusion_attention_backend"),
             )
 
+        stage_extras = (
+            normalize_omni_diffusion_engine_kwargs(
+                {
+                    "extras": kwargs.get("extras"),
+                    "auxiliary_text_encoder": kwargs.get("auxiliary_text_encoder"),
+                }
+            ).get("extras")
+            or {}
+        )
+        stage_extras.setdefault(
+            "default_llama_model_id",
+            kwargs.get("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
+        )
+
         stage_engine_args = {
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
@@ -1030,10 +1049,7 @@ class AsyncOmniEngine:
             "force_cutlass_fp8": bool(kwargs.get("force_cutlass_fp8", False)),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
             "streaming_output": kwargs.get("diffusion_streaming_output", False),
-            "extras": {
-                "auxiliary_text_encoder": kwargs.get("auxiliary_text_encoder", None),
-                "default_llama_model_id": kwargs.get("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
-            },
+            "extras": stage_extras,
             **(
                 {
                     "profiler_config": asdict(kwargs["profiler_config"])
@@ -1044,6 +1060,10 @@ class AsyncOmniEngine:
                 else {}
             ),
         }
+        for name in _omni_diffusion_config_field_names() - stage_engine_args.keys():
+            if kwargs.get(name) is not None:
+                stage_engine_args[name] = kwargs[name]
+
         # Only set dtype if it was already explicitly passed and normalized
         if "dtype" in normalized_kwargs:
             stage_engine_args["dtype"] = normalized_kwargs["dtype"]

@@ -112,6 +112,11 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
     return _normalize_omni_diffusion_kwargs(kwargs, engine_ingress=False)
 
 
+def _omni_diffusion_config_field_names() -> frozenset[str]:
+    """Return the schema-owned diffusion config field names."""
+    return frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
+
+
 def _normalize_flat_diffusion_parallel_fields(
     engine_kwargs: dict[str, Any],
     flattened_values: dict[str, Any],
@@ -146,7 +151,7 @@ def _normalize_flat_diffusion_parallel_fields(
     )
     for name in flat_keys:
         value = flattened_values.pop(name)
-        if value is None or (not overwrite and name in parallel_config_dict):
+        if value is None or (not overwrite and parallel_config_dict.get(name) is not None):
             continue
         moved_value = True
         if name in {"ulysses_degree", "ring_degree"}:
@@ -184,7 +189,7 @@ def normalize_omni_diffusion_engine_kwargs(kwargs: Mapping[str, Any]) -> dict[st
     auxiliary_text_encoder = normalized.pop("auxiliary_text_encoder", None)
     if auxiliary_text_encoder is not None:
         extras = dict(normalized.get("extras") or {})
-        if "auxiliary_text_encoder" in extras:
+        if extras.get("auxiliary_text_encoder") is not None:
             raise ValueError(
                 "Diffusion engine field 'auxiliary_text_encoder' cannot be provided "
                 "both at the top level and in 'extras'."

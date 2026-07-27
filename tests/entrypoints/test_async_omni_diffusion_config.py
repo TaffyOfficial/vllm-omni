@@ -191,6 +191,19 @@ def test_default_stage_config_engine_args():
     assert engine_args["trust_remote_code"] is True
 
 
+def test_default_stage_config_forwards_schema_owned_diffusion_fields():
+    """Ensure new diffusion config fields do not require another factory whitelist."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "diffusion_model_runner_cls": "example.Runner",
+            "extras": {"custom_option": "value"},
+        }
+    )[0]
+
+    assert stage_cfg["engine_args"]["diffusion_model_runner_cls"] == "example.Runner"
+    assert stage_cfg["engine_args"]["extras"]["custom_option"] == "value"
+
+
 def test_default_stage_config_whitelist_none_fallback():
     """DeployConfig / StageDeployConfig whitelist fields with value None
     fall back to OmniDiffusionConfig dataclass defaults."""

@@ -1019,6 +1019,28 @@ def test_startup_diffusion_payload_normalizes_owned_fields(kwargs, expected):
         assert payload[name] == value
 
 
+def test_startup_diffusion_payload_treats_nested_none_as_unset():
+    payload = _strict_diffusion_config_kwargs(
+        {
+            "parallel_config": {"vae_parallel_mode": None},
+            "vae_parallel_mode": "spatial_shard_height",
+        }
+    )
+
+    assert payload["parallel_config"]["vae_parallel_mode"] == "spatial_shard_height"
+
+
+def test_startup_diffusion_payload_treats_compatibility_none_as_unset():
+    payload = _strict_diffusion_config_kwargs(
+        {
+            "auxiliary_text_encoder": "example/encoder",
+            "extras": {"auxiliary_text_encoder": None},
+        }
+    )
+
+    assert payload["extras"]["auxiliary_text_encoder"] == "example/encoder"
+
+
 def test_legacy_diffusion_deploy_flat_parallel_fields_drive_preflight_and_config(tmp_path, monkeypatch):
     from vllm_omni.engine import stage_init_utils
 
@@ -1067,6 +1089,30 @@ def test_explicit_sequence_parallel_size_conflict_has_legacy_structured_parity()
         build_diffusion_config("unused", legacy_stage, extract_stage_metadata(legacy_stage))
     with pytest.raises(ValueError, match="Sequence parallel size"):
         VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+
+
+def test_nested_none_parallel_field_has_legacy_structured_parity(monkeypatch):
+    from vllm_omni.engine import stage_init_utils
+
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    deploy = DeployConfig(
+        async_chunk=False,
+        stages=[
+            StageDeployConfig(
+                stage_id=0,
+                vae_parallel_mode="spatial_shard_height",
+                engine_extras={"parallel_config": {"vae_parallel_mode": None}},
+            )
+        ],
+    )
+    legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
+    structured_stage = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
+    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
+
+    legacy_config = build_diffusion_config("unused", legacy_stage, extract_stage_metadata(legacy_stage))
+
+    assert legacy_config.parallel_config.vae_parallel_mode == "spatial_shard_height"
+    assert structured_stage.parallel_config.vae_parallel_mode == "spatial_shard_height"
 
 
 @pytest.mark.parametrize(
