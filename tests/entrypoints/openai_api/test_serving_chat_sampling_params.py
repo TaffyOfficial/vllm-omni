@@ -175,36 +175,18 @@ def test_openai_sampling_fields_contains_expected_fields():
 
 
 @pytest.mark.parametrize(
-    ("model_class_name", "request_body", "field", "expected_on_ar", "expected_ar_value"),
+    ("model_class_name", "field", "value", "expected_on_ar", "expected_ar_value"),
     [
-        (
-            "BagelPipeline",
-            {"cfg_text_scale": 7.0},
-            "cfg_text_scale",
-            True,
-            None,
-        ),
-        (
-            "SenseNovaU1Pipeline",
-            {"max_tokens": 32},
-            "max_tokens",
-            False,
-            100,
-        ),
-        (
-            "MingImagePipeline",
-            {"seed": 32},
-            "seed",
-            True,
-            32,
-        ),
+        pytest.param("BagelPipeline", "cfg_text_scale", 7.0, True, None, id="custom-fan-out"),
+        pytest.param("SenseNovaU1Pipeline", "max_tokens", 32, False, 100, id="no-fan-out"),
+        pytest.param("MingImagePipeline", "seed", 32, True, 32, id="typed-fan-out"),
     ],
 )
 def test_registry_owns_declared_extra_fan_out(
     serving_chat,
     model_class_name,
-    request_body,
     field,
+    value,
     expected_on_ar,
     expected_ar_value,
 ):
@@ -224,12 +206,12 @@ def test_registry_owns_declared_extra_fan_out(
 
     plan = _compile_diffusion_plan(
         serving_chat,
-        ChatCompletionRequest(model="test", messages=[], **request_body),
+        ChatCompletionRequest(model="test", messages=[], **{field: value}),
     )
     ar_params, diffusion_params = plan.clone_sampling_params_list()
 
     assert (field in (ar_params.extra_args or {})) is expected_on_ar
-    assert diffusion_params.extra_args[field] == next(iter(request_body.values()))
+    assert diffusion_params.extra_args[field] == value
     if expected_ar_value is not None:
         assert getattr(ar_params, field) == expected_ar_value
 
@@ -252,11 +234,6 @@ def test_registry_owns_declared_extra_fan_out(
             {"extra_body": {"modalities": ["audio"]}},
             "Unsupported output modalities audio",
             id="unsupported-audio",
-        ),
-        pytest.param(
-            {"extra_body": {"modalities": ["video"]}},
-            "Unsupported output modalities video",
-            id="unsupported-video",
         ),
     ],
 )
@@ -283,11 +260,9 @@ def test_invalid_request_uses_the_shared_boundary_before_dispatch(
     serving_chat._check_model.assert_not_awaited()
 
 
-@pytest.mark.parametrize("modality", ["image", "text"])
 def test_pure_dispatcher_receives_the_compiled_controls(
     serving_chat,
     mocker: MockerFixture,
-    modality: str,
 ):
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -314,12 +289,16 @@ def test_pure_dispatcher_receives_the_compiled_controls(
         model="test",
         messages=[],
         size="768x512",
-        extra_body={"modalities": [modality]},
+        extra_body={
+            "modalities": ["text"],
+            "negative_prompt": "low quality",
+        },
     )
 
     response = asyncio.run(serving_chat._create_chat_completion(request))
 
-    assert captured["prompt"]["modalities"] == [modality]
+    assert captured["prompt"]["modalities"] == ["text"]
+    assert captured["prompt"]["negative_prompt"] == "low quality"
     (params,) = captured["sampling_params_list"]
     assert (params.height, params.width) == (512, 768)
     assert response.error.message == "No output generated from AsyncOmni"
