@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import fields
 from pathlib import Path
 
@@ -36,6 +37,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
+    StagePipelineConfig,
     load_deploy_config,
     merge_pipeline_deploy,
 )
@@ -926,3 +928,281 @@ def test_diffusion_config_projection_keeps_mapping_quantization_config_serializa
     cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(quantization_config=quantization_config)
 
     assert cfg.quantization_config == quantization_config
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        omni_config_module._DiffusionConfigProjection.from_kwargs,
+        pytest.param(
+            lambda **kwargs: __import__(
+                "vllm_omni.diffusion.data",
+                fromlist=["OmniDiffusionConfig"],
+            ).OmniDiffusionConfig.from_kwargs(**kwargs),
+            id="runtime-config",
+        ),
+    ],
+)
+def test_diffusion_config_entrypoints_reject_unknown_none(factory):
+    with pytest.raises((ValueError, ValidationError), match="enable_sleep_mod"):
+        factory(enable_sleep_mod=None)
+
+
+def test_direct_diffusion_aliases_promote_none_and_reject_real_conflicts(monkeypatch):
+    from vllm_omni.diffusion import data as diffusion_data
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    monkeypatch.setattr(diffusion_data, "build_quant_config", lambda config: config)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        config = OmniDiffusionConfig.from_kwargs(
+            quantization={"method": "example"},
+            quantization_config=None,
+            kv_cache_dtype="fp8",
+            diffusion_kv_cache_dtype=None,
+        )
+
+    assert config.quantization_config == {"method": "example"}
+    assert config.diffusion_kv_cache_dtype == "fp8"
+    assert sum(item.category is FutureWarning for item in caught) == 1
+    with pytest.raises(ValueError, match=r"quantization.*quantization_config"):
+        OmniDiffusionConfig.from_kwargs(quantization="fp8", quantization_config={"method": "example"})
+
+
+def test_shared_cli_fields_route_to_llm_owner_and_stage_scoped_values_reject():
+    from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
+    from vllm_omni.engine.stage_init_utils import _strict_diffusion_config_kwargs
+
+    pipeline = PipelineConfig(
+        model_type="owner-routing-test",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="llm",
+                execution_type=StageExecutionType.LLM_AR,
+            ),
+            StagePipelineConfig(
+                stage_id=1,
+                model_stage="diffusion",
+                execution_type=StageExecutionType.DIFFUSION,
+            ),
+        ),
+    )
+    stages = merge_pipeline_deploy(
+        pipeline,
+        DeployConfig(async_chunk=False, enable_prefix_caching=False),
+    )
+    global_overrides = {"seed": 7, "kv_cache_dtype": "fp8"}
+    for stage in stages:
+        stage.runtime_overrides = StageConfigFactory._merge_cli_overrides(stage, global_overrides)
+
+    llm_stage, diffusion_stage = stages
+    engine_args = OmniEngineArgs(model="unused", **llm_stage.runtime_overrides)
+    assert (engine_args.seed, engine_args.kv_cache_dtype) == (7, "fp8")
+    assert not ({"seed", "kv_cache_dtype"} & diffusion_stage.runtime_overrides.keys())
+    assert llm_stage.yaml_engine_args["enable_prefix_caching"] is False
+    assert "enable_prefix_caching" not in diffusion_stage.yaml_engine_args
+
+    with pytest.raises(ValueError, match=r"stage 1.*seed"):
+        StageConfigFactory._merge_cli_overrides(diffusion_stage, {"stage_1_seed": None})
+    with pytest.raises(ValueError, match=r"stage 1.*kv_cache_dtype"):
+        StageConfigFactory._merge_cli_overrides(diffusion_stage, {"stage_1_kv_cache_dtype": "fp8"})
+    with pytest.raises(ValueError, match=r"stage 1.*kv_cache_dtype"):
+        _strict_diffusion_config_kwargs({"stage_id": 1, "kv_cache_dtype": "fp8"})
+
+
+def test_diffusion_cli_rejects_unknown_global_and_normalizes_runtime_alias():
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+
+    with pytest.raises(ValueError, match=r"stage 0.*enable_sleep_mod"):
+        VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            cli_overrides={"enable_sleep_mod": None},
+        )
+
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=DeployConfig(
+            async_chunk=False,
+            stages=[StageDeployConfig(stage_id=0, max_num_seqs=2)],
+        ),
+        cli_overrides={"stage_0_max_batch_size": 8},
+    )
+    assert config.stage_by_id(0).scheduler_config.max_num_seqs == 8
+
+    with pytest.raises(ValueError, match=r"max_batch_size.*max_num_seqs"):
+        VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            user_deploy_config=DeployConfig(
+                async_chunk=False,
+                stages=[
+                    StageDeployConfig(
+                        stage_id=0,
+                        max_num_seqs=2,
+                        engine_extras={"max_batch_size": 8},
+                    )
+                ],
+            ),
+        )
+
+
+def test_parallel_flat_and_nested_values_conflict():
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    with pytest.raises(ValueError, match=r"tensor_parallel_size.*top level.*parallel_config"):
+        VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            user_deploy_config=DeployConfig(
+                async_chunk=False,
+                stages=[
+                    StageDeployConfig(
+                        stage_id=0,
+                        tensor_parallel_size=4,
+                        engine_extras={"parallel_config": {"tensor_parallel_size": 2}},
+                    )
+                ],
+            ),
+        )
+
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=DeployConfig(async_chunk=False, data_parallel_size=2),
+        cli_overrides={"stage_0_parallel_config": {"data_parallel_size": 1}},
+    )
+    assert config.stage_by_id(0).parallel_config.data_parallel_size == 1
+
+    object_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        cli_overrides={"parallel_config": DiffusionParallelConfig(data_parallel_size=2)},
+    )
+    assert object_config.stage_by_id(0).parallel_config.data_parallel_size == 2
+
+
+def test_structured_diffusion_validates_engine_owner_before_partition():
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=DeployConfig(
+            async_chunk=False,
+            stages=[
+                StageDeployConfig(
+                    stage_id=0,
+                    max_num_seqs=4,
+                    vae_parallel_mode="spatial_shard_height",
+                    engine_extras={"diffusion_model_runner_cls": "example.Runner"},
+                )
+            ],
+        ),
+    )
+
+    stage = config.stage_by_id(0)
+    assert stage.scheduler_config.max_num_seqs == 4
+    assert stage.parallel_config.vae_parallel_mode == "spatial_shard_height"
+    assert stage.diffusion_config.diffusion_model_runner_cls == "example.Runner"
+
+    with pytest.raises(ValueError, match=r"stage 0.*seed"):
+        VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            user_deploy_config=DeployConfig(
+                async_chunk=False,
+                stages=[StageDeployConfig(stage_id=0, engine_extras={"seed": None})],
+            ),
+        )
+
+
+def test_legacy_startup_normalizes_parallel_and_rejects_unowned_input(monkeypatch):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.engine import stage_init_utils
+    from vllm_omni.engine.stage_init_utils import build_diffusion_config, extract_stage_metadata
+
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    stage = merge_pipeline_deploy(
+        pipeline,
+        DeployConfig(
+            async_chunk=False,
+            stages=[
+                StageDeployConfig(
+                    stage_id=0,
+                    ulysses_degree=2,
+                    vae_parallel_mode="spatial_shard_height",
+                )
+            ],
+        ),
+    )[0].to_omegaconf()
+    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 2)
+    monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda self: 29500)
+
+    config = build_diffusion_config("unused", stage, extract_stage_metadata(stage))
+    assert config.parallel_config.ulysses_degree == 2
+    assert config.parallel_config.sequence_parallel_size == 2
+    assert config.parallel_config.vae_parallel_mode == "spatial_shard_height"
+
+    with pytest.raises(ValueError, match=r"stage 0.*enable_sleep_mod"):
+        merge_pipeline_deploy(
+            pipeline,
+            DeployConfig(
+                async_chunk=False,
+                stages=[StageDeployConfig(stage_id=0, engine_extras={"enable_sleep_mod": None})],
+            ),
+        )
+
+
+def test_diffusion_metadata_stays_on_stage_envelope_and_user_metadata_rejects():
+    from vllm_omni.engine.stage_init_utils import extract_stage_metadata
+
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    stage = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))[0].to_omegaconf()
+
+    assert stage.model_stage == "diffusion"
+    assert "model_stage" not in stage.engine_args
+    assert extract_stage_metadata(stage).model_stage == "diffusion"
+
+    with pytest.raises(ValueError, match=r"stage 0.*model_stage"):
+        merge_pipeline_deploy(
+            pipeline,
+            DeployConfig(
+                async_chunk=False,
+                stages=[StageDeployConfig(stage_id=0, engine_extras={"model_stage": "override"})],
+            ),
+        )
+
+
+def test_capacity_guard_prevents_diffusion_client_creation(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm_omni.diffusion import stage_diffusion_client
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.engine import stage_init_utils
+    from vllm_omni.engine.stage_init_utils import extract_stage_metadata, initialize_diffusion_stage
+
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    stage = merge_pipeline_deploy(
+        pipeline,
+        DeployConfig(
+            async_chunk=False,
+            data_parallel_size=2,
+            stages=[StageDeployConfig(stage_id=0, engine_extras={"tensor_parallel_size": 2})],
+        ),
+    )[0].to_omegaconf()
+    device_env = stage_init_utils.current_omni_platform.device_control_env_var
+    if device_env:
+        monkeypatch.delenv(device_env, raising=False)
+    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 2)
+    monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda self: 29500)
+    create_client = Mock(side_effect=AssertionError("client creation must not run"))
+    monkeypatch.setattr(stage_diffusion_client, "create_diffusion_client", create_client)
+
+    with pytest.raises(
+        ValueError,
+        match=r"Stage 0 requires 4 device\(s\).*2 device\(s\) are available: \[0, 1\]",
+    ):
+        initialize_diffusion_stage(
+            stage_id=0,
+            model="unused",
+            stage_cfg=stage,
+            metadata=extract_stage_metadata(stage),
+            stage_init_timeout=1,
+        )
+    create_client.assert_not_called()

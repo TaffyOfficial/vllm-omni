@@ -25,6 +25,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageConfig,
     StageType,
+    build_diffusion_stage_runtime_overrides,
     build_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
@@ -553,8 +554,6 @@ class StageConfigFactory:
                 engine_args["parallel_config"] = parallel_config
 
         engine_args.setdefault("cache_backend", "none")
-        engine_args["model_stage"] = "diffusion"
-
         # Convert dtype to string for OmegaConf
         if "dtype" in engine_args:
             engine_args["dtype"] = str(engine_args["dtype"])
@@ -564,6 +563,7 @@ class StageConfigFactory:
         config_dict: dict[str, Any] = {
             "stage_id": 0,
             "stage_type": StageType.DIFFUSION.value,
+            "model_stage": "diffusion",
             "runtime": {
                 "process": True,
                 "devices": devices,
@@ -588,4 +588,6 @@ class StageConfigFactory:
         server/uvicorn keys are dropped downstream by
         ``filter_dataclass_kwargs(OmniEngineArgs, ...)``.
         """
+        if StageType(stage.stage_type) == StageType.DIFFUSION:
+            return build_diffusion_stage_runtime_overrides(stage.stage_id, cli_overrides)
         return build_stage_runtime_overrides(stage.stage_id, cli_overrides)

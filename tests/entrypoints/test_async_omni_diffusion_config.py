@@ -30,7 +30,8 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["cache_config"]["Fn_compute_blocks"] == 2
     assert engine_args["vae_use_slicing"] is True
     assert engine_args["parallel_config"].ulysses_degree == 2
-    assert engine_args["model_stage"] == "diffusion"
+    assert stage_cfg["model_stage"] == "diffusion"
+    assert "model_stage" not in engine_args
 
 
 def test_default_cache_config_used_when_missing():

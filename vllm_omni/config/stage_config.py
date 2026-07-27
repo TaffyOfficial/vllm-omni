@@ -8,7 +8,7 @@ import dataclasses
 import functools
 import re
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
@@ -50,6 +50,8 @@ def build_stage_runtime_overrides(
     cli_overrides: dict[str, Any],
     *,
     internal_keys: set[str] | frozenset[str] | None = None,
+    excluded_global_keys: set[str] | frozenset[str] = frozenset(),
+    allowed_stage_keys: set[str] | frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Build per-stage runtime overrides from global and ``stage_<id>_*`` kwargs.
 
@@ -74,20 +76,63 @@ def build_stage_runtime_overrides(
     result: dict[str, Any] = {}
 
     for key, value in cli_overrides.items():
-        if value is None or key in internal_keys:
-            continue
-
         match = _STAGE_OVERRIDE_PATTERN.match(key)
         if match is not None:
             override_stage_id = int(match.group(1))
             param_name = match.group(2)
-            if override_stage_id == stage_id and param_name not in internal_keys:
+            if override_stage_id != stage_id or param_name in internal_keys:
+                continue
+            if allowed_stage_keys is not None and param_name not in allowed_stage_keys:
+                raise ValueError(f"Unknown diffusion config field(s) for stage {stage_id}: {param_name!r}")
+            if value is not None:
                 result[param_name] = value
             continue
 
+        if value is None or key in internal_keys or key in excluded_global_keys:
+            continue
         result[key] = value
 
     return result
+
+
+def build_diffusion_stage_runtime_overrides(
+    stage_id: int,
+    cli_overrides: dict[str, Any],
+) -> dict[str, Any]:
+    """Route global shared fields away from diffusion and validate stage input."""
+    from vllm_omni.diffusion.data import omni_diffusion_engine_input_fields
+    from vllm_omni.engine.arg_utils import (
+        SHARED_FIELDS,
+        OmniEngineArgs,
+        OrchestratorArgs,
+        internal_blacklist_keys,
+    )
+
+    diffusion_fields = omni_diffusion_engine_input_fields()
+    stage_fields = diffusion_fields | {"devices", "num_replicas"}
+    omni_engine_fields = frozenset(config_field.name for config_field in fields(OmniEngineArgs))
+    known_cli_fields = (
+        omni_engine_fields
+        | frozenset(config_field.name for config_field in fields(OrchestratorArgs))
+        | diffusion_fields
+        | deploy_runtime_override_keys()
+    )
+    unknown_null_fields = sorted(
+        key
+        for key, value in cli_overrides.items()
+        if value is None and _STAGE_OVERRIDE_PATTERN.match(key) is None and key not in known_cli_fields
+    )
+    if unknown_null_fields:
+        names = ", ".join(repr(name) for name in unknown_null_fields)
+        raise ValueError(f"Unknown diffusion config field(s) for stage {stage_id}: {names}")
+    global_shared_only = omni_engine_fields - diffusion_fields
+    return build_stage_runtime_overrides(
+        stage_id,
+        cli_overrides,
+        internal_keys=(internal_blacklist_keys() - stage_fields - deploy_runtime_override_keys()) | SHARED_FIELDS,
+        excluded_global_keys=global_shared_only,
+        allowed_stage_keys=stage_fields,
+    )
 
 
 def strip_parent_engine_args(
@@ -141,7 +186,35 @@ def _apply_diffusion_parallel_runtime_overrides(
     parallel_config = engine_args.get("parallel_config")
     parallel_config_dict = dict(parallel_config) if parallel_config is not None else None
     degree_overridden = False
-    sequence_parallel_explicit = runtime_overrides.get("sequence_parallel_size") is not None
+    runtime_parallel = runtime_overrides.pop("parallel_config", None)
+    if runtime_parallel is None:
+        runtime_parallel_dict: dict[str, Any] = {}
+    elif isinstance(runtime_parallel, Mapping):
+        runtime_parallel_dict = dict(runtime_parallel)
+    else:
+        runtime_parallel_dict = {
+            name: getattr(runtime_parallel, name) for name in parallel_fields if hasattr(runtime_parallel, name)
+        }
+    sequence_parallel_explicit = (
+        runtime_overrides.get("sequence_parallel_size") is not None
+        or runtime_parallel_dict.get("sequence_parallel_size") is not None
+    )
+
+    for key, value in runtime_parallel_dict.items():
+        if key not in parallel_fields:
+            raise ValueError(f"Unknown diffusion parallel config field: {key!r}")
+        if value is None:
+            continue
+        if runtime_overrides.get(key) is not None:
+            raise ValueError(
+                f"Diffusion parallel field {key!r} cannot be provided both at the top level and in 'parallel_config'."
+            )
+        if parallel_config_dict is None:
+            parallel_config_dict = {}
+        if key in ("ulysses_degree", "ring_degree", "allgather_degree"):
+            degree_overridden = True
+        engine_args.pop(key, None)
+        parallel_config_dict[key] = value
 
     for key in list(runtime_overrides.keys()):
         value = runtime_overrides.get(key)
@@ -151,6 +224,9 @@ def _apply_diffusion_parallel_runtime_overrides(
             parallel_config_dict = {}
         if key in ("ulysses_degree", "ring_degree", "allgather_degree"):
             degree_overridden = True
+        # The runtime/CLI source has higher precedence than deploy defaults.
+        # Remove a flat default before writing the canonical nested value.
+        engine_args.pop(key, None)
         parallel_config_dict[key] = runtime_overrides.pop(key)
 
     if parallel_config_dict is not None and degree_overridden and not sequence_parallel_explicit:
@@ -817,16 +893,22 @@ def _build_engine_args(
 ) -> dict[str, Any]:
     """Assemble the flat ``yaml_engine_args`` dict for one stage.
 
-    Pipeline-wide DeployConfig fields are applied uniformly to every stage;
-    per-stage StageDeployConfig overrides take precedence when present (e.g.
-    ``engine_extras`` can still carry a stage-specific ``dtype``).
+    Pipeline-wide DeployConfig fields are routed to compatible stage owners;
+    per-stage StageDeployConfig input is validated before its source is lost.
     """
+    is_diffusion = ps.execution_type == StageExecutionType.DIFFUSION
+    diffusion_fields: frozenset[str] = frozenset()
+    if is_diffusion:
+        from vllm_omni.diffusion.data import omni_diffusion_engine_input_fields
+
+        diffusion_fields = omni_diffusion_engine_input_fields()
+
     engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch}
-    if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
+    if is_diffusion and ps.model_arch:
         engine_args.setdefault("model_class_name", ps.model_arch)
-    if ps.engine_output_type:
+    if not is_diffusion and ps.engine_output_type:
         engine_args["engine_output_type"] = ps.engine_output_type
-    if next_stage_proc:
+    if not is_diffusion and next_stage_proc:
         engine_args["custom_process_next_stage_input_func"] = next_stage_proc
     # Subdirectory indirections from StagePipelineConfig (structural, not
     # deployment knobs).  Deploy YAML ``engine_extras`` can still override
@@ -838,20 +920,47 @@ def _build_engine_args(
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:
+        if is_diffusion and name not in diffusion_fields:
+            continue
         value = getattr(deploy, name)
         if value is not None:
             engine_args[name] = value
 
     # Per-stage StageDeployConfig values override pipeline-wide settings.
     if ds is not None:
+        declared_stage_args: dict[str, Any] = {}
         for k, v in asdict(ds).items():
             if k in _STAGE_RESERVED_KEYS or v is None:
                 continue
-            engine_args[k] = v
-        engine_args.update(ds.engine_extras)
+            declared_stage_args[k] = v
+        if is_diffusion:
+            from vllm_omni.diffusion.data import normalize_and_validate_omni_diffusion_kwargs
+
+            if (
+                ds.engine_extras.get("max_batch_size") is not None
+                and declared_stage_args.get("max_num_seqs") is not None
+            ):
+                raise ValueError(
+                    f"Diffusion engine fields 'max_batch_size' and 'max_num_seqs' cannot be provided together "
+                    f"for stage {ps.stage_id}."
+                )
+            mixed_stage_fields = (
+                diffusion_fields | frozenset(_STAGE_DEPLOY_FIELDS) | frozenset(_PIPELINE_WIDE_ENGINE_FIELDS)
+            )
+            normalized_extras = normalize_and_validate_omni_diffusion_kwargs(
+                ds.engine_extras,
+                mixed_stage_fields,
+                engine_ingress=True,
+                stage_id=ps.stage_id,
+            )
+            stage_args = {**declared_stage_args, **normalized_extras}
+        else:
+            stage_args = {**declared_stage_args, **ds.engine_extras}
+        engine_args.update(stage_args)
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
-    engine_args["async_chunk"] = bool(deploy.async_chunk)
+    if not is_diffusion:
+        engine_args["async_chunk"] = bool(deploy.async_chunk)
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     return engine_args
@@ -929,7 +1038,7 @@ def merge_pipeline_deploy(
         engine_args = _build_engine_args(ps, ds, pipeline, deploy, next_stage_proc)
         # Downstream stages may share a multimodal wrapper class without owning
         # an encoder. Do not make vLLM profile dummy multimodal inputs for them.
-        if not ps.requires_multimodal_data:
+        if stage_type != StageType.DIFFUSION and not ps.requires_multimodal_data:
             engine_args.setdefault("skip_mm_profiling", True)
         sched_cls = _resolve_scheduler(
             ps.execution_type,
@@ -999,16 +1108,19 @@ class StageConfig:
         engine_args: dict[str, Any] = dict(self.yaml_engine_args)
         runtime_overrides = dict(self.runtime_overrides)
 
-        # Overlay topology-level fields
-        engine_args["model_stage"] = self.model_stage
-        if self.worker_type:
-            engine_args["worker_type"] = self.worker_type
-        if self.scheduler_cls:
-            engine_args["scheduler_cls"] = self.scheduler_cls
-        if self.hf_config_name:
-            engine_args["hf_config_name"] = self.hf_config_name
-
-        if StageType(self.stage_type) == StageType.DIFFUSION:
+        stage_type = StageType(self.stage_type)
+        # The LLM engine owns its legacy stage metadata. Diffusion metadata
+        # remains on the stage envelope and never enters the strict engine
+        # payload.
+        if stage_type != StageType.DIFFUSION:
+            engine_args["model_stage"] = self.model_stage
+            if self.worker_type:
+                engine_args["worker_type"] = self.worker_type
+            if self.scheduler_cls:
+                engine_args["scheduler_cls"] = self.scheduler_cls
+            if self.hf_config_name:
+                engine_args["hf_config_name"] = self.hf_config_name
+        else:
             _apply_diffusion_parallel_runtime_overrides(engine_args, runtime_overrides)
 
         # CLI overrides take precedence over YAML defaults
@@ -1035,12 +1147,16 @@ class StageConfig:
                 stacklevel=2,
             )
             effective_mbs = int(cli_mbs or legacy_mbs or 1)
-            engine_args.setdefault("max_num_seqs", effective_mbs)
+            if cli_mbs is not None:
+                engine_args["max_num_seqs"] = effective_mbs
+            else:
+                engine_args.setdefault("max_num_seqs", effective_mbs)
 
         # Build full config dict
         config_dict: dict[str, Any] = {
             "stage_id": self.stage_id,
-            "stage_type": StageType(self.stage_type).value,
+            "stage_type": stage_type.value,
+            "model_stage": self.model_stage,
             "session_mode": self.session_mode,
             "engine_args": create_config(engine_args),
             "runtime": create_config(runtime),
