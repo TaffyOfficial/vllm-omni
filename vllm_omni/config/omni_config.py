@@ -44,6 +44,7 @@ from vllm_omni.config.stage_config import (
     _resolve_scheduler,
     _scheduler_path,
     _select_processor_funcs,
+    build_diffusion_stage_runtime_overrides,
     build_stage_runtime_overrides,
     load_deploy_config,
 )
@@ -316,8 +317,15 @@ def _resolve_scheduler_path(execution_type: StageExecutionType, async_scheduling
     return _scheduler_path(_resolve_scheduler(execution_type, async_scheduling))
 
 
-def _stage_cli_overrides(stage_id: int, cli_overrides: Mapping[str, Any]) -> dict[str, Any]:
-    runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
+def _stage_cli_overrides(
+    stage_id: int,
+    execution_type: StageExecutionType,
+    cli_overrides: Mapping[str, Any],
+) -> dict[str, Any]:
+    if execution_type == StageExecutionType.DIFFUSION:
+        runtime_overrides = build_diffusion_stage_runtime_overrides(stage_id, dict(cli_overrides))
+    else:
+        runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
     global_stage_fields = _global_stage_cli_fields()
     result: dict[str, Any] = {}
     for key, value in runtime_overrides.items():
@@ -639,7 +647,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             self.world_size = other_parallel_world_size
 
 
-@config(config=ConfigDict(arbitrary_types_allowed=True))
+@config(config=ConfigDict(arbitrary_types_allowed=True, extra="forbid"))
 class _DiffusionConfigProjection:
     """Diffusion-specific per-stage settings.
 
@@ -730,16 +738,18 @@ class _DiffusionConfigProjection:
     additional_config: dict[str, Any] = field(default_factory=dict)
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
+    request_batch_max_wait_ms: float = 0.0
+    streaming_output: bool = False
     quantization_config: _QuantizationConfigType = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> _DiffusionConfigProjection:
-        from vllm_omni.diffusion.data import normalize_omni_diffusion_kwargs
+        from vllm_omni.diffusion.data import normalize_and_validate_omni_diffusion_kwargs
 
-        normalized_kwargs = normalize_omni_diffusion_kwargs(kwargs)
-        valid_fields = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in normalized_kwargs.items() if k in valid_fields})
+        valid_fields = frozenset(f.name for f in fields(cls))
+        normalized = normalize_and_validate_omni_diffusion_kwargs(kwargs, valid_fields)
+        return cls(**{name: value for name, value in normalized.items() if value is not None})
 
     def __post_init__(self) -> None:
         # Keep diffusion imports lazy so importing vllm_omni.config does not
@@ -1170,6 +1180,19 @@ def _stage_engine_values(
     topology: StagePipelineConfig,
     stage_cli_overrides: Mapping[str, Any] | None = None,
 ) -> _StageEngineValues:
+    if topology.execution_type == StageExecutionType.DIFFUSION:
+        from vllm_omni.diffusion.data import (
+            normalize_and_validate_omni_diffusion_kwargs,
+            omni_diffusion_engine_input_fields,
+        )
+
+        if stage_deploy is not None:
+            normalize_and_validate_omni_diffusion_kwargs(
+                stage_deploy.engine_extras,
+                omni_diffusion_engine_input_fields() - {"model", "model_arch", "stage_id"},
+                engine_ingress=True,
+                stage_id=topology.stage_id,
+            )
     engine = _stage_engine_overrides(stage_deploy)
     # Preserve legacy ordering: topology-owned KV roles override deploy
     # extras, while an explicit CLI override remains highest priority.
@@ -1177,6 +1200,13 @@ def _stage_engine_values(
         engine["omni_kv_config"] = _copy_value(topology.omni_kv_config)
     if stage_cli_overrides:
         engine.update(_copy_value(stage_cli_overrides))
+    if topology.execution_type == StageExecutionType.DIFFUSION:
+        engine = normalize_and_validate_omni_diffusion_kwargs(
+            engine,
+            _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS,
+            engine_ingress=True,
+            stage_id=topology.stage_id,
+        )
     _validate_stage_engine_override_ownership(
         topology.stage_id,
         topology.execution_type,
@@ -1833,7 +1863,7 @@ class VllmOmniConfig:
                 _stage_engine_values(
                     deploy_by_id.get(topology.stage_id),
                     topology,
-                    _stage_cli_overrides(topology.stage_id, cli_overrides),
+                    _stage_cli_overrides(topology.stage_id, topology.execution_type, cli_overrides),
                 ),
                 model=model,
             )

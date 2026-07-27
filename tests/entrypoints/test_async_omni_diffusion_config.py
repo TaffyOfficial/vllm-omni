@@ -33,6 +33,30 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["model_stage"] == "diffusion"
 
 
+def test_default_stage_routes_ar_profiler_away_before_diffusion_build(mocker):
+    from vllm_omni.config.yaml_util import create_config
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.engine import stage_init_utils
+    from vllm_omni.engine.stage_init_utils import build_diffusion_config, extract_stage_metadata
+
+    stage_dict = AsyncOmniEngine._create_default_diffusion_stage_cfg({"enable_ar_profiler": True})[0]
+    assert "enable_ar_profiler" not in stage_dict["engine_args"]
+
+    stage_cfg = create_config(stage_dict)
+    built = SimpleNamespace(
+        parallel_config=SimpleNamespace(world_size=1),
+        num_gpus=None,
+        cfg_kv_collect_func=None,
+    )
+    from_kwargs = mocker.patch.object(OmniDiffusionConfig, "from_kwargs", return_value=built)
+    mocker.patch.object(stage_init_utils.current_omni_platform, "get_device_count", return_value=1)
+
+    result = build_diffusion_config("unused", stage_cfg, extract_stage_metadata(stage_cfg))
+
+    assert result is built
+    assert "enable_ar_profiler" not in from_kwargs.call_args.kwargs
+
+
 def test_default_cache_config_used_when_missing():
     """Ensure default cache_config is synthesized when only backend is given."""
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(

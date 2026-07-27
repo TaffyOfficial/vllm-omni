@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import fields
 from inspect import Parameter, signature
 from pathlib import Path
@@ -45,6 +46,8 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
+    StagePipelineConfig,
+    build_diffusion_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
 )
@@ -1218,3 +1221,164 @@ def test_diffusion_quantization_mapping_reaches_terminal_config(monkeypatch):
 
     assert cfg.quantization_config is not None
     assert cfg.quantization_config.get_name() == "int8"
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        omni_config_module._DiffusionConfigProjection.from_kwargs,
+        pytest.param(
+            lambda **kwargs: __import__(
+                "vllm_omni.diffusion.data",
+                fromlist=["OmniDiffusionConfig"],
+            ).OmniDiffusionConfig.from_kwargs(**kwargs),
+            id="runtime-config",
+        ),
+    ],
+)
+def test_diffusion_config_entrypoints_reject_unknown_none(factory):
+    with pytest.raises((ValueError, ValidationError), match="enable_sleep_mod"):
+        factory(enable_sleep_mod=None)
+
+
+def test_direct_diffusion_aliases_promote_none_and_reject_real_conflicts(monkeypatch):
+    from vllm_omni.diffusion import data as diffusion_data
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    monkeypatch.setattr(diffusion_data, "build_quant_config", lambda config: config)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        config = OmniDiffusionConfig.from_kwargs(
+            quantization={"method": "example"},
+            quantization_config=None,
+            kv_cache_dtype="fp8",
+            diffusion_kv_cache_dtype=None,
+        )
+
+    assert config.quantization_config == {"method": "example"}
+    assert config.diffusion_kv_cache_dtype == "fp8"
+    assert sum(item.category is FutureWarning for item in caught) == 1
+    with pytest.raises(ValueError, match=r"quantization.*quantization_config"):
+        OmniDiffusionConfig.from_kwargs(quantization="fp8", quantization_config={"method": "example"})
+
+    compatibility = OmniDiffusionConfig.from_kwargs(
+        diffusion_quantization_config={"method": "compat"},
+        auxiliary_text_encoder="text-encoder",
+        max_batch_size=3,
+    )
+    assert compatibility.quantization_config == {"method": "compat"}
+    assert compatibility.extras["auxiliary_text_encoder"] == "text-encoder"
+    assert compatibility.max_num_seqs == 3
+
+
+def test_structured_projection_keeps_existing_diffusion_runtime_fields():
+    projection = omni_config_module._DiffusionConfigProjection.from_kwargs(
+        engine_backend="custom",
+        diffusion_model_runner_cls="example.Runner",
+        enable_session_state_manager=True,
+        request_batch_max_wait_ms=2.5,
+        streaming_output=True,
+    )
+
+    assert projection.engine_backend == "custom"
+    assert projection.diffusion_model_runner_cls == "example.Runner"
+    assert projection.enable_session_state_manager is True
+    assert projection.request_batch_max_wait_ms == 2.5
+    assert projection.streaming_output is True
+
+
+def test_diffusion_cli_routes_shared_fields_and_rejects_stage_identity():
+    assert (
+        build_diffusion_stage_runtime_overrides(
+            0,
+            {"seed": 7, "kv_cache_dtype": "fp8", "model_arch": "override"},
+        )
+        == {}
+    )
+    for key in ("seed", "kv_cache_dtype", "stage_id", "model", "model_arch"):
+        with pytest.raises(ValueError, match=rf"stage 0.*{key}"):
+            build_diffusion_stage_runtime_overrides(0, {f"stage_0_{key}": None})
+    with pytest.raises(ValueError, match=r"stage 0.*enable_sleep_mod"):
+        build_diffusion_stage_runtime_overrides(0, {"enable_sleep_mod": None})
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_diffusion_engine_extras_reject_unowned_and_producer_fields(structured):
+    pipeline = PipelineConfig(
+        model_type="diffusion-owner-test",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="diffusion",
+                execution_type=StageExecutionType.DIFFUSION,
+            ),
+        ),
+    )
+    deploy = DeployConfig(
+        async_chunk=False,
+        stages=[StageDeployConfig(stage_id=0, engine_extras={"model_arch": "override"})],
+    )
+
+    with pytest.raises(ValueError, match=r"stage 0.*model_arch"):
+        if structured:
+            VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+        else:
+            merge_pipeline_deploy(pipeline, deploy)
+
+
+def test_diffusion_stage_rejects_service_field_without_stage_consumer():
+    from vllm_omni.engine.stage_init_utils import _strict_diffusion_config_kwargs
+
+    pipeline = PipelineConfig(
+        model_type="diffusion-owner-test",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="diffusion",
+                execution_type=StageExecutionType.DIFFUSION,
+            ),
+        ),
+    )
+    deploy = DeployConfig(
+        async_chunk=False,
+        stages=[StageDeployConfig(stage_id=0, tts_max_instructions_length=128)],
+    )
+    stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
+
+    with pytest.raises(ValueError, match="tts_max_instructions_length"):
+        _strict_diffusion_config_kwargs(dict(stage.engine_args))
+
+
+def test_deploy_flat_diffusion_parallel_field_reaches_nested_payload():
+    pipeline = PipelineConfig(
+        model_type="diffusion-owner-test",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="diffusion",
+                execution_type=StageExecutionType.DIFFUSION,
+            ),
+        ),
+    )
+    stage = merge_pipeline_deploy(
+        pipeline,
+        DeployConfig(
+            async_chunk=False,
+            stages=[StageDeployConfig(stage_id=0, vae_parallel_mode="spatial_shard_height")],
+        ),
+    )[0].to_omegaconf()
+
+    assert stage.engine_args.parallel_config.vae_parallel_mode == "spatial_shard_height"
+    assert "vae_parallel_mode" not in stage.engine_args
+
+
+def test_strict_runtime_partition_rejects_shared_fields_without_consumer():
+    from vllm_omni.engine.stage_init_utils import _strict_diffusion_config_kwargs
+
+    payload = _strict_diffusion_config_kwargs(
+        {"model": "unused", "stage_id": 0, "model_stage": "diffusion", "model_arch": "Example"}
+    )
+    assert payload == {"model": "unused", "stage_id": 0}
+    for key in ("seed", "kv_cache_dtype"):
+        with pytest.raises(ValueError, match=key):
+            _strict_diffusion_config_kwargs({"model": "unused", "stage_id": 0, key: None})
