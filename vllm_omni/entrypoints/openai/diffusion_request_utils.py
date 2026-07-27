@@ -7,6 +7,7 @@ import copy
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, is_dataclass
 from dataclasses import replace as dataclass_replace
+from functools import partial
 from types import MappingProxyType
 from typing import Any
 
@@ -73,12 +74,7 @@ def _reject_duplicates(sources_by_key: Mapping[str, list[str]]) -> None:
 
 
 def _parse(key: str, value: object) -> object:
-    if key == "num_inference_steps" and value is not None:
-        try:
-            return int(value)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("num_inference_steps must be an integer.") from exc
-    if key in {"height", "width", "target_h", "target_w"} and value is not None:
+    if key in {"num_inference_steps", "height", "width", "target_h", "target_w"} and value is not None:
         try:
             return int(value)
         except (TypeError, ValueError, OverflowError) as exc:
@@ -115,42 +111,224 @@ def _replace_params(params: Any, overrides: Mapping[str, object]) -> Any:
     return type(params)(**(values | overrides))
 
 
-class _Assignments:
-    """Collect provenance, then build final typed stages from cloned defaults."""
-
-    def __init__(self, params: list[Any]) -> None:
-        self.params = params
-        self.items: list[tuple[int, str, str, object, str, bool, bool]] = []
-
-    def add(
+class _PlanBuilder:
+    def __init__(
         self,
-        stage: int,
+        request: object,
+        stage_types: Sequence[str],
+        defaults: Sequence[object],
+        comprehension_stage: int | None,
+        root_fields: Mapping[str, str],
+        standard_fields: Collection[str],
+        control_fields: Collection[str],
+        declared_fields: Collection[str],
+        fan_out_declared: bool,
+        supported_modalities: Collection[str],
+    ) -> None:
+        self.request = request
+        self.declared = frozenset(declared_fields)
+        self.root_fields = root_fields
+        self.standard_fields = frozenset(standard_fields)
+        self.control_fields = frozenset(control_fields)
+        self.sampling_fields = {key: target for key, target in root_fields.items() if key not in self.declared}
+        self.fan_out_declared = fan_out_declared
+        self.supported_modalities = frozenset(supported_modalities)
+        self.comprehension_stage = comprehension_stage
+        self.types = list(stage_types) or ["diffusion"]
+        self.params = [
+            _stage_params(stage_type, defaults[index] if index < len(defaults) else None)
+            for index, stage_type in enumerate(self.types)
+        ]
+        self.diffusion_stages = [index for index, stage_type in enumerate(self.types) if stage_type == "diffusion"]
+        self.items: list[list[tuple[str, str, object, str, bool]]] = [[] for _ in self.params]
+        self.claims: list[dict[str, list[str]]] = [{} for _ in self.params]
+
+    def collect_sources(self) -> None:
+        consumed = self.declared | self.sampling_fields.keys() | self.control_fields
+        model_extra = getattr(self.request, "model_extra", None)
+        self.flat = dict(model_extra) if isinstance(model_extra, Mapping) else {}
+        nested_value = self.flat.pop("extra_body", None)
+        if nested_value is None:
+            nested_value = getattr(self.request, "extra_body", None)
+        self.nested = _mapping("extra_body", nested_value)
+        explicit = getattr(self.request, "model_fields_set", None)
+        if explicit is None:
+            explicit = getattr(self.request, "__fields_set__", ())
+        self.explicit = set(explicit) if isinstance(explicit, Collection) else set()
+        for key in self.explicit:
+            if key not in self.flat and (
+                key in consumed or key in self.standard_fields or key == "sampling_params_list"
+            ):
+                self.flat[key] = getattr(self.request, key, None)
+
+        self.values: list[tuple[str, object, str, bool]] = [
+            (key, values[key], f"{prefix}.{key}", False)
+            for values, prefix in ((self.flat, "request"), (self.nested, "request.extra_body"))
+            for key in sorted(values)
+            if key in consumed
+        ]
+        for name, value in (
+            ("request.extra_args", self.flat.get("extra_args")),
+            ("request.extra_params", self.flat.get("extra_params")),
+            ("request.extra_body.extra_args", self.nested.get("extra_args")),
+            ("request.extra_body.extra_params", self.nested.get("extra_params")),
+        ):
+            values = _mapping(name.removeprefix("request."), value)
+            self.values.extend((key, values[key], f"{name}.{key}", True) for key in sorted(values))
+
+        claims: dict[str, list[str]] = {}
+        self.by_key: dict[str, tuple[object, str]] = {}
+        for key, value, source, is_container in self.values:
+            conflict_key = key if key in self.declared else self.root_fields.get(key, key)
+            claims.setdefault(conflict_key, []).append(source)
+            if not is_container or key in self.declared:
+                self.by_key[key] = (value, source)
+        _reject_duplicates(claims)
+
+    def validate_sources(self) -> None:
+        self.controls = {
+            key: value
+            for key, (value, _source) in self.by_key.items()
+            if key in self.control_fields and key not in {"size", "lora"} and value is not None
+        }
+        modalities = self.controls.get("modalities")
+        if modalities is not None:
+            if not isinstance(modalities, list) or not all(isinstance(modality, str) for modality in modalities):
+                raise ValueError("'modalities' must be a list of strings.")
+            unsupported = set(modalities) - self.supported_modalities
+            if unsupported:
+                raise ValueError(
+                    f"Unsupported output modalities {', '.join(sorted(unsupported))} for this model. "
+                    f"Supported modalities: {', '.join(sorted(self.supported_modalities))}"
+                )
+
+        self.height = self.by_key.get("height", (None, ""))[0]
+        self.width = self.by_key.get("width", (None, ""))[0]
+        self.invalid_size: object | None = None
+        if "size" in self.by_key and (self.height is None or self.width is None):
+            size, source = self.by_key["size"]
+            try:
+                if isinstance(size, str) and "x" in size.lower():
+                    width, height = (int(part) for part in size.lower().split("x"))
+                    for key, value in (("height", height), ("width", width)):
+                        if getattr(self, key) is None:
+                            setattr(self, key, value)
+                            self.by_key[key] = (value, source)
+                            self.values.append((key, value, source, False))
+            except ValueError:
+                self.invalid_size = size
+        self.controls.update(
+            {
+                key: _parse(key, value)
+                for key, value in (("height", self.height), ("width", self.width))
+                if value is not None
+            }
+        )
+
+    def _assign(
+        self,
+        stages: int | Collection[int],
         key: str,
         value: object,
         source: str,
         *,
         target: str | None = None,
-        keep_none: bool = False,
         parse_value: bool = True,
     ) -> None:
-        self.items.append((stage, key, target or key, value, source, keep_none, parse_value))
+        for stage in (stages,) if isinstance(stages, int) else stages:
+            self.claims[stage].setdefault(key, []).append(source)
+            self.items[stage].append((key, target or key, value, source, parse_value))
 
-    def reject_duplicates(self) -> None:
-        for stage in range(len(self.params)):
-            claims: dict[str, list[str]] = {}
-            for claimed_stage, key, _target, _value, source, _keep_none, _parse_value in self.items:
-                if claimed_stage == stage:
-                    claims.setdefault(key, []).append(source)
+    def build_stage_assignments(self) -> None:
+        assign = self._assign
+        extra = partial(assign, target="extra_args")
+        diffusion = self.diffusion_stages
+        declared_stages: Collection[int] = range(len(self.types)) if self.fan_out_declared else diffusion
+        for key, value, source, is_container in self.values:
+            if value is None and (not is_container or key in self.declared):
+                continue
+            if key in self.declared:
+                extra(declared_stages, key, value, source)
+            elif is_container:
+                extra(diffusion, key, value, source, parse_value=False)
+            elif key in self.sampling_fields:
+                assign(diffusion, self.sampling_fields[key], value, source)
+
+        stage = self.comprehension_stage
+        if stage is not None:
+            if self.fan_out_declared and self.types[stage] != "diffusion":
+                for key, value, source, _is_container in self.values:
+                    if value is not None and key in self.declared and key in self.standard_fields:
+                        assign(stage, key, value, source)
+            for key in self.standard_fields & self.explicit - self.declared:
+                if self.types[stage] == "diffusion" and key in self.sampling_fields:
+                    continue
+                value = getattr(self.request, key, None)
+                if value is not None and (not isinstance(value, list) or value):
+                    assign(stage, key, value, f"request.{key}")
+            for key, value, source_key in (
+                ("target_h", self.height, "height"),
+                ("target_w", self.width, "width"),
+            ):
+                if value is not None:
+                    extra(stage, key, value, self.by_key[source_key][1])
+
+        stage_sources = [
+            (f"{prefix}.sampling_params_list", values["sampling_params_list"])
+            for values, prefix in ((self.flat, "request"), (self.nested, "request.extra_body"))
+            if "sampling_params_list" in values
+        ]
+        _reject_duplicates({"sampling_params_list": [source for source, _value in stage_sources]})
+        stage_source, raw_stages = (
+            stage_sources[0]
+            if stage_sources
+            else ("request.sampling_params_list", getattr(self.request, "sampling_params_list", None))
+        )
+        if raw_stages is not None:
+            if not isinstance(raw_stages, list):
+                raise ValueError(f"{stage_source} must be a JSON array.")
+            if len(raw_stages) > len(self.params):
+                raise ValueError(
+                    f"sampling_params_list has {len(raw_stages)} entries, "
+                    f"but the pipeline has {len(self.params)} stages."
+                )
+            for stage, raw_params in enumerate(raw_stages):
+                values = _mapping(f"{stage_source}[{stage}]", raw_params, required=True)
+                extras = _mapping(f"{stage_source}[{stage}].extra_args", values.pop("extra_args", None))
+                is_diffusion = self.types[stage] == "diffusion"
+                for key in sorted(values):
+                    target = "extra_args" if is_diffusion and key in self.declared else None
+                    claim = self.sampling_fields.get(key, key) if is_diffusion and target is None else key
+                    assign(stage, claim, values[key], f"{stage_source}[{stage}].{key}", target=target)
+                for key in sorted(extras):
+                    extra(
+                        stage,
+                        key,
+                        extras[key],
+                        f"{stage_source}[{stage}].extra_args.{key}",
+                        parse_value=is_diffusion and key in self.declared,
+                    )
+
+        for claims in self.claims:
             _reject_duplicates(claims)
+        if "lora" in self.by_key and self.by_key["lora"][0] is not None:
+            value, source = self.by_key["lora"]
+            try:
+                lora_request, lora_scale = parse_lora_request(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(str(exc)) from exc
+            if lora_request is not None:
+                assign(diffusion, "lora_request", lora_request, source)
+            if lora_scale is not None:
+                assign(diffusion, "lora_scale", lora_scale, source)
 
-    def apply(self) -> None:
-        self.reject_duplicates()
-        for stage, params in enumerate(self.params):
+    def apply_assignments(self) -> None:
+        for claims in self.claims:
+            _reject_duplicates(claims)
+        for stage, (params, items) in enumerate(zip(self.params, self.items)):
             overrides: dict[str, object] = {}
             extra_args: dict[str, object] = {}
-            for item_stage, key, target, value, source, keep_none, parse_value in self.items:
-                if item_stage != stage or (value is None and not keep_none):
-                    continue
+            for key, target, value, source, parse_value in items:
                 if target == "extra_args":
                     if not hasattr(params, "extra_args"):
                         raise ValueError(f"{source} is not supported by stage {stage}.")
@@ -187,231 +365,29 @@ def compile_diffusion_chat_request_plan(
     supported_modalities: Collection[str],
 ) -> DiffusionChatRequestPlan:
     """Compile all Chat request sources into final typed stage parameters."""
-    declared = frozenset(declared_extra_fields)
-    controls_fields = frozenset(control_root_fields)
-    sampling_fields = {
-        request_key: target_key
-        for request_key, target_key in sampling_root_fields.items()
-        if request_key not in declared
-    }
-    consumed = declared | sampling_fields.keys() | controls_fields
-
-    model_extra = getattr(request, "model_extra", None)
-    flat = dict(model_extra) if isinstance(model_extra, Mapping) else {}
-    nested_value = flat.pop("extra_body", None)
-    if nested_value is None:
-        nested_value = getattr(request, "extra_body", None)
-    nested = _mapping("extra_body", nested_value)
-
-    explicit = getattr(request, "model_fields_set", None)
-    if explicit is None:
-        explicit = getattr(request, "__fields_set__", ())
-    explicit = set(explicit) if isinstance(explicit, Collection) else set()
-    for key in explicit:
-        if key not in flat and (key in consumed or key in standard_sampling_fields or key == "sampling_params_list"):
-            flat[key] = getattr(request, key, None)
-
-    roots: list[tuple[str, object, str]] = []
-    for values, prefix in ((flat, "request"), (nested, "request.extra_body")):
-        roots.extend((key, values[key], f"{prefix}.{key}") for key in sorted(values) if key in consumed)
-
-    raw_containers = (
-        ("request.extra_args", flat.get("extra_args")),
-        ("request.extra_params", flat.get("extra_params")),
-        ("request.extra_body.extra_args", nested.get("extra_args")),
-        ("request.extra_body.extra_params", nested.get("extra_params")),
+    builder = _PlanBuilder(
+        request,
+        stage_types,
+        default_sampling_params_list,
+        comprehension_stage_index,
+        sampling_root_fields,
+        standard_sampling_fields,
+        control_root_fields,
+        declared_extra_fields,
+        apply_declared_to_non_diffusion,
+        supported_modalities,
     )
-    containers = [(name, _mapping(name.removeprefix("request."), value)) for name, value in raw_containers]
-    global_values = [(key, value, source, False) for key, value, source in roots]
-    global_values.extend(
-        (key, values[key], f"{name}.{key}", True) for name, values in containers for key in sorted(values)
-    )
-    global_claims: dict[str, list[str]] = {}
-    for key, _value, source, _is_container in global_values:
-        conflict_key = key if key in declared else sampling_root_fields.get(key, key)
-        global_claims.setdefault(conflict_key, []).append(source)
-    _reject_duplicates(global_claims)
-
-    types = list(stage_types) or ["diffusion"]
-    params = [
-        _stage_params(
-            stage_type,
-            default_sampling_params_list[index] if index < len(default_sampling_params_list) else None,
-        )
-        for index, stage_type in enumerate(types)
-    ]
-    diffusion_stages = [index for index, stage_type in enumerate(types) if stage_type == "diffusion"]
-    assignments = _Assignments(params)
-    serving_by_key = {
-        key: (value, source)
-        for key, value, source, is_container in global_values
-        if not is_container or key in declared
-    }
-
-    controls = {
-        key: value
-        for key, (value, _source) in serving_by_key.items()
-        if key in controls_fields and key not in {"size", "lora"} and value is not None
-    }
-    modalities = controls.get("modalities")
-    if modalities is not None and (
-        not isinstance(modalities, list) or not all(isinstance(modality, str) for modality in modalities)
-    ):
-        raise ValueError("'modalities' must be a list of strings.")
-    if modalities is not None:
-        allowed = set(supported_modalities)
-        unsupported = set(modalities) - allowed
-        if unsupported:
-            raise ValueError(
-                f"Unsupported output modalities {', '.join(sorted(unsupported))} for this model. "
-                f"Supported modalities: {', '.join(sorted(allowed))}"
-            )
-    height = serving_by_key.get("height", (None, ""))[0]
-    width = serving_by_key.get("width", (None, ""))[0]
-    invalid_size: object | None = None
-    if "size" in serving_by_key and (height is None or width is None):
-        size, source = serving_by_key["size"]
-        try:
-            if isinstance(size, str) and "x" in size.lower():
-                parsed_width, parsed_height = (int(part) for part in size.lower().split("x"))
-                if height is None:
-                    height = parsed_height
-                    serving_by_key["height"] = (height, source)
-                    global_values.append(("height", height, source, False))
-                if width is None:
-                    width = parsed_width
-                    serving_by_key["width"] = (width, source)
-                    global_values.append(("width", width, source, False))
-        except ValueError:
-            invalid_size = size
-
-    for request_key, value, source, is_container in global_values:
-        if request_key in declared:
-            targets = list(range(len(types))) if apply_declared_to_non_diffusion else diffusion_stages
-            for stage in targets:
-                assignments.add(
-                    stage,
-                    request_key,
-                    value,
-                    source,
-                    target="extra_args",
-                )
-        elif is_container:
-            for stage in diffusion_stages:
-                assignments.add(
-                    stage,
-                    request_key,
-                    value,
-                    source,
-                    target="extra_args",
-                    keep_none=True,
-                    parse_value=False,
-                )
-        elif request_key in sampling_fields:
-            target = sampling_fields[request_key]
-            for stage in diffusion_stages:
-                assignments.add(stage, target, value, source)
-
-    if comprehension_stage_index is not None:
-        if apply_declared_to_non_diffusion and types[comprehension_stage_index] != "diffusion":
-            for key, value, source, _is_container in global_values:
-                if key in declared and key in standard_sampling_fields:
-                    assignments.add(comprehension_stage_index, key, value, source)
-        for key in standard_sampling_fields:
-            if key not in explicit:
-                continue
-            if key in declared:
-                continue
-            if types[comprehension_stage_index] == "diffusion" and key in sampling_fields:
-                continue
-            value = getattr(request, key, None)
-            if not isinstance(value, list) or value:
-                assignments.add(comprehension_stage_index, key, value, f"request.{key}")
-        for key, value in (("target_h", height), ("target_w", width)):
-            if value is not None:
-                source_key = "height" if key == "target_h" else "width"
-                assignments.add(
-                    comprehension_stage_index,
-                    key,
-                    value,
-                    serving_by_key[source_key][1],
-                    target="extra_args",
-                )
-
-    stage_sources = [
-        (f"{prefix}.sampling_params_list", values["sampling_params_list"])
-        for values, prefix in ((flat, "request"), (nested, "request.extra_body"))
-        if "sampling_params_list" in values
-    ]
-    _reject_duplicates({"sampling_params_list": [source for source, _value in stage_sources]})
-    stage_source, raw_stages = (
-        stage_sources[0]
-        if stage_sources
-        else ("request.sampling_params_list", getattr(request, "sampling_params_list", None))
-    )
-    if raw_stages is not None:
-        if not isinstance(raw_stages, list):
-            raise ValueError(f"{stage_source} must be a JSON array.")
-        if len(raw_stages) > len(params):
-            raise ValueError(
-                f"sampling_params_list has {len(raw_stages)} entries, but the pipeline has {len(params)} stages."
-            )
-        for stage, raw_params in enumerate(raw_stages):
-            stage_values = _mapping(
-                f"{stage_source}[{stage}]",
-                raw_params,
-                required=True,
-            )
-            stage_extras = _mapping(
-                f"{stage_source}[{stage}].extra_args",
-                stage_values.pop("extra_args", None),
-            )
-            is_diffusion = types[stage] == "diffusion"
-            for key in sorted(stage_values):
-                value = stage_values[key]
-                source = f"{stage_source}[{stage}].{key}"
-                if is_diffusion and key in declared:
-                    assignments.add(stage, key, value, source, target="extra_args", keep_none=True)
-                else:
-                    target = sampling_fields.get(key, key) if is_diffusion else key
-                    assignments.add(stage, target, value, source, keep_none=True)
-            for key in sorted(stage_extras):
-                value = stage_extras[key]
-                assignments.add(
-                    stage,
-                    key,
-                    value,
-                    f"{stage_source}[{stage}].extra_args.{key}",
-                    target="extra_args",
-                    keep_none=True,
-                    parse_value=is_diffusion and key in declared,
-                )
-
-    assignments.reject_duplicates()
-    controls.update(
-        {key: _parse(key, value) for key, value in (("height", height), ("width", width)) if value is not None}
-    )
-    if "lora" in serving_by_key and serving_by_key["lora"][0] is not None:
-        value, source = serving_by_key["lora"]
-        try:
-            lora_request, lora_scale = parse_lora_request(value)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(str(exc)) from exc
-        for stage in diffusion_stages:
-            if lora_request is not None:
-                assignments.add(stage, "lora_request", lora_request, source)
-            if lora_scale is not None:
-                assignments.add(stage, "lora_scale", lora_scale, source)
-
-    assignments.apply()
-    plan = DiffusionChatRequestPlan(
-        controls=MappingProxyType(copy.deepcopy(controls)),
-        _stage_params=tuple(params),
-    )
-    if invalid_size is not None:
-        logger.warning("Invalid size format: %s", invalid_size)
-    if flat.get("extra_params") is not None or nested.get("extra_params") is not None:
+    builder.collect_sources()
+    builder.validate_sources()
+    builder.build_stage_assignments()
+    builder.apply_assignments()
+    if builder.invalid_size is not None:
+        logger.warning("Invalid size format: %s", builder.invalid_size)
+    if builder.flat.get("extra_params") is not None or builder.nested.get("extra_params") is not None:
         logger.warning_once(
             "extra_params is deprecated; use extra_args for model-specific diffusion request parameters."
         )
-    return plan
+    return DiffusionChatRequestPlan(
+        controls=MappingProxyType(copy.deepcopy(builder.controls)),
+        _stage_params=tuple(builder.params),
+    )
