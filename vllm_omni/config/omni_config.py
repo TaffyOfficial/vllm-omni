@@ -1181,15 +1181,12 @@ def _stage_engine_values(
     stage_cli_overrides: Mapping[str, Any] | None = None,
 ) -> _StageEngineValues:
     if topology.execution_type == StageExecutionType.DIFFUSION:
-        from vllm_omni.diffusion.data import (
-            normalize_and_validate_omni_diffusion_kwargs,
-            omni_diffusion_engine_input_fields,
-        )
+        from vllm_omni.diffusion.data import normalize_and_validate_omni_diffusion_kwargs
 
         if stage_deploy is not None:
             normalize_and_validate_omni_diffusion_kwargs(
                 stage_deploy.engine_extras,
-                omni_diffusion_engine_input_fields() - {"model", "model_arch", "stage_id"},
+                _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS,
                 engine_ingress=True,
                 stage_id=topology.stage_id,
             )

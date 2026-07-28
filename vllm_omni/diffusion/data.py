@@ -109,7 +109,8 @@ def normalize_omni_diffusion_kwargs(
     # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND.
     if "cache_backend" not in normalized:
         cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
-        normalized["cache_backend"] = cache_backend.lower() if cache_backend else "none"
+        if cache_backend:
+            normalized["cache_backend"] = cache_backend.lower()
 
     # Convert optional YAML null values to empty containers.
     for key in ("diffusers_load_kwargs", "diffusers_call_kwargs"):

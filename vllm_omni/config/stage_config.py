@@ -50,6 +50,7 @@ def build_stage_runtime_overrides(
     *,
     internal_keys: set[str] | frozenset[str] | None = None,
     excluded_global_keys: set[str] | frozenset[str] = frozenset(),
+    allowed_global_keys: set[str] | frozenset[str] | None = None,
     allowed_stage_keys: set[str] | frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Build per-stage runtime overrides from global and ``stage_<id>_*`` kwargs.
@@ -60,7 +61,9 @@ def build_stage_runtime_overrides(
     (``model`` / ``log_stats`` / ``stage_id``) leak
     into a stage's per-stage runtime overrides — the orchestrator sets those
     uniformly for every stage, they are not per-stage knobs. Callers can
-    pass an explicit set for tests or specialized flows.
+    pass an explicit set for tests or specialized flows. ``allowed_global_keys``
+    lets typed stage paths project a mixed CLI namespace onto their existing
+    stage schemas instead of maintaining another blacklist.
     """
     if internal_keys is None:
         from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
@@ -89,7 +92,12 @@ def build_stage_runtime_overrides(
                 result[param_name] = value
             continue
 
-        if value is None or key in internal_keys or key in excluded_global_keys:
+        if (
+            value is None
+            or key in internal_keys
+            or key in excluded_global_keys
+            or (allowed_global_keys is not None and key not in allowed_global_keys)
+        ):
             continue
         result[key] = value
 
@@ -102,30 +110,18 @@ def build_diffusion_stage_runtime_overrides(
 ) -> dict[str, Any]:
     """Route global shared fields away and validate diffusion-stage inputs."""
     from vllm_omni.diffusion.data import omni_diffusion_engine_input_fields
-    from vllm_omni.engine.arg_utils import OmniEngineArgs, OrchestratorArgs
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
 
     diffusion_fields = omni_diffusion_engine_input_fields()
     stage_fields = diffusion_fields - {"model", "model_arch", "stage_id"}
     engine_fields = frozenset(config_field.name for config_field in fields(OmniEngineArgs))
-    known_fields = (
-        engine_fields
-        | frozenset(config_field.name for config_field in fields(OrchestratorArgs))
-        | diffusion_fields
-        | deploy_runtime_override_keys()
-    )
-    unknown_null = sorted(
-        key
-        for key, value in cli_overrides.items()
-        if value is None and _STAGE_OVERRIDE_PATTERN.match(key) is None and key not in known_fields
-    )
-    if unknown_null:
-        names = ", ".join(repr(name) for name in unknown_null)
-        raise ValueError(f"Unknown diffusion config field(s) for stage {stage_id}: {names}")
+    runtime_fields = deploy_runtime_override_keys()
     return build_stage_runtime_overrides(
         stage_id,
         cli_overrides,
         excluded_global_keys=(engine_fields - diffusion_fields) | {"model_arch"},
-        allowed_stage_keys=stage_fields | deploy_runtime_override_keys() | {"devices", "num_replicas"},
+        allowed_global_keys=stage_fields | runtime_fields,
+        allowed_stage_keys=stage_fields | runtime_fields | {"devices", "num_replicas"},
     )
 
 
@@ -932,7 +928,8 @@ def _build_engine_args(
 
             normalize_and_validate_omni_diffusion_kwargs(
                 ds.engine_extras,
-                omni_diffusion_engine_input_fields() - {"model", "model_arch", "stage_id"},
+                (omni_diffusion_engine_input_fields() | deploy_runtime_override_keys())
+                - {"model", "model_arch", "stage_id"},
                 engine_ingress=True,
                 stage_id=ps.stage_id,
             )

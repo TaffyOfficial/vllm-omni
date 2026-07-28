@@ -1288,18 +1288,30 @@ def test_structured_projection_keeps_existing_diffusion_runtime_fields():
 
 
 def test_diffusion_cli_routes_shared_fields_and_rejects_stage_identity():
-    assert (
-        build_diffusion_stage_runtime_overrides(
-            0,
-            {"seed": 7, "kv_cache_dtype": "fp8", "model_arch": "override"},
-        )
-        == {}
-    )
-    for key in ("seed", "kv_cache_dtype", "stage_id", "model", "model_arch"):
+    assert build_diffusion_stage_runtime_overrides(
+        0,
+        {
+            "seed": 7,
+            "kv_cache_dtype": "fp8",
+            "model_arch": "override",
+            "model_tag": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            "subparser": "serve",
+            "enable_prefix_caching": True,
+            "omni_kv_config": {"need_recv_cache": True},
+        },
+    ) == {
+        "omni_kv_config": {"need_recv_cache": True},
+    }
+    for key in (
+        "seed",
+        "kv_cache_dtype",
+        "stage_id",
+        "model",
+        "model_arch",
+        "enable_sleep_mod",
+    ):
         with pytest.raises(ValueError, match=rf"stage 0.*{key}"):
             build_diffusion_stage_runtime_overrides(0, {f"stage_0_{key}": None})
-    with pytest.raises(ValueError, match=r"stage 0.*enable_sleep_mod"):
-        build_diffusion_stage_runtime_overrides(0, {"enable_sleep_mod": None})
 
 
 @pytest.mark.parametrize("structured", [False, True])
