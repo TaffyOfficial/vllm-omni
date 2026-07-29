@@ -64,9 +64,6 @@ def normalize_diffusion_request_args(
 
     conflicts = {key: list(dict.fromkeys(paths)) for key, paths in sources_by_key.items() if len(set(paths)) > 1}
     if conflicts:
-        if len(conflicts) == 1:
-            key, paths = next(iter(conflicts.items()))
-            raise ValueError(f'Parameter "{key}" was provided more than once: {", ".join(paths)}.')
         details = "; ".join(f'"{key}": {", ".join(conflicts[key])}' for key in sorted(conflicts))
         raise ValueError(f"Diffusion request parameters were provided more than once: {details}.")
 

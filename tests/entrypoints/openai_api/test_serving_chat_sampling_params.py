@@ -189,7 +189,7 @@ def test_duplicate_extras_return_the_same_bad_request_before_dispatch(
 
     assert response.error.code == 400
     assert response.error.message == (
-        'Parameter "sample_solver" was provided more than once: '
+        'Diffusion request parameters were provided more than once: "sample_solver": '
         "request.sample_solver, request.extra_args.sample_solver."
     )
     check_model.assert_not_awaited()
