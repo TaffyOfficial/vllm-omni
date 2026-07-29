@@ -151,7 +151,6 @@ class _ModelEngineOverrides(TypedDict, total=False):
     interleave_mm_strings: bool
     media_io_kwargs: dict[str, Any]
     active_stream_window: int
-    retains_state_across_chunks: bool
     enable_sleep_mode: bool
     omni_kv_config: dict[str, Any]
     subtalker_sampling_params: dict[str, Any]
@@ -1026,11 +1025,7 @@ _PARALLEL_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(
 )
 
 _QUANTIZATION_ENGINE_FIELDS = frozenset(_QuantizationEngineOverrides.__annotations__)
-_MODEL_ENGINE_FIELDS = frozenset(
-    config_field.name
-    for config_field in fields(OmniStageModelConfig)
-    if config_field.name not in {"default_sampling_params", "model_subdir", "tokenizer_subdir"}
-)
+_MODEL_ENGINE_FIELDS = frozenset(_ModelEngineOverrides.__annotations__)
 _LOAD_ENGINE_FIELDS = frozenset(_LoadEngineOverrides.__annotations__)
 _CACHE_ENGINE_FIELDS = frozenset(_CacheEngineOverrides.__annotations__)
 _SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
@@ -1136,6 +1131,11 @@ def _validate_stage_engine_override_ownership(
             f"Stage {stage_id} ({execution_type.value}) has explicit engine argument(s) "
             f"with no structured config owner: {names}"
         )
+
+
+def omni_stage_engine_input_fields() -> frozenset[str]:
+    """Raw per-stage engine fields with a declared structured-config owner."""
+    return _KNOWN_STAGE_ENGINE_FIELDS
 
 
 def _global_stage_cli_fields() -> frozenset[str]:

@@ -590,6 +590,18 @@ class StageConfigFactory:
         Returns:
             List containing a single config dict for the diffusion stage.
         """
+        from vllm_omni.diffusion.data import (
+            normalize_and_validate_omni_diffusion_kwargs,
+            omni_diffusion_engine_input_fields,
+        )
+
+        kwargs = normalize_and_validate_omni_diffusion_kwargs(
+            kwargs,
+            omni_diffusion_engine_input_fields(),
+            engine_ingress=True,
+            stage_id=0,
+        )
+
         # Calculate devices based on parallel config
         devices = "0"
         if "parallel_config" in kwargs:

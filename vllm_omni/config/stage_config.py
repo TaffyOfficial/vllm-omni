@@ -916,24 +916,25 @@ def _build_engine_args(
 
     # Per-stage StageDeployConfig values override pipeline-wide settings.
     if ds is not None:
+        stage_deploy_engine_args: dict[str, Any] = {}
         for k, v in asdict(ds).items():
             if k in _STAGE_RESERVED_KEYS or v is None:
                 continue
-            engine_args[k] = v
+            stage_deploy_engine_args[k] = v
+        stage_deploy_engine_args.update(ds.engine_extras)
         if ps.execution_type == StageExecutionType.DIFFUSION:
+            from vllm_omni.config.omni_config import omni_stage_engine_input_fields
             from vllm_omni.diffusion.data import (
                 normalize_and_validate_omni_diffusion_kwargs,
-                omni_diffusion_engine_input_fields,
             )
 
             normalize_and_validate_omni_diffusion_kwargs(
-                ds.engine_extras,
-                (omni_diffusion_engine_input_fields() | deploy_runtime_override_keys())
-                - {"model", "model_arch", "stage_id"},
+                stage_deploy_engine_args,
+                omni_stage_engine_input_fields(),
                 engine_ingress=True,
                 stage_id=ps.stage_id,
             )
-        engine_args.update(ds.engine_extras)
+        engine_args.update(stage_deploy_engine_args)
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)

@@ -43,7 +43,7 @@ from vllm_omni.config.omni_config import (
 from vllm_omni.config.stage_config import StageType
 from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
-    normalize_and_validate_omni_diffusion_kwargs,
+    normalize_omni_diffusion_kwargs,
 )
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
@@ -1452,30 +1452,18 @@ def get_stage_connector_spec(
     return {}
 
 
-def _strict_diffusion_config_kwargs(engine_args: dict[str, Any]) -> dict[str, Any]:
-    """Return only normalized fields owned by the diffusion runtime."""
-    from vllm_omni.config.omni_config import _KNOWN_STAGE_ENGINE_FIELDS
-
+def _project_resolved_diffusion_config_kwargs(engine_args: dict[str, Any]) -> dict[str, Any]:
+    """Project already-validated stage engine args to diffusion consumers."""
     diffusion_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
-    producer_metadata_fields = {
-        "async_chunk",
-        "custom_process_next_stage_input_func",
-        "engine_output_type",
-        "has_sampling_extra_args",
-        "hf_config_name",
-        "model_arch",
-        "model_stage",
-        "scheduler_cls",
-        "stage_connector_spec",
-        "worker_type",
-    }
-    normalized = normalize_and_validate_omni_diffusion_kwargs(
+    normalized = normalize_omni_diffusion_kwargs(
         engine_args,
-        diffusion_fields | producer_metadata_fields | _KNOWN_STAGE_ENGINE_FIELDS,
         engine_ingress=True,
-        stage_id=engine_args.get("stage_id", "unknown"),
     )
-    return {name: value for name, value in normalized.items() if name in diffusion_fields and value is not None}
+    return {
+        name: value
+        for name, value in normalized.items()
+        if name in diffusion_fields and name != "kv_cache_dtype" and value is not None
+    }
 
 
 def build_diffusion_config(
@@ -1486,7 +1474,7 @@ def build_diffusion_config(
     """Build diffusion config for a stage."""
 
     engine_args_dict = build_engine_args_dict(stage_cfg, model)
-    od_config = OmniDiffusionConfig.from_kwargs(**_strict_diffusion_config_kwargs(engine_args_dict))
+    od_config = OmniDiffusionConfig.from_kwargs(**_project_resolved_diffusion_config_kwargs(engine_args_dict))
 
     num_devices_per_stage = od_config.parallel_config.world_size
     device_control_env = current_omni_platform.device_control_env_var

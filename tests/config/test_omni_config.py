@@ -1322,7 +1322,7 @@ def test_diffusion_cli_routes_shared_fields_and_rejects_stage_identity():
 
 
 def test_diffusion_model_owned_fields_survive_owner_projection():
-    from vllm_omni.engine.stage_init_utils import _strict_diffusion_config_kwargs
+    from vllm_omni.engine.stage_init_utils import _project_resolved_diffusion_config_kwargs
 
     omni_kv_config = {"need_recv_cache": True}
     pipeline = PipelineConfig(
@@ -1347,7 +1347,7 @@ def test_diffusion_model_owned_fields_survive_owner_projection():
     assert structured_stage.model_config.omni_kv_config == omni_kv_config
 
     legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
-    runtime_kwargs = _strict_diffusion_config_kwargs(dict(legacy_stage.engine_args))
+    runtime_kwargs = _project_resolved_diffusion_config_kwargs(dict(legacy_stage.engine_args))
     assert runtime_kwargs["omni_kv_config"] == omni_kv_config
     assert "retains_state_across_chunks" not in runtime_kwargs
 
@@ -1377,8 +1377,6 @@ def test_diffusion_engine_extras_reject_unowned_and_producer_fields(structured):
 
 
 def test_diffusion_stage_rejects_service_field_without_stage_consumer():
-    from vllm_omni.engine.stage_init_utils import _strict_diffusion_config_kwargs
-
     pipeline = PipelineConfig(
         model_type="diffusion-owner-test",
         stages=(
@@ -1393,10 +1391,8 @@ def test_diffusion_stage_rejects_service_field_without_stage_consumer():
         async_chunk=False,
         stages=[StageDeployConfig(stage_id=0, tts_max_instructions_length=128)],
     )
-    stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
-
     with pytest.raises(ValueError, match="tts_max_instructions_length"):
-        _strict_diffusion_config_kwargs(dict(stage.engine_args))
+        merge_pipeline_deploy(pipeline, deploy)
 
 
 def test_deploy_flat_diffusion_parallel_field_reaches_nested_payload():
@@ -1422,13 +1418,18 @@ def test_deploy_flat_diffusion_parallel_field_reaches_nested_payload():
     assert "vae_parallel_mode" not in stage.engine_args
 
 
-def test_strict_runtime_partition_rejects_shared_fields_without_consumer():
-    from vllm_omni.engine.stage_init_utils import _strict_diffusion_config_kwargs
+def test_resolved_runtime_projection_ignores_non_consumer_fields():
+    from vllm_omni.engine.stage_init_utils import _project_resolved_diffusion_config_kwargs
 
-    payload = _strict_diffusion_config_kwargs(
-        {"model": "unused", "stage_id": 0, "model_stage": "diffusion", "model_arch": "Example"}
+    payload = _project_resolved_diffusion_config_kwargs(
+        {
+            "model": "unused",
+            "stage_id": 0,
+            "model_stage": "diffusion",
+            "model_arch": "Example",
+            "future_topology_metadata": True,
+            "seed": None,
+            "kv_cache_dtype": None,
+        }
     )
     assert payload == {"model": "unused", "stage_id": 0}
-    for key in ("seed", "kv_cache_dtype"):
-        with pytest.raises(ValueError, match=key):
-            _strict_diffusion_config_kwargs({"model": "unused", "stage_id": 0, key: None})
