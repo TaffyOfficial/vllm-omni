@@ -179,6 +179,11 @@ def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(mod
         assert omni_stage.model_config.duplex_max_sessions == engine_args.get("duplex_max_sessions", 1)
         assert omni_stage.model_config.session_mode == engine_args.get("session_mode", "turn")
         assert omni_stage.model_config.enforce_eager == engine_args.get("enforce_eager", False)
+        assert omni_stage.model_config.retains_state_across_chunks == engine_args.get(
+            "retains_state_across_chunks",
+            False,
+        )
+        assert omni_stage.model_config.omni_kv_config == engine_args.get("omni_kv_config")
         assert omni_stage.load_config.load_format == engine_args.get("load_format", "auto")
         assert omni_stage.load_config.tokenizer_mode == engine_args.get("tokenizer_mode", "auto")
         assert omni_stage.cache_config.gpu_memory_utilization == engine_args.get("gpu_memory_utilization")
@@ -1906,6 +1911,7 @@ def test_diffusion_cli_routes_shared_fields_and_rejects_stage_identity():
             "model_tag": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
             "subparser": "serve",
             "enable_prefix_caching": True,
+            "retains_state_across_chunks": True,
             "omni_kv_config": {"need_recv_cache": True},
         },
     ) == {
@@ -1917,10 +1923,42 @@ def test_diffusion_cli_routes_shared_fields_and_rejects_stage_identity():
         "stage_id",
         "model",
         "model_arch",
+        "retains_state_across_chunks",
         "enable_sleep_mod",
     ):
         with pytest.raises(ValueError, match=rf"stage 0.*{key}"):
             build_diffusion_stage_runtime_overrides(0, {f"stage_0_{key}": None})
+
+
+def test_diffusion_model_owned_fields_survive_owner_projection():
+    from vllm_omni.engine.stage_init_utils import _strict_diffusion_config_kwargs
+
+    omni_kv_config = {"need_recv_cache": True}
+    pipeline = PipelineConfig(
+        model_type="diffusion-owner-test",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="diffusion",
+                execution_type=StageExecutionType.DIFFUSION,
+                retains_state_across_chunks=True,
+                omni_kv_config=omni_kv_config,
+            ),
+        ),
+    )
+    deploy = DeployConfig(async_chunk=False)
+
+    structured_stage = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
+    ).stage_by_id(0)
+    assert structured_stage.model_config.retains_state_across_chunks is True
+    assert structured_stage.model_config.omni_kv_config == omni_kv_config
+
+    legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
+    runtime_kwargs = _strict_diffusion_config_kwargs(dict(legacy_stage.engine_args))
+    assert runtime_kwargs["omni_kv_config"] == omni_kv_config
+    assert "retains_state_across_chunks" not in runtime_kwargs
 
 
 @pytest.mark.parametrize("structured", [False, True])

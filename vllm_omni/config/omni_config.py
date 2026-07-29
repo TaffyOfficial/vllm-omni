@@ -165,7 +165,9 @@ class _ModelEngineOverrides(TypedDict, total=False):
     interleave_mm_strings: bool
     media_io_kwargs: dict[str, Any]
     active_stream_window: int
+    retains_state_across_chunks: bool
     enable_sleep_mode: bool
+    omni_kv_config: dict[str, Any]
     subtalker_sampling_params: dict[str, Any]
     silence_ban_frames: int
     has_sampling_extra_args: bool
@@ -457,7 +459,9 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
+    retains_state_across_chunks: bool = False
     enable_sleep_mode: bool = False
+    omni_kv_config: dict[str, Any] | None = None
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
     silence_ban_frames: int = 0
@@ -1169,7 +1173,11 @@ _PARALLEL_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(
 )
 
 _QUANTIZATION_ENGINE_FIELDS = frozenset(_QuantizationEngineOverrides.__annotations__)
-_MODEL_ENGINE_FIELDS = frozenset(_ModelEngineOverrides.__annotations__)
+_MODEL_ENGINE_FIELDS = frozenset(
+    config_field.name
+    for config_field in fields(OmniStageModelConfig)
+    if config_field.name not in {"default_sampling_params", "model_subdir", "tokenizer_subdir"}
+)
 _LOAD_ENGINE_FIELDS = frozenset(_LoadEngineOverrides.__annotations__)
 _CACHE_ENGINE_FIELDS = frozenset(_CacheEngineOverrides.__annotations__)
 _SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
@@ -1809,6 +1817,10 @@ def _build_model_config(
         kwargs["active_stream_window"] = _copy_value(deploy.active_stream_window)
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
+    if "retains_state_across_chunks" not in kwargs:
+        kwargs["retains_state_across_chunks"] = topology.retains_state_across_chunks
+    if "omni_kv_config" not in kwargs and topology.omni_kv_config is not None:
+        kwargs["omni_kv_config"] = _copy_value(topology.omni_kv_config)
     if "has_sampling_extra_args" not in kwargs:
         kwargs["has_sampling_extra_args"] = bool((default_sampling_params or {}).get("extra_args"))
     if "model_subdir" not in kwargs and topology.model_subdir is not None:
