@@ -22,31 +22,37 @@ def _request_mapping(name: str, value: object | None) -> dict[str, object]:
     return dict(value)
 
 
-def normalize_diffusion_request_extra_args(
+def normalize_diffusion_request_args(
     *,
-    provided_root_fields: Collection[str] = (),
-    root_extra_args: object | None = None,
-    extra_args: object | None = None,
-    extra_params: object | None = None,
-    nested_provided_root_fields: Collection[str] = (),
-    nested_root_extra_args: object | None = None,
-    nested_extra_args: object | None = None,
-    nested_extra_params: object | None = None,
+    root: object | None = None,
+    nested: object | None = None,
+    explicit_root_args: object | None = None,
+    serving_root_fields: Collection[str] = (),
+    registered_extra_fields: Collection[str] = (),
     root_field_aliases: Mapping[str, str] | None = None,
-) -> dict[str, object]:
-    """Normalize model-specific request extras without implicit precedence."""
-    root = _request_mapping("root_extra_args", root_extra_args)
-    nested_root = _request_mapping("nested_root_extra_args", nested_root_extra_args)
-    canonical = _request_mapping("extra_args", extra_args)
-    legacy = _request_mapping("extra_params", extra_params)
-    nested_canonical = _request_mapping("extra_body.extra_args", nested_extra_args)
-    nested_legacy = _request_mapping("extra_body.extra_params", nested_extra_params)
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Validate request sources and project diffusion consumer arguments."""
+    root_args = _request_mapping("request", root)
+    root_args.update(_request_mapping("explicit_root_args", explicit_root_args))
+    nested_args = _request_mapping("request.extra_body", nested)
 
-    aliases = root_field_aliases or {}
+    registered = set(registered_extra_fields)
+    aliases = {alias: canonical for alias, canonical in (root_field_aliases or {}).items() if alias not in registered}
+    serving_fields = set(serving_root_fields) | aliases.keys()
+    declared_fields = registered - serving_fields
+    consumer_fields = serving_fields | declared_fields
+
+    root_declared = {key: root_args[key] for key in declared_fields if key in root_args}
+    nested_declared = {key: nested_args[key] for key in declared_fields if key in nested_args}
+    canonical = _request_mapping("extra_args", root_args.get("extra_args"))
+    legacy = _request_mapping("extra_params", root_args.get("extra_params"))
+    nested_canonical = _request_mapping("extra_body.extra_args", nested_args.get("extra_args"))
+    nested_legacy = _request_mapping("extra_body.extra_params", nested_args.get("extra_params"))
+
     sources_by_key: dict[str, list[str]] = {}
     sources = (
-        ((set(provided_root_fields) | root.keys()), "request"),
-        ((set(nested_provided_root_fields) | nested_root.keys()), "request.extra_body"),
+        ((root_args.keys() & serving_fields) | root_declared.keys(), "request"),
+        ((nested_args.keys() & serving_fields) | nested_declared.keys(), "request.extra_body"),
         (canonical, "request.extra_args"),
         (legacy, "request.extra_params"),
         (nested_canonical, "request.extra_body.extra_args"),
@@ -64,21 +70,30 @@ def normalize_diffusion_request_extra_args(
         details = "; ".join(f'"{key}": {", ".join(conflicts[key])}' for key in sorted(conflicts))
         raise ValueError(f"Diffusion request parameters were provided more than once: {details}.")
 
-    if extra_params is not None or nested_extra_params is not None:
+    if root_args.get("extra_params") is not None or nested_args.get("extra_params") is not None:
         logger.warning_once(
             "extra_params is deprecated; use extra_args for model-specific diffusion request parameters."
         )
 
     # Duplicate request keys were rejected above, so ordering is not precedence.
-    normalized = {
-        **nested_root,
-        **root,
+    normalized_extra_args = {
+        **nested_declared,
+        **root_declared,
         **legacy,
         **nested_legacy,
         **canonical,
         **nested_canonical,
     }
-    return {key: value for key, value in normalized.items() if value is not None}
+    normalized_extra_args = {key: value for key, value in normalized_extra_args.items() if value is not None}
+
+    request_args = {
+        **{key: nested_args[key] for key in consumer_fields if key in nested_args},
+        **{key: root_args[key] for key in consumer_fields if key in root_args},
+    }
+    for alias, canonical_name in aliases.items():
+        if alias in request_args:
+            request_args[canonical_name] = request_args.pop(alias)
+    return normalized_extra_args, request_args
 
 
 def apply_normalized_diffusion_request_extra_args(

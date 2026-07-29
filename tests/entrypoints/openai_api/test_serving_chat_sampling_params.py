@@ -108,6 +108,7 @@ def test_serving_boundary_normalizes_declared_root_and_nested_extras(serving_cha
         "cfg_text_scale": 7.0,
         "sample_solver": "euler",
     }
+    assert diffusion_request_args["cfg_text_scale"] == 7.0
     assert diffusion_request_args["num_inference_steps"] == 7
     assert diffusion_request_args["size"] == "768x512"
     assert diffusion_request_args["negative_prompt"] == "avoid blur"

@@ -3,7 +3,7 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -27,7 +27,7 @@ from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.diffusion_request_utils import (
     apply_normalized_diffusion_request_extra_args,
-    normalize_diffusion_request_extra_args,
+    normalize_diffusion_request_args,
 )
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
@@ -188,6 +188,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         }
     )
     _diffusion_root_field_aliases = {"cfg_scale": "true_cfg_scale"}
+    _diffusion_serving_root_fields = _diffusion_common_root_fields | _diffusion_existing_control_fields
 
     # Harmony flag (always False for vllm-omni models)
     use_harmony: bool = False
@@ -332,67 +333,24 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request: ChatCompletionRequest,
     ) -> tuple[dict[str, object], dict[str, Any]]:
         """Normalize extras and preserve validated common root fields."""
-        root, nested = self._split_diffusion_request_extra_body(request)
+        root = dict(request.model_extra or {})
+        nested = root.pop("extra_body", None)
+        if nested is None:
+            nested = getattr(request, "extra_body", None)
         explicit = getattr(request, "model_fields_set", None)
         if explicit is None:
             explicit = getattr(request, "__fields_set__", ())
-        explicit = set(explicit)
-
-        registered_extra_fields = self._get_diffusion_extra_body_params()
-        active_root_field_aliases = {
-            alias: canonical
-            for alias, canonical in self._diffusion_root_field_aliases.items()
-            if alias not in registered_extra_fields
+        explicit_root_args = {
+            key: getattr(request, key) for key in explicit if key != "extra_body" and hasattr(request, key)
         }
-        common = self._diffusion_common_root_fields | active_root_field_aliases.keys()
-        consumed_root_fields = common | self._diffusion_existing_control_fields
-        declared = registered_extra_fields - consumed_root_fields
-        consumer_fields = consumed_root_fields | declared
-        root_declared = {
-            key: getattr(request, key, root.get(key)) for key in declared if key in explicit or key in root
-        }
-        nested_declared = {key: nested[key] for key in declared if key in nested}
-        normalized_extra_args = normalize_diffusion_request_extra_args(
-            provided_root_fields=(set(root) | explicit) & consumed_root_fields,
-            root_extra_args=root_declared,
-            extra_args=root.get("extra_args"),
-            extra_params=root.get("extra_params"),
-            nested_provided_root_fields=set(nested) & consumed_root_fields,
-            nested_root_extra_args=nested_declared,
-            nested_extra_args=nested.get("extra_args"),
-            nested_extra_params=nested.get("extra_params"),
-            root_field_aliases=active_root_field_aliases,
+        return normalize_diffusion_request_args(
+            root=root,
+            nested=nested,
+            explicit_root_args=explicit_root_args,
+            serving_root_fields=self._diffusion_serving_root_fields,
+            registered_extra_fields=self._get_diffusion_extra_body_params(),
+            root_field_aliases=self._diffusion_root_field_aliases,
         )
-        root_consumer_args = {
-            key: getattr(request, key, root.get(key)) for key in consumer_fields if key in explicit or key in root
-        }
-        nested_consumer_args = {key: nested[key] for key in consumer_fields if key in nested}
-        # Duplicate logical claims have already been rejected, so these
-        # consumer sources are disjoint rather than precedence-ordered.
-        diffusion_request_args = {
-            **nested_consumer_args,
-            **root_consumer_args,
-        }
-        for alias, canonical in active_root_field_aliases.items():
-            if alias in diffusion_request_args:
-                diffusion_request_args[canonical] = diffusion_request_args.pop(alias)
-        return normalized_extra_args, diffusion_request_args
-
-    @staticmethod
-    def _split_diffusion_request_extra_body(
-        request: ChatCompletionRequest,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        root = dict(request.model_extra or {})
-        nested_value = root.pop("extra_body", None)
-        if nested_value is None:
-            nested_value = getattr(request, "extra_body", None)
-        if nested_value is None:
-            return root, {}
-        if not isinstance(nested_value, Mapping):
-            raise ValueError("extra_body must be a JSON object.")
-        if any(not isinstance(key, str) for key in nested_value):
-            raise ValueError("extra_body must be a JSON object with string keys.")
-        return root, dict(nested_value)
 
     def _get_diffusion_extra_output_params(
         self,
