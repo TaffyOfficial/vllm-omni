@@ -41,6 +41,7 @@ from vllm_omni.config.omni_config import (
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
     _STAGE_DEPLOY_FIELDS,
+    _STAGE_SERVICE_ENGINE_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
     PipelineConfig,
@@ -136,11 +137,6 @@ def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(mod
         engine_args = legacy_stage.yaml_engine_args
         assert omni_stage.model_config.duplex_max_sessions == engine_args.get("duplex_max_sessions", 1)
         assert omni_stage.model_config.enforce_eager == engine_args.get("enforce_eager", False)
-        assert omni_stage.model_config.retains_state_across_chunks == engine_args.get(
-            "retains_state_across_chunks",
-            False,
-        )
-        assert omni_stage.model_config.omni_kv_config == engine_args.get("omni_kv_config")
         assert omni_stage.load_config.load_format == engine_args.get("load_format", "auto")
         assert omni_stage.load_config.tokenizer_mode == engine_args.get("tokenizer_mode", "auto")
         assert omni_stage.cache_config.gpu_memory_utilization == engine_args.get("gpu_memory_utilization")
@@ -164,6 +160,7 @@ def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(mod
             assert omni_stage.diffusion_config is not None
             assert omni_stage.diffusion_config.stage_id == legacy_stage.stage_id
             assert omni_stage.diffusion_config.model_arch == engine_args.get("model_arch")
+            assert omni_stage.diffusion_config.omni_kv_config == engine_args.get("omni_kv_config")
         elif omni_stage.stage_pipeline_config.execution_type == StageExecutionType.LLM_AR:
             assert isinstance(omni_stage, VllmOmniARStageConfig)
             assert not hasattr(omni_stage, "diffusion_config")
@@ -687,6 +684,15 @@ def test_structured_llm_stage_registration_payloads_remain_msgpack_transport_saf
             "stage_config": _serialize_stage_config(stage_config),
         }
         msgspec.msgpack.encode(payload)
+def test_stage_deploy_fields_have_declared_raw_owner():
+    from vllm_omni.diffusion.data import omni_diffusion_engine_input_fields
+
+    deploy_fields = frozenset(_STAGE_DEPLOY_FIELDS)
+    core_fields = omni_config_module._KNOWN_STAGE_ENGINE_FIELDS
+    diffusion_fields = omni_diffusion_engine_input_fields()
+
+    assert deploy_fields <= omni_config_module.omni_stage_raw_input_fields()
+    assert deploy_fields - core_fields - diffusion_fields == _STAGE_SERVICE_ENGINE_FIELDS
 
 
 def test_diffusion_parallel_config_fields_cover_legacy_surface():
@@ -1321,7 +1327,7 @@ def test_diffusion_cli_routes_shared_fields_and_rejects_stage_identity():
             build_diffusion_stage_runtime_overrides(0, {f"stage_0_{key}": None})
 
 
-def test_diffusion_model_owned_fields_survive_owner_projection():
+def test_diffusion_topology_fields_follow_declared_owners():
     from vllm_omni.engine.stage_init_utils import _project_resolved_diffusion_config_kwargs
 
     omni_kv_config = {"need_recv_cache": True}
@@ -1343,8 +1349,18 @@ def test_diffusion_model_owned_fields_survive_owner_projection():
         pipeline,
         user_deploy_config=deploy,
     ).stage_by_id(0)
-    assert structured_stage.model_config.retains_state_across_chunks is True
-    assert structured_stage.model_config.omni_kv_config == omni_kv_config
+    assert structured_stage.stage_pipeline_config.retains_state_across_chunks is True
+    assert structured_stage.diffusion_config.omni_kv_config == omni_kv_config
+
+    deploy_override = {"need_recv_cache": False}
+    overridden_stage = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=DeployConfig(
+            async_chunk=False,
+            stages=[StageDeployConfig(stage_id=0, engine_extras={"omni_kv_config": deploy_override})],
+        ),
+    ).stage_by_id(0)
+    assert overridden_stage.diffusion_config.omni_kv_config == deploy_override
 
     legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
     runtime_kwargs = _project_resolved_diffusion_config_kwargs(dict(legacy_stage.engine_args))
@@ -1376,7 +1392,9 @@ def test_diffusion_engine_extras_reject_unowned_and_producer_fields(structured):
             merge_pipeline_deploy(pipeline, deploy)
 
 
-def test_diffusion_stage_rejects_service_field_without_stage_consumer():
+def test_diffusion_stage_preserves_service_field_outside_runtime_projection():
+    from vllm_omni.engine.stage_init_utils import _project_resolved_diffusion_config_kwargs
+
     pipeline = PipelineConfig(
         model_type="diffusion-owner-test",
         stages=(
@@ -1391,8 +1409,9 @@ def test_diffusion_stage_rejects_service_field_without_stage_consumer():
         async_chunk=False,
         stages=[StageDeployConfig(stage_id=0, tts_max_instructions_length=128)],
     )
-    with pytest.raises(ValueError, match="tts_max_instructions_length"):
-        merge_pipeline_deploy(pipeline, deploy)
+    stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
+    assert stage.engine_args.tts_max_instructions_length == 128
+    assert "tts_max_instructions_length" not in _project_resolved_diffusion_config_kwargs(dict(stage.engine_args))
 
 
 def test_deploy_flat_diffusion_parallel_field_reaches_nested_payload():

@@ -152,7 +152,6 @@ class _ModelEngineOverrides(TypedDict, total=False):
     media_io_kwargs: dict[str, Any]
     active_stream_window: int
     enable_sleep_mode: bool
-    omni_kv_config: dict[str, Any]
     subtalker_sampling_params: dict[str, Any]
     has_sampling_extra_args: bool
     custom_voice_dir: str
@@ -393,9 +392,7 @@ class OmniStageModelConfig:
     media_io_kwargs: dict[str, Any] | None = None
     active_stream_window: int = Field(default=0, ge=0)
     duplex_max_sessions: int = Field(default=1, ge=1)
-    retains_state_across_chunks: bool = False
     enable_sleep_mode: bool = False
-    omni_kv_config: dict[str, Any] | None = None
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
@@ -1133,9 +1130,13 @@ def _validate_stage_engine_override_ownership(
         )
 
 
-def omni_stage_engine_input_fields() -> frozenset[str]:
-    """Raw per-stage engine fields with a declared structured-config owner."""
-    return _KNOWN_STAGE_ENGINE_FIELDS
+def omni_stage_raw_input_fields() -> frozenset[str]:
+    """Raw deploy/CLI fields accepted before stage ownership projection."""
+    from vllm_omni.diffusion.data import omni_diffusion_engine_input_fields
+
+    return (
+        _KNOWN_STAGE_ENGINE_FIELDS | frozenset(_STAGE_DEPLOY_ENGINE_FIELDS) | omni_diffusion_engine_input_fields()
+    ) - {"model", "model_arch", "stage_id"}
 
 
 def _global_stage_cli_fields() -> frozenset[str]:
@@ -1188,16 +1189,6 @@ def _stage_engine_values(
     topology: StagePipelineConfig,
     stage_cli_overrides: Mapping[str, Any] | None = None,
 ) -> _StageEngineValues:
-    if topology.execution_type == StageExecutionType.DIFFUSION:
-        from vllm_omni.diffusion.data import normalize_and_validate_omni_diffusion_kwargs
-
-        if stage_deploy is not None:
-            normalize_and_validate_omni_diffusion_kwargs(
-                stage_deploy.engine_extras,
-                _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS,
-                engine_ingress=True,
-                stage_id=topology.stage_id,
-            )
     engine = _stage_engine_overrides(stage_deploy)
     # Preserve legacy ordering: topology-owned KV roles override deploy
     # extras, while an explicit CLI override remains highest priority.
@@ -1206,9 +1197,11 @@ def _stage_engine_values(
     if stage_cli_overrides:
         engine.update(_copy_value(stage_cli_overrides))
     if topology.execution_type == StageExecutionType.DIFFUSION:
+        from vllm_omni.diffusion.data import normalize_and_validate_omni_diffusion_kwargs
+
         engine = normalize_and_validate_omni_diffusion_kwargs(
             engine,
-            _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS,
+            omni_stage_raw_input_fields(),
             engine_ingress=True,
             stage_id=topology.stage_id,
         )
@@ -1629,10 +1622,6 @@ def _build_model_config(
         kwargs["active_stream_window"] = _copy_value(deploy.active_stream_window)
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
-    if "retains_state_across_chunks" not in kwargs:
-        kwargs["retains_state_across_chunks"] = topology.retains_state_across_chunks
-    if "omni_kv_config" not in kwargs and topology.omni_kv_config is not None:
-        kwargs["omni_kv_config"] = _copy_value(topology.omni_kv_config)
     if "has_sampling_extra_args" not in kwargs:
         kwargs["has_sampling_extra_args"] = bool((default_sampling_params or {}).get("extra_args"))
     if "model_subdir" not in kwargs and topology.model_subdir is not None:
@@ -1803,6 +1792,8 @@ def _build_diffusion_config_projection(
     )
     if "model_class_name" not in diffusion_kwargs and topology.model_arch is not None:
         diffusion_kwargs["model_class_name"] = _copy_value(topology.model_arch)
+    if "omni_kv_config" not in diffusion_kwargs and topology.omni_kv_config is not None:
+        diffusion_kwargs["omni_kv_config"] = _copy_value(topology.omni_kv_config)
     if "dtype" not in diffusion_kwargs and deploy.dtype is not None:
         diffusion_kwargs["dtype"] = _copy_value(deploy.dtype)
     if "trust_remote_code" not in diffusion_kwargs and deploy.trust_remote_code is not None:
