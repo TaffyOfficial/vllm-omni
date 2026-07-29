@@ -4,9 +4,9 @@
         "description": "LTX-2.3 T2V single-device baseline with enforce-eager and diffusion pipeline profiling",
         "server_type": "vllm-omni",
         "server_params": {
-            "model": "dg845/LTX-2.3-Diffusers",
+            "model": "diffusers/LTX-2.3-Diffusers",
             "serve_args": {
-                "model-class-name": "LTX23Pipeline",
+                "model-class-name": "LTX2Pipeline",
                 "enforce-eager": true,
                 "enable-diffusion-pipeline-profiler": true
             }
@@ -45,9 +45,9 @@
         "description": "LTX-2.3 T2V single-device torch.compile path with diffusion pipeline profiling",
         "server_type": "vllm-omni",
         "server_params": {
-            "model": "dg845/LTX-2.3-Diffusers",
+            "model": "diffusers/LTX-2.3-Diffusers",
             "serve_args": {
-                "model-class-name": "LTX23Pipeline",
+                "model-class-name": "LTX2Pipeline",
                 "enable-diffusion-pipeline-profiler": true
             }
         },
