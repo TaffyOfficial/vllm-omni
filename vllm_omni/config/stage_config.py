@@ -949,7 +949,7 @@ def _build_engine_args(
         # model-owned streaming state. Propagate it to every stage instead of
         # making individual models duplicate the value in connector extras.
         engine_args["duplex_max_sessions"] = deploy.duplex_session.max_sessions
-    if ps.omni_kv_config:
+    if ps.omni_kv_config and engine_args.get("omni_kv_config") is None:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     return engine_args
 

@@ -1328,6 +1328,7 @@ def test_diffusion_cli_routes_shared_fields_and_rejects_stage_identity():
 
 
 def test_diffusion_topology_fields_follow_declared_owners():
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.engine.stage_init_utils import _project_resolved_diffusion_config_kwargs
 
     omni_kv_config = {"need_recv_cache": True}
@@ -1353,12 +1354,13 @@ def test_diffusion_topology_fields_follow_declared_owners():
     assert structured_stage.diffusion_config.omni_kv_config == omni_kv_config
 
     deploy_override = {"need_recv_cache": False}
+    overridden_deploy = DeployConfig(
+        async_chunk=False,
+        stages=[StageDeployConfig(stage_id=0, engine_extras={"omni_kv_config": deploy_override})],
+    )
     overridden_stage = VllmOmniConfig.from_pipeline_config(
         pipeline,
-        user_deploy_config=DeployConfig(
-            async_chunk=False,
-            stages=[StageDeployConfig(stage_id=0, engine_extras={"omni_kv_config": deploy_override})],
-        ),
+        user_deploy_config=overridden_deploy,
     ).stage_by_id(0)
     assert overridden_stage.diffusion_config.omni_kv_config == deploy_override
 
@@ -1366,6 +1368,37 @@ def test_diffusion_topology_fields_follow_declared_owners():
     runtime_kwargs = _project_resolved_diffusion_config_kwargs(dict(legacy_stage.engine_args))
     assert runtime_kwargs["omni_kv_config"] == omni_kv_config
     assert "retains_state_across_chunks" not in runtime_kwargs
+
+    overridden_legacy_stage = merge_pipeline_deploy(pipeline, overridden_deploy)[0].to_omegaconf()
+    overridden_runtime_kwargs = _project_resolved_diffusion_config_kwargs(dict(overridden_legacy_stage.engine_args))
+    assert overridden_runtime_kwargs["omni_kv_config"] == deploy_override
+    assert OmniDiffusionConfig.from_kwargs(**overridden_runtime_kwargs).omni_kv_config == deploy_override
+
+    unset_override_deploy = DeployConfig(
+        async_chunk=False,
+        stages=[StageDeployConfig(stage_id=0, engine_extras={"omni_kv_config": None})],
+    )
+    unset_structured_stage = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=unset_override_deploy,
+    ).stage_by_id(0)
+    assert unset_structured_stage.diffusion_config.omni_kv_config == omni_kv_config
+    unset_legacy_stage = merge_pipeline_deploy(pipeline, unset_override_deploy)[0].to_omegaconf()
+    unset_runtime_kwargs = _project_resolved_diffusion_config_kwargs(dict(unset_legacy_stage.engine_args))
+    assert unset_runtime_kwargs["omni_kv_config"] == omni_kv_config
+
+    empty_override_deploy = DeployConfig(
+        async_chunk=False,
+        stages=[StageDeployConfig(stage_id=0, engine_extras={"omni_kv_config": {}})],
+    )
+    empty_structured_stage = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=empty_override_deploy,
+    ).stage_by_id(0)
+    assert empty_structured_stage.diffusion_config.omni_kv_config == {}
+    empty_legacy_stage = merge_pipeline_deploy(pipeline, empty_override_deploy)[0].to_omegaconf()
+    empty_runtime_kwargs = _project_resolved_diffusion_config_kwargs(dict(empty_legacy_stage.engine_args))
+    assert OmniDiffusionConfig.from_kwargs(**empty_runtime_kwargs).omni_kv_config == {}
 
 
 @pytest.mark.parametrize("structured", [False, True])

@@ -677,6 +677,7 @@ class _DiffusionConfigProjection:
     host: str | None = None
     port: int | None = None
     model_config: dict[str, Any] = field(default_factory=dict)
+    omni_kv_config: dict[str, Any] | None = None
     tf_model_config: Any = None
     diffusion_attention_config: Any = None
     cache_strategy: str = "none"
@@ -913,6 +914,7 @@ _DIFFUSION_SHARED_CONFIG_FIELDS = frozenset(
         "distributed_executor_backend",
         "dist_timeout",
         "model_config",
+        "omni_kv_config",
         "quantization_config",
     }
 )
@@ -937,7 +939,6 @@ _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
         "num_gpus",
         "log_level",
         "profiler_config",
-        "omni_kv_config",
         "cfg_kv_collect_func",
         "max_num_seqs",
         "kv_cache_memory_bytes",
