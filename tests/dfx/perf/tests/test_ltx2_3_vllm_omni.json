@@ -34,8 +34,8 @@
                 "max-concurrency": 1,
                 "baseline-tolerance": 0.1,
                 "baseline": {
-                    "stage_durations_mean.stage_0_gen_ms": 5339.81,
-                    "peak_memory_mb_mean": 73291
+                    "stage_durations_mean.stage_0_gen_ms": 5516.92,
+                    "peak_memory_mb_mean": 72462
                 }
             }
         ]
@@ -77,8 +77,8 @@
                 "warmup-num-frames": 25,
                 "baseline-tolerance": 0.1,
                 "baseline": {
-                    "stage_durations_mean.stage_0_gen_ms": 4092.05,
-                    "peak_memory_mb_mean": 73290
+                    "stage_durations_mean.stage_0_gen_ms": 4195.83,
+                    "peak_memory_mb_mean": 72464
                 }
             }
         ]
