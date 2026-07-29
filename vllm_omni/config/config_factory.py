@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import json
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -646,6 +646,17 @@ class StageConfigFactory:
         kwargs: dict[str, Any],
     ) -> tuple[dict[str, Any], DiffusionParallelConfig, dict[str, Any], str]:
         """Normalize inputs shared by typed and compatibility diffusion builders."""
+        from vllm_omni.diffusion.data import (
+            normalize_and_validate_omni_diffusion_kwargs,
+            omni_diffusion_engine_input_fields,
+        )
+
+        kwargs = normalize_and_validate_omni_diffusion_kwargs(
+            kwargs,
+            omni_diffusion_engine_input_fields() | {"default_sampling_params", "devices", "stage_0_devices"},
+            engine_ingress=True,
+            stage_id=0,
+        )
         raw_sampling_params = kwargs.get("default_sampling_params")
         if isinstance(raw_sampling_params, str):
             try:
@@ -660,7 +671,10 @@ class StageConfigFactory:
         parallel_config = DiffusionParallelConfig.from_stage_overrides(kwargs)
         if kwargs.get("num_gpus") is not None:
             parallel_config.resolve_data_parallel_size(int(kwargs["num_gpus"]))
-        engine_args = OmniDiffusionConfig.normalize_init_kwargs(kwargs)
+        diffusion_config_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
+        engine_args = OmniDiffusionConfig.normalize_init_kwargs(
+            {name: value for name, value in kwargs.items() if name in diffusion_config_fields}
+        )
 
         extras = dict(engine_args.get("extras") or {})
         for key, default in (
