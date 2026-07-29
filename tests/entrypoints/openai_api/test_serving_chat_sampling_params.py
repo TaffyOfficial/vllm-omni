@@ -132,6 +132,36 @@ def test_unknown_root_extra_does_not_claim_canonical_extra(serving_chat):
     assert "pipeline_option" not in diffusion_request_args
 
 
+def test_unregistered_cfg_scale_aliases_common_true_cfg_scale(serving_chat):
+    serving_chat._diffusion_extra_body_params = frozenset()
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        cfg_scale=7.0,
+    )
+
+    normalized_extra_args, diffusion_request_args = serving_chat._normalize_diffusion_request_args(request)
+
+    assert normalized_extra_args == {}
+    assert diffusion_request_args == {"true_cfg_scale": 7.0}
+
+
+@pytest.mark.parametrize(
+    ("registered", "request_kwargs"),
+    [
+        ({"cfg_scale"}, {"cfg_scale": 7.0, "extra_args": {"cfg_scale": 8.0}}),
+        (set(), {"cfg_scale": 7.0, "true_cfg_scale": 2.0}),
+    ],
+    ids=["registered-model-extra", "unregistered-common-alias"],
+)
+def test_cfg_scale_owner_conflicts_are_rejected(serving_chat, registered, request_kwargs):
+    serving_chat._diffusion_extra_body_params = frozenset(registered)
+    request = ChatCompletionRequest(model="test", messages=[], **request_kwargs)
+
+    with pytest.raises(ValueError, match="provided more than once"):
+        serving_chat._normalize_diffusion_request_args(request)
+
+
 @pytest.mark.parametrize("diffusion_mode", [True, False], ids=["pure", "mixed"])
 def test_duplicate_extras_return_the_same_bad_request_before_dispatch(
     serving_chat,
@@ -165,7 +195,7 @@ def test_duplicate_extras_return_the_same_bad_request_before_dispatch(
     pure_dispatch.assert_not_awaited()
 
 
-def test_pure_consumer_preserves_stage_defaults(serving_chat, mocker: MockerFixture):
+def test_pure_consumer_preserves_defaults_and_separate_cfg_owners(serving_chat, mocker: MockerFixture):
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     captured: dict[str, object] = {}
@@ -184,7 +214,7 @@ def test_pure_consumer_preserves_stage_defaults(serving_chat, mocker: MockerFixt
         generate=generate,
     )
     serving_chat._diffusion_mode = True
-    serving_chat._diffusion_extra_body_params = frozenset()
+    serving_chat._diffusion_extra_body_params = frozenset({"cfg_scale"})
     serving_chat._extract_diffusion_prompt_and_media = mocker.Mock(return_value=("prompt", [], [], []))
     request = ChatCompletionRequest(
         model="test",
@@ -193,13 +223,20 @@ def test_pure_consumer_preserves_stage_defaults(serving_chat, mocker: MockerFixt
         num_inference_steps=7,
         size="768x512",
         negative_prompt="avoid blur",
+        cfg_scale=7.0,
+        true_cfg_scale=2.0,
         extra_body={"extra_args": {"solver": "ddim"}},
     )
 
     response = asyncio.run(serving_chat._create_chat_completion(request))
 
     (sampling_params,) = captured["sampling_params_list"]
-    assert sampling_params.extra_args == {"solver": "ddim", "stage_default": True}
+    assert sampling_params.extra_args == {
+        "cfg_scale": 7.0,
+        "solver": "ddim",
+        "stage_default": True,
+    }
+    assert sampling_params.true_cfg_scale == 2.0
     assert sampling_params.num_inference_steps == 7
     assert (sampling_params.height, sampling_params.width) == (512, 768)
     assert captured["prompt"]["negative_prompt"] == "avoid blur"

@@ -173,7 +173,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             "num_inference_steps",
             "guidance_scale",
             "true_cfg_scale",
-            "cfg_scale",
             "num_frames",
             "guidance_scale_2",
             "layers",
@@ -339,9 +338,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             explicit = getattr(request, "__fields_set__", ())
         explicit = set(explicit)
 
-        common = self._diffusion_common_root_fields
+        registered_extra_fields = self._get_diffusion_extra_body_params()
+        active_root_field_aliases = {
+            alias: canonical
+            for alias, canonical in self._diffusion_root_field_aliases.items()
+            if alias not in registered_extra_fields
+        }
+        common = self._diffusion_common_root_fields | active_root_field_aliases.keys()
         consumed_root_fields = common | self._diffusion_existing_control_fields
-        declared = self._get_diffusion_extra_body_params() - consumed_root_fields
+        declared = registered_extra_fields - consumed_root_fields
         consumer_fields = consumed_root_fields | declared
         root_declared = {
             key: getattr(request, key, root.get(key)) for key in declared if key in explicit or key in root
@@ -356,7 +361,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             nested_root_extra_args=nested_declared,
             nested_extra_args=nested.get("extra_args"),
             nested_extra_params=nested.get("extra_params"),
-            root_field_aliases=self._diffusion_root_field_aliases,
+            root_field_aliases=active_root_field_aliases,
         )
         root_consumer_args = {
             key: getattr(request, key, root.get(key)) for key in consumer_fields if key in explicit or key in root
@@ -368,6 +373,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             **nested_consumer_args,
             **root_consumer_args,
         }
+        for alias, canonical in active_root_field_aliases.items():
+            if alias in diffusion_request_args:
+                diffusion_request_args[canonical] = diffusion_request_args.pop(alias)
         return normalized_extra_args, diffusion_request_args
 
     @staticmethod
@@ -3520,7 +3528,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # not provide a value.
             num_inference_steps = extra_body.get("num_inference_steps")
             guidance_scale = extra_body.get("guidance_scale")
-            true_cfg_scale = extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale")
+            true_cfg_scale = extra_body.get("true_cfg_scale")
             seed = extra_body.get("seed")
             if seed is None:
                 seed = getattr(request, "seed", None)
