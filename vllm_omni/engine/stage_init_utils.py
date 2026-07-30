@@ -41,10 +41,7 @@ from vllm_omni.config.omni_config import (
     VllmOmniDiffusionStageConfig,
 )
 from vllm_omni.config.stage_config import StageType
-from vllm_omni.diffusion.data import (
-    OmniDiffusionConfig,
-    normalize_omni_diffusion_kwargs,
-)
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
@@ -1452,29 +1449,22 @@ def get_stage_connector_spec(
     return {}
 
 
-def _project_resolved_diffusion_config_kwargs(engine_args: dict[str, Any]) -> dict[str, Any]:
-    """Project already-validated stage engine args to diffusion consumers."""
-    diffusion_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
-    normalized = normalize_omni_diffusion_kwargs(
-        engine_args,
-        engine_ingress=True,
-    )
-    return {
-        name: value
-        for name, value in normalized.items()
-        if name in diffusion_fields and name != "kv_cache_dtype" and value is not None
-    }
-
-
 def build_diffusion_config(
     model: str,
     stage_cfg: Any,
     metadata: StageMetadata,
 ) -> Any:
     """Build diffusion config for a stage."""
+    from vllm_omni.config.omni_config import extract_diffusion_stage_config_kwargs
 
     engine_args_dict = build_engine_args_dict(stage_cfg, model)
-    od_config = OmniDiffusionConfig.from_kwargs(**_project_resolved_diffusion_config_kwargs(engine_args_dict))
+    stage_id = engine_args_dict.get("stage_id", metadata.stage_id)
+    diffusion_kwargs = extract_diffusion_stage_config_kwargs(
+        engine_args_dict,
+        stage_id=stage_id,
+        include_engine_adapter_metadata=True,
+    )
+    od_config = OmniDiffusionConfig(**{name: value for name, value in diffusion_kwargs.items() if value is not None})
 
     num_devices_per_stage = od_config.parallel_config.world_size
     device_control_env = current_omni_platform.device_control_env_var

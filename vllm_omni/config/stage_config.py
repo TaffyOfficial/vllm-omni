@@ -49,9 +49,6 @@ def build_stage_runtime_overrides(
     cli_overrides: dict[str, Any],
     *,
     internal_keys: set[str] | frozenset[str] | None = None,
-    excluded_global_keys: set[str] | frozenset[str] = frozenset(),
-    allowed_global_keys: set[str] | frozenset[str] | None = None,
-    allowed_stage_keys: set[str] | frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Build per-stage runtime overrides from global and ``stage_<id>_*`` kwargs.
 
@@ -61,9 +58,7 @@ def build_stage_runtime_overrides(
     (``model`` / ``log_stats`` / ``stage_id``) leak
     into a stage's per-stage runtime overrides — the orchestrator sets those
     uniformly for every stage, they are not per-stage knobs. Callers can
-    pass an explicit set for tests or specialized flows. ``allowed_global_keys``
-    lets typed stage paths project a mixed CLI namespace onto their existing
-    stage schemas instead of maintaining another blacklist.
+    pass an explicit set for tests or specialized flows.
     """
     if internal_keys is None:
         from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
@@ -78,91 +73,20 @@ def build_stage_runtime_overrides(
     result: dict[str, Any] = {}
 
     for key, value in cli_overrides.items():
+        if value is None or key in internal_keys:
+            continue
+
         match = _STAGE_OVERRIDE_PATTERN.match(key)
         if match is not None:
             override_stage_id = int(match.group(1))
             param_name = match.group(2)
-            if override_stage_id != stage_id:
-                continue
-            if allowed_stage_keys is not None and param_name not in allowed_stage_keys:
-                raise ValueError(f"Unknown diffusion config field(s) for stage {stage_id}: {param_name!r}")
-            if param_name in internal_keys:
-                continue
-            if value is not None:
+            if override_stage_id == stage_id and param_name not in internal_keys:
                 result[param_name] = value
             continue
 
-        if (
-            value is None
-            or key in internal_keys
-            or key in excluded_global_keys
-            or (allowed_global_keys is not None and key not in allowed_global_keys)
-        ):
-            continue
         result[key] = value
 
     return result
-
-
-def build_diffusion_stage_runtime_overrides(
-    stage_id: int,
-    cli_overrides: dict[str, Any],
-) -> dict[str, Any]:
-    """Route global shared fields away and validate diffusion-stage inputs."""
-    from vllm_omni.diffusion.data import omni_diffusion_engine_input_fields
-    from vllm_omni.engine.arg_utils import OmniEngineArgs
-
-    diffusion_fields = omni_diffusion_engine_input_fields()
-    stage_fields = diffusion_fields - {"model", "model_arch", "stage_id"}
-    engine_fields = frozenset(config_field.name for config_field in fields(OmniEngineArgs))
-    runtime_fields = deploy_runtime_override_keys()
-    return build_stage_runtime_overrides(
-        stage_id,
-        cli_overrides,
-        excluded_global_keys=(engine_fields - diffusion_fields) | {"model_arch"},
-        allowed_global_keys=stage_fields | runtime_fields,
-        allowed_stage_keys=stage_fields | runtime_fields | {"devices", "num_replicas"},
-    )
-
-
-def strip_parent_engine_args(
-    kwargs: dict[str, Any],
-    *,
-    parent_fields: dict[str, dataclasses.Field],
-    keep_keys: set[str] | frozenset[str] = frozenset(),
-    strip_keys: set[str] | frozenset[str] = frozenset(),
-    no_warn_keys: set[str] | frozenset[str] = frozenset(),
-) -> tuple[dict[str, Any], list[str]]:
-    """Strip parent ``EngineArgs`` fields before merging into stage YAML."""
-    overridden: list[str] = []
-    result: dict[str, Any] = {}
-
-    for key, value in kwargs.items():
-        if key in strip_keys:
-            continue
-
-        if key not in parent_fields or key in keep_keys:
-            result[key] = value
-            continue
-
-        field_def = parent_fields[key]
-        if field_def.default is not dataclasses.MISSING:
-            default = field_def.default
-        elif field_def.default_factory is not dataclasses.MISSING:
-            default = field_def.default_factory()
-        else:
-            default = dataclasses.MISSING
-
-        if default is dataclasses.MISSING or value is None:
-            continue
-
-        if dataclasses.is_dataclass(default) and not isinstance(default, type):
-            default = asdict(default)
-
-        if value != default and key not in no_warn_keys:
-            overridden.append(key)
-
-    return result, sorted(overridden)
 
 
 def _apply_diffusion_parallel_runtime_overrides(
@@ -177,18 +101,6 @@ def _apply_diffusion_parallel_runtime_overrides(
     parallel_config_dict = dict(parallel_config) if parallel_config is not None else None
     degree_overridden = False
     sequence_parallel_explicit = runtime_overrides.get("sequence_parallel_size") is not None
-
-    # Deploy fields are stored flat in yaml_engine_args. Move them into the
-    # existing parallel config before applying higher-priority runtime values.
-    for key in parallel_fields:
-        if key not in engine_args:
-            continue
-        value = engine_args.pop(key)
-        if value is None:
-            continue
-        if parallel_config_dict is None:
-            parallel_config_dict = {}
-        parallel_config_dict.setdefault(key, value)
 
     for key in list(runtime_overrides.keys()):
         value = runtime_overrides.get(key)
@@ -569,12 +481,6 @@ _STAGE_RESERVED_KEYS = frozenset(
 
 # Fields on StageDeployConfig that are populated from engine_args dict
 _STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name not in _STAGE_RESERVED_KEYS}
-_STAGE_SERVICE_ENGINE_FIELDS = frozenset(
-    {
-        "max_generated_image_size",
-        "tts_max_instructions_length",
-    }
-)
 
 
 def deploy_runtime_override_keys() -> frozenset[str]:
@@ -922,25 +828,11 @@ def _build_engine_args(
 
     # Per-stage StageDeployConfig values override pipeline-wide settings.
     if ds is not None:
-        stage_deploy_engine_args: dict[str, Any] = {}
         for k, v in asdict(ds).items():
             if k in _STAGE_RESERVED_KEYS or v is None:
                 continue
-            stage_deploy_engine_args[k] = v
-        stage_deploy_engine_args.update(ds.engine_extras)
-        if ps.execution_type == StageExecutionType.DIFFUSION:
-            from vllm_omni.config.omni_config import omni_stage_raw_input_fields
-            from vllm_omni.diffusion.data import (
-                normalize_and_validate_omni_diffusion_kwargs,
-            )
-
-            normalize_and_validate_omni_diffusion_kwargs(
-                stage_deploy_engine_args,
-                omni_stage_raw_input_fields(),
-                engine_ingress=True,
-                stage_id=ps.stage_id,
-            )
-        engine_args.update(stage_deploy_engine_args)
+            engine_args[k] = v
+        engine_args.update(ds.engine_extras)
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)
@@ -949,7 +841,7 @@ def _build_engine_args(
         # model-owned streaming state. Propagate it to every stage instead of
         # making individual models duplicate the value in connector extras.
         engine_args["duplex_max_sessions"] = deploy.duplex_session.max_sessions
-    if ps.omni_kv_config and engine_args.get("omni_kv_config") is None:
+    if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     return engine_args
 

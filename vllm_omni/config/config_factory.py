@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import json
 from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
@@ -18,7 +19,10 @@ from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 from vllm.transformers_utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
-from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.omni_config import (
+    VllmOmniConfig,
+    normalize_and_validate_diffusion_engine_ingress_kwargs,
+)
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
@@ -26,7 +30,6 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageConfig,
     StageType,
-    build_diffusion_stage_runtime_overrides,
     build_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
@@ -590,16 +593,16 @@ class StageConfigFactory:
         Returns:
             List containing a single config dict for the diffusion stage.
         """
-        from vllm_omni.diffusion.data import (
-            normalize_and_validate_omni_diffusion_kwargs,
-            omni_diffusion_engine_input_fields,
-        )
-
-        kwargs = normalize_and_validate_omni_diffusion_kwargs(
-            kwargs,
-            omni_diffusion_engine_input_fields(),
-            engine_ingress=True,
-            stage_id=0,
+        kwargs = normalize_and_validate_diffusion_engine_ingress_kwargs(kwargs, stage_id=0)
+        default_sampling_params = kwargs.pop("default_sampling_params", None)
+        if isinstance(default_sampling_params, str):
+            try:
+                default_sampling_params = json.loads(default_sampling_params)
+            except json.JSONDecodeError:
+                logger.warning("Invalid default_sampling_params JSON, ignoring stage defaults.")
+                default_sampling_params = None
+        stage_default_sampling_params = (
+            default_sampling_params.get("0", {}) if isinstance(default_sampling_params, Mapping) else {}
         )
 
         # Calculate devices based on parallel config
@@ -643,6 +646,7 @@ class StageConfigFactory:
                 "devices": devices,
             },
             "engine_args": create_config(engine_args),
+            "default_sampling_params": create_config(stage_default_sampling_params),
             "final_output": True,
             "final_output_type": "image",
         }
@@ -662,6 +666,4 @@ class StageConfigFactory:
         server/uvicorn keys are dropped downstream by
         ``filter_dataclass_kwargs(OmniEngineArgs, ...)``.
         """
-        if StageType(stage.stage_type) == StageType.DIFFUSION:
-            return build_diffusion_stage_runtime_overrides(stage.stage_id, cli_overrides)
         return build_stage_runtime_overrides(stage.stage_id, cli_overrides)
