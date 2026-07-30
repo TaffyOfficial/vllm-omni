@@ -18,7 +18,10 @@ from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 from vllm.transformers_utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
-from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.omni_config import (
+    VllmOmniConfig,
+    normalize_and_validate_diffusion_engine_ingress_kwargs,
+)
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
@@ -29,7 +32,6 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
     StageType,
-    build_diffusion_stage_runtime_overrides,
     build_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
@@ -646,17 +648,7 @@ class StageConfigFactory:
         kwargs: dict[str, Any],
     ) -> tuple[dict[str, Any], DiffusionParallelConfig, dict[str, Any], str]:
         """Normalize inputs shared by typed and compatibility diffusion builders."""
-        from vllm_omni.diffusion.data import (
-            normalize_and_validate_omni_diffusion_kwargs,
-            omni_diffusion_engine_input_fields,
-        )
-
-        kwargs = normalize_and_validate_omni_diffusion_kwargs(
-            kwargs,
-            omni_diffusion_engine_input_fields() | {"default_sampling_params", "devices", "stage_0_devices"},
-            engine_ingress=True,
-            stage_id=0,
-        )
+        kwargs = normalize_and_validate_diffusion_engine_ingress_kwargs(kwargs, stage_id=0)
         raw_sampling_params = kwargs.get("default_sampling_params")
         if isinstance(raw_sampling_params, str):
             try:
@@ -783,6 +775,4 @@ class StageConfigFactory:
         server/uvicorn keys are dropped downstream by
         ``filter_dataclass_kwargs(OmniEngineArgs, ...)``.
         """
-        if StageType(stage.stage_type) == StageType.DIFFUSION:
-            return build_diffusion_stage_runtime_overrides(stage.stage_id, cli_overrides)
         return build_stage_runtime_overrides(stage.stage_id, cli_overrides)

@@ -563,26 +563,6 @@ class TestResolveOmniConfig:
         assert resolved.pipeline_config.stages[-1].model_stage == "forced_aligner"
         assert len(resolved.pipeline_config.stages) == len(pipeline.stages) + 1
 
-    def test_rejects_unknown_diffusion_stage_engine_arg(self, mocker: MockerFixture):
-        yaml_config = create_config(
-            {
-                "stage_args": [
-                    {
-                        "stage_id": 0,
-                        "stage_type": "diffusion",
-                        "engine_args": {"enable_sleep_mod": None},
-                    }
-                ],
-            }
-        )
-        mocker.patch(
-            "vllm_omni.entrypoints.utils.load_yaml_config",
-            return_value=yaml_config,
-        )
-
-        with pytest.raises(ValueError, match=r"stage 0.*enable_sleep_mod"):
-            load_stage_configs_from_yaml("fake.yaml")
-
 
 class TestCumulativeStreamingCoercion:
     @pytest.mark.parametrize("skip_clone", [True, False])

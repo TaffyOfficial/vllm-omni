@@ -49,27 +49,22 @@ def _move_diffusion_alias(
     normalized: dict[str, Any],
     legacy_name: str,
     canonical_name: str,
-    *,
-    deprecated: bool = False,
 ) -> None:
     legacy_value = normalized.pop(legacy_name, None)
     if legacy_value is None:
         return
     if normalized.get(canonical_name) is not None:
         raise ValueError(f"Diffusion config fields {legacy_name!r} and {canonical_name!r} cannot both be provided.")
-    if deprecated:
-        warnings.warn(
-            f"Diffusion config field {legacy_name!r} is deprecated; use {canonical_name!r}.",
-            FutureWarning,
-            stacklevel=3,
-        )
+    warnings.warn(
+        f"Diffusion config field {legacy_name!r} is deprecated; use {canonical_name!r}.",
+        FutureWarning,
+        stacklevel=3,
+    )
     normalized[canonical_name] = legacy_value
 
 
 def normalize_omni_diffusion_kwargs(
     raw_kwargs: Mapping[str, Any],
-    *,
-    engine_ingress: bool = False,
 ) -> dict[str, Any]:
     """Normalize legacy diffusion kwargs before config construction."""
     config_kwargs = dict(raw_kwargs)
@@ -82,23 +77,28 @@ def normalize_omni_diffusion_kwargs(
     elif not isinstance(dtype, str):
         raise TypeError(f"Provided dtype must be a string or torch.dtype, got {type(dtype).__name__}")
 
-    for legacy, canonical, deprecated in (
-        ("static_lora_scale", "lora_scale", True),
-        ("quantization", "quantization_config", not engine_ingress),
-        ("diffusion_quantization_config", "quantization_config", False),
-        ("max_batch_size", "max_num_seqs", False),
-        ("kv_cache_skip_steps", "diffusion_kv_cache_skip_steps", False),
-        ("kv_cache_skip_layers", "diffusion_kv_cache_skip_layers", False),
+    for legacy, canonical in (
+        ("static_lora_scale", "lora_scale"),
+        ("quantization", "quantization_config"),
+        ("diffusion_quantization_config", "quantization_config"),
+        ("max_batch_size", "max_num_seqs"),
+        ("kv_cache_skip_steps", "diffusion_kv_cache_skip_steps"),
+        ("kv_cache_skip_layers", "diffusion_kv_cache_skip_layers"),
     ):
-        _move_diffusion_alias(config_kwargs, legacy, canonical, deprecated=deprecated)
-    if not engine_ingress:
-        _move_diffusion_alias(config_kwargs, "kv_cache_dtype", "diffusion_kv_cache_dtype")
+        _move_diffusion_alias(config_kwargs, legacy, canonical)
+    _move_diffusion_alias(config_kwargs, "kv_cache_dtype", "diffusion_kv_cache_dtype")
 
     # Handle "diffusion_attention_backend" shorthand: merge into
     # diffusion_attention_config before field filtering.
     diffusion_attn_backend = config_kwargs.pop("diffusion_attention_backend", None)
     fastvideo_vsa_topk = config_kwargs.pop("fastvideo_vsa_topk", None)
     if diffusion_attn_backend is not None or fastvideo_vsa_topk is not None:
+        if diffusion_attn_backend is not None:
+            warnings.warn(
+                "Diffusion config field 'diffusion_attention_backend' is deprecated; use 'diffusion_attention_config'.",
+                FutureWarning,
+                stacklevel=2,
+            )
         existing = config_kwargs.get("diffusion_attention_config")
         config_kwargs["diffusion_attention_config"] = parse_attention_config(
             existing,
@@ -179,23 +179,18 @@ def validate_dlo_host_registration_options(
     return value
 
 
-def normalize_and_validate_omni_diffusion_kwargs(
+def validate_omni_diffusion_kwargs(
     kwargs: Mapping[str, Any],
     allowed_fields: set[str] | frozenset[str],
     *,
-    engine_ingress: bool = False,
     stage_id: int | str | None = None,
-) -> dict[str, Any]:
-    """Normalize aliases, then reject every field without an owner."""
-    normalized = normalize_omni_diffusion_kwargs(kwargs, engine_ingress=engine_ingress)
-    unknown = set(normalized) - allowed_fields
-    if engine_ingress and "kv_cache_dtype" in normalized:
-        unknown.add("kv_cache_dtype")
+) -> None:
+    """Reject every field without an owner."""
+    unknown = set(kwargs) - allowed_fields
     if unknown:
         names = ", ".join(repr(name) for name in sorted(unknown))
         suffix = "" if stage_id is None else f" for stage {stage_id}"
         raise ValueError(f"Unknown diffusion config field(s){suffix}: {names}")
-    return normalized
 
 
 def parse_kv_cache_skip_selector(
@@ -1668,7 +1663,8 @@ class OmniDiffusionConfig:
     @classmethod
     def normalize_init_kwargs(cls, raw_kwargs: Mapping[str, Any]) -> dict[str, Any]:
         valid_fields = frozenset(f.name for f in fields(cls))
-        config_kwargs = normalize_and_validate_omni_diffusion_kwargs(raw_kwargs, valid_fields)
+        config_kwargs = normalize_omni_diffusion_kwargs(raw_kwargs)
+        validate_omni_diffusion_kwargs(config_kwargs, valid_fields)
         # Remaining ``None`` values mean "unset" at the CLI/deploy boundary.
         # Drop them so non-optional dataclass defaults are not overwritten.
         # Fields where ``None`` has normalization semantics (for example dtype
@@ -1678,26 +1674,6 @@ class OmniDiffusionConfig:
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
         return cls(**cls.normalize_init_kwargs(kwargs))
-
-
-def omni_diffusion_engine_input_fields() -> frozenset[str]:
-    """Raw stage inputs that have a diffusion or parallel-config consumer."""
-    compatibility_fields = {
-        "auxiliary_text_encoder",
-        "diffusion_attention_backend",
-        "diffusion_quantization_config",
-        "kv_cache_skip_layers",
-        "kv_cache_skip_steps",
-        "max_batch_size",
-        "quantization",
-        "static_lora_scale",
-    }
-    return (
-        frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
-        - {"cfg_kv_collect_func", "scheduler_port"}
-        | frozenset(config_field.name for config_field in fields(DiffusionParallelConfig))
-        | compatibility_fields
-    )
 
 
 DIFFUSION_REQUEST_LIFECYCLE_KEY = "_diffusion_request_lifecycle"
