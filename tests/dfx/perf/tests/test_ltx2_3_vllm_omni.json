@@ -2,6 +2,18 @@
     {
         "test_name": "test_ltx2_3_baseline_eager",
         "description": "LTX-2.3 T2V single-device baseline with enforce-eager and diffusion pipeline profiling",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "cuda": "H100"
+                    },
+                    "num_cards": 1
+                }
+            },
+            "full_model",
+            "diffusion"
+        ],
         "server_type": "vllm-omni",
         "server_params": {
             "model": "diffusers/LTX-2.3-Diffusers",
@@ -34,7 +46,7 @@
                 "max-concurrency": 1,
                 "baseline-tolerance": 0.1,
                 "baseline": {
-                    "stage_durations_mean.stage_0_gen_ms": 5516.92,
+                    "stage_durations_mean.stage_0_gen_ms": 5962.89,
                     "peak_memory_mb_mean": 72462
                 }
             }
@@ -43,6 +55,18 @@
     {
         "test_name": "test_ltx2_3_torch_compile",
         "description": "LTX-2.3 T2V single-device torch.compile path with diffusion pipeline profiling",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "cuda": "H100"
+                    },
+                    "num_cards": 1
+                }
+            },
+            "full_model",
+            "diffusion"
+        ],
         "server_type": "vllm-omni",
         "server_params": {
             "model": "diffusers/LTX-2.3-Diffusers",
@@ -77,7 +101,7 @@
                 "warmup-num-frames": 25,
                 "baseline-tolerance": 0.1,
                 "baseline": {
-                    "stage_durations_mean.stage_0_gen_ms": 4195.83,
+                    "stage_durations_mean.stage_0_gen_ms": 4580.59,
                     "peak_memory_mb_mean": 72464
                 }
             }

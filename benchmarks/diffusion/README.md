@@ -153,3 +153,13 @@ batch may still pay compile or CUDA-graph capture cost.
 
 For a Qwen-Image continuous-batching replay example, see
 [`performance_dashboard/qwen_image_serving_performance.md`](./performance_dashboard/qwen_image_serving_performance.md).
+
+## 4. LTX-2.3 T2V reference results
+
+These H200 reference results are informational only. The nightly CI guard uses
+same-resource H100 baselines from `tests/dfx/perf/tests/test_ltx2_3_vllm_omni.json`.
+
+| Case | Hardware | Workload | `stage_durations_mean.stage_0_gen_ms` | `peak_memory_mb_mean` |
+| ---- | -------- | -------- | ------------------------------------: | --------------------: |
+| eager | 1x H200 | 512x384, 25 frames, 20 steps, 3 prompts | 5524.8085 | 72462 |
+| torch.compile | 1x H200 | 512x384, 25 frames, 20 steps, 3 prompts | 4204.0232 | 72464 |
