@@ -663,6 +663,11 @@ class StageConfigFactory:
         parallel_config = DiffusionParallelConfig.from_stage_overrides(kwargs)
         if kwargs.get("num_gpus") is not None:
             parallel_config.resolve_data_parallel_size(int(kwargs["num_gpus"]))
+        # Ingress keeps the engine spelling; canonicalize it before filtering
+        # to terminal diffusion fields. Conflicts were validated at ingress.
+        quantization = kwargs.pop("quantization", None)
+        if quantization is not None:
+            kwargs["quantization_config"] = quantization
         diffusion_config_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
         engine_args = OmniDiffusionConfig.normalize_init_kwargs(
             {name: value for name, value in kwargs.items() if name in diffusion_config_fields}

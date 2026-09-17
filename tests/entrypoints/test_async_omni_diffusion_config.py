@@ -824,6 +824,24 @@ def test_default_stage_config_includes_quantization_config():
     assert stage_cfg["engine_args"]["quantization_config"] == quantization_config
 
 
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+def test_default_diffusion_factory_preserves_engine_quantization(typed, monkeypatch):
+    monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda _self: 29500)
+    monkeypatch.setattr(OmniDiffusionConfig, "enrich_config", lambda _self: None)
+    kwargs = {"quantization": "fp8"}
+
+    if typed:
+        stage = StageConfigFactory.create_typed_default_diffusion("generic-diffusion", kwargs).stage_configs[0]
+        config = stage.diffusion_config
+        config.enrich_config()
+    else:
+        config = _terminal_config(StageConfigFactory.create_default_diffusion(kwargs)[0])
+
+    assert config.quantization_config is not None
+    assert config.quantization_config.get_name() == "fp8"
+    assert config.quantization_config_is_auto_detected is False
+
+
 @pytest.mark.parametrize("model_class_name", ["HeliosPipeline", "HunyuanVideo15Pipeline"])
 def test_generic_diffusion_uses_canonical_video_output_type(model_class_name):
     config = StageConfigFactory.create_typed_default_diffusion(

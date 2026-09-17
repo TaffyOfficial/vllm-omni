@@ -1340,7 +1340,7 @@ def normalize_and_validate_diffusion_engine_ingress_kwargs(
     *,
     stage_id: int | str,
 ) -> dict[str, Any]:
-    """Normalize raw diffusion-engine input before a default factory filters it."""
+    """Normalize and validate raw diffusion input without inserting defaults."""
     from vllm_omni.diffusion.data import (
         OmniDiffusionConfig,
         normalize_omni_diffusion_kwargs,
@@ -1354,7 +1354,7 @@ def normalize_and_validate_diffusion_engine_ingress_kwargs(
         for name in _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS | {"quantization"}
         if name in mixed_kwargs
     }
-    normalized = normalize_omni_diffusion_kwargs(mixed_kwargs)
+    normalized = normalize_omni_diffusion_kwargs(mixed_kwargs, apply_defaults=False)
     if engine_owned.get("quantization") is not None and normalized.get("quantization_config") is not None:
         raise ValueError("Diffusion config fields 'quantization' and 'quantization_config' cannot both be provided.")
     normalized.update(engine_owned)

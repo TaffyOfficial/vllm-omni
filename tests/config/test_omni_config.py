@@ -514,9 +514,38 @@ def test_from_pipeline_config_keeps_global_kv_cache_dtype_outside_diffusion_stag
 def test_stage_cli_field_selection_defers_ownership_validation_until_sources_are_merged():
     assert omni_config_module._stage_cli_overrides(
         0,
-        StageExecutionType.LLM_AR,
         {"enable_lora": True},
+        execution_type=StageExecutionType.LLM_AR,
     ) == {"enable_lora": True}
+
+
+@pytest.mark.parametrize(
+    ("cli_overrides", "expected_dtype"),
+    [
+        ({}, torch.float32),
+        ({"dtype": None}, torch.float32),
+        ({"dtype": "float16"}, torch.float16),
+        ({"dtype": "auto"}, torch.bfloat16),
+        ({"stage_0_dtype": "bfloat16"}, torch.bfloat16),
+    ],
+)
+def test_diffusion_deploy_dtype_survives_unset_cli_overrides(cli_overrides, expected_dtype):
+    stage = _build_single_diffusion_config(
+        engine_extras={"dtype": "float32", "cache_backend": "tea_cache"},
+        cli_overrides=cli_overrides,
+    ).stage_by_id(0)
+
+    assert stage.diffusion_config.dtype == expected_dtype
+    assert stage.diffusion_config.cache_backend == "tea_cache"
+
+
+def test_diffusion_ingress_defers_defaults(monkeypatch):
+    monkeypatch.setenv("DIFFUSION_CACHE_BACKEND", "tea_cache")
+
+    assert omni_config_module.normalize_and_validate_diffusion_engine_ingress_kwargs({}, stage_id=0) == {}
+    assert omni_config_module.normalize_and_validate_diffusion_engine_ingress_kwargs(
+        {"dtype": None, "cache_backend": None}, stage_id=0
+    ) == {"dtype": None, "cache_backend": None}
 
 
 @pytest.mark.parametrize(

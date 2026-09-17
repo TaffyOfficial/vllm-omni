@@ -65,13 +65,16 @@ def _move_diffusion_alias(
 
 def normalize_omni_diffusion_kwargs(
     raw_kwargs: Mapping[str, Any],
+    *,
+    apply_defaults: bool = True,
 ) -> dict[str, Any]:
-    """Normalize legacy diffusion kwargs before config construction."""
+    """Normalize diffusion kwargs, deferring defaults until sources are merged."""
     config_kwargs = dict(raw_kwargs)
 
     dtype = config_kwargs.get("dtype")
     if dtype is None:
-        config_kwargs["dtype"] = "auto"
+        if apply_defaults:
+            config_kwargs["dtype"] = "auto"
     elif isinstance(dtype, torch.dtype):
         config_kwargs["dtype"] = str(dtype).removeprefix("torch.")
     elif not isinstance(dtype, str):
@@ -119,10 +122,10 @@ def normalize_omni_diffusion_kwargs(
 
     # Check environment variable as fallback for cache_backend.
     # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND.
-    if "cache_backend" not in config_kwargs:
+    if "cache_backend" not in config_kwargs and apply_defaults:
         cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
         config_kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
-    elif config_kwargs["cache_backend"] is None:
+    elif "cache_backend" in config_kwargs and config_kwargs["cache_backend"] is None and apply_defaults:
         # Callers (e.g. example CLIs with `default=None`) pass an explicit
         # None for "no cache"; canonicalize it so every consumer sees the
         # declared `str` value instead of relying on per-model None handling.
