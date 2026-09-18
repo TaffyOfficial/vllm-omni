@@ -515,7 +515,6 @@ def test_stage_cli_field_selection_defers_ownership_validation_until_sources_are
     assert omni_config_module._stage_cli_overrides(
         0,
         {"enable_lora": True},
-        execution_type=StageExecutionType.LLM_AR,
     ) == {"enable_lora": True}
 
 
