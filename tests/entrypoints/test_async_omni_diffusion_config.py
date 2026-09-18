@@ -9,7 +9,7 @@ import torch
 from pydantic import ValidationError
 
 from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.config.omni_config import VllmOmniDiffusionStageConfig
+from vllm_omni.config.omni_config import VllmOmniDiffusionStageConfig, extract_diffusion_stage_config_kwargs
 from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
 from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
 from vllm_omni.engine import stage_init_utils
@@ -21,7 +21,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _terminal_config(stage_cfg: dict) -> OmniDiffusionConfig:
-    return OmniDiffusionConfig.from_kwargs(**stage_cfg["engine_args"])
+    kwargs = extract_diffusion_stage_config_kwargs(stage_cfg["engine_args"], stage_id=stage_cfg["stage_id"])
+    return OmniDiffusionConfig.from_kwargs(**kwargs)
 
 
 def test_default_stage_config_includes_cache_backend():
@@ -738,10 +739,11 @@ def test_serve_cli_rejects_invalid_request_batch_max_wait_ms(bad_wait: str):
         )
 
 
-def test_serve_cli_accepts_additional_config():
+@pytest.mark.parametrize("subcommand_dest", ["command", "subparser"])
+def test_serve_cli_accepts_additional_config(subcommand_dest):
     """Ensure diffusion serve CLI exposes additional_config and forwards it to stage config."""
     parser = TrackingArgumentParser()
-    subparsers = parser.add_subparsers(dest="command")
+    subparsers = parser.add_subparsers(dest=subcommand_dest)
     OmniServeCommand().subparser_init(subparsers)
 
     args = parser.parse_args(
@@ -754,7 +756,7 @@ def test_serve_cli_accepts_additional_config():
         ]
     )
 
-    stage_cfg = StageConfigFactory.create_default_diffusion(vars(args))[0]
+    stage_cfg = StageConfigFactory.create_default_diffusion(args.get_explicit_kwargs_dict())[0]
 
     engine_args = stage_cfg["engine_args"]
 

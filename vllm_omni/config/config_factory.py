@@ -648,6 +648,13 @@ class StageConfigFactory:
         kwargs: dict[str, Any],
     ) -> tuple[dict[str, Any], DiffusionParallelConfig, dict[str, Any], str]:
         """Normalize inputs shared by typed and compatibility diffusion builders."""
+        # Preserve the default builder's explicit top-level override of model
+        # extras before the strict same-source alias validator runs.
+        if kwargs.get("auxiliary_text_encoder") is not None:
+            kwargs = dict(kwargs)
+            extras = dict(kwargs.get("extras") or {})
+            extras.pop("auxiliary_text_encoder", None)
+            kwargs["extras"] = extras
         kwargs = normalize_and_validate_diffusion_engine_ingress_kwargs(kwargs, stage_id=0)
         raw_sampling_params = kwargs.get("default_sampling_params")
         if isinstance(raw_sampling_params, str):

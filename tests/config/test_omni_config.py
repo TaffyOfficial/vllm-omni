@@ -164,6 +164,7 @@ def _build_single_diffusion_config(
                 stage_id=0,
                 model_stage="diffusion",
                 execution_type=StageExecutionType.DIFFUSION,
+                final_output=True,
             ),
         ),
     )
@@ -1562,7 +1563,10 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 
     engine_args = build_engine_args_dict_from_omni_stage_config(stage, model=str(tmp_path))
-    od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
+    diffusion_kwargs = omni_config_module.extract_diffusion_stage_config_kwargs(
+        engine_args, stage_id=stage.stage_id, include_engine_adapter_metadata=True
+    )
+    od_config = OmniDiffusionConfig.from_kwargs(**diffusion_kwargs)
     assert od_config.kv_transfer_config.engine_id == "dit-engine-1"
 
 

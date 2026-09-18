@@ -82,6 +82,7 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "omni",
         "output_modalities",
         "stage_id",
+        "subparser",
         "tokenizer",
     }
 )
@@ -422,6 +423,10 @@ def _validate_global_stage_cli_ownership(
         field for stage in pipeline.stages for field in _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[stage.execution_type]
     }
     unowned_fields = explicit_global_fields - owned_fields
+    if any(stage.execution_type == StageExecutionType.DIFFUSION for stage in pipeline.stages):
+        # Mixed engine ingress accepts these shared globals, but diffusion
+        # stages deliberately leave them outside their terminal config.
+        unowned_fields -= _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
     if unowned_fields:
         names = ", ".join(sorted(unowned_fields))
         raise ValueError(
@@ -1319,8 +1324,13 @@ _DIFFUSION_STAGE_METADATA_FIELDS = frozenset(
 
 _DIFFUSION_ENGINE_ADAPTER_METADATA_FIELDS = frozenset(
     {
+        # Serialized shared model settings are consumed outside the terminal
+        # diffusion config; accepting them here does not widen raw ingress.
+        "duplex_max_sessions",
         "has_sampling_extra_args",
+        "requires_full_payload_input",
         "sampling_extra_args_keys",
+        "session_mode",
     }
 )
 _DIFFUSION_DEFAULT_FACTORY_FIELDS = frozenset(
@@ -1330,7 +1340,7 @@ _DIFFUSION_DEFAULT_FACTORY_FIELDS = frozenset(
 
 def _frontend_cli_fields() -> frozenset[str]:
     """Return vLLM server fields that are consumed before stage startup."""
-    from vllm.entrypoints.openai.cli_args import FrontendArgs
+    from vllm.entrypoints.launchers.cli_args import FrontendArgs
 
     return frozenset(config_field.name for config_field in fields(FrontendArgs))
 
