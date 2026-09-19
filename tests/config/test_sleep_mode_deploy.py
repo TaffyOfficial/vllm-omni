@@ -34,6 +34,8 @@ def test_sleep_deploy_resolves_expected_stages(diffusion_only, tp_size):
         assert stage.model_config.enable_sleep_mode is True
         assert stage.parallel_config.tensor_parallel_size == tp_size
         assert stage.runtime_config.devices == ",".join(str(stage.stage_id * tp_size + rank) for rank in range(tp_size))
+        if not is_diffusion:
+            assert stage.cache_config.gpu_memory_utilization == 0.8
         if is_diffusion:
             engine_args = build_engine_args_dict_from_omni_stage_config(stage, "test-bagel")
             terminal = OmniDiffusionConfig.from_kwargs(

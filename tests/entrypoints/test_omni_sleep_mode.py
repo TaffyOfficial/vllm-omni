@@ -125,7 +125,9 @@ def _sleep_deploy_config(*, diffusion_only: bool = False, tp_size: int = 1) -> s
                     "enable_sleep_mode": True,
                     "enforce_eager": True,
                     "dtype": "bfloat16",
-                    "gpu_memory_utilization": 0.4,
+                    # Stages use disjoint GPUs. On an 80 GiB H100, 40% cannot
+                    # fit TP=1 Thinker weights, activation peaks and KV cache.
+                    "gpu_memory_utilization": 0.8 if not diffusion_only and stage_id == 0 else 0.4,
                 }
                 for stage_id in stage_ids
             }
