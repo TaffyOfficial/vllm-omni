@@ -1328,6 +1328,7 @@ _DIFFUSION_ENGINE_ADAPTER_METADATA_FIELDS = frozenset(
         # diffusion config; accepting them here does not widen raw ingress.
         "duplex_max_sessions",
         "has_sampling_extra_args",
+        "inline_diffusion",
         "requires_full_payload_input",
         "sampling_extra_args_keys",
         "session_mode",
@@ -1383,6 +1384,9 @@ def normalize_and_validate_diffusion_engine_ingress_kwargs(
         | _NON_STAGE_ENGINE_CLI_FIELDS
         | _frontend_cli_fields()
         | orchestrator_field_names()
+        # Coordination fields also live on the typed orchestrator config, not
+        # all of them are present on the CLI-only OrchestratorArgs dataclass.
+        | frozenset(config_field.name for config_field in fields(VllmOmniOrchestratorConfig))
     )
     allowed_fields = stage_consumed_fields | externally_consumed_fields
     validate_omni_diffusion_kwargs(normalized, allowed_fields, stage_id=stage_id)

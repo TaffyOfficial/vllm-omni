@@ -539,6 +539,20 @@ def test_diffusion_deploy_dtype_survives_unset_cli_overrides(cli_overrides, expe
     assert stage.diffusion_config.cache_backend == "tea_cache"
 
 
+@pytest.mark.parametrize(
+    "coordination_kwargs",
+    [
+        {"omni_master_address": "127.0.0.1", "omni_master_port": 30000},
+        {"omni_dp_size_local": 2, "omni_heartbeat_timeout": 60.0, "omni_lb_policy": "random"},
+    ],
+)
+def test_diffusion_ingress_routes_coordination_fields_away(coordination_kwargs):
+    normalize = omni_config_module.normalize_and_validate_diffusion_engine_ingress_kwargs
+    assert normalize({**coordination_kwargs, "enable_sleep_mode": True}, stage_id=0) == {"enable_sleep_mode": True}
+    with pytest.raises(ValueError, match="omni_master_adress"):
+        normalize({**coordination_kwargs, "omni_master_adress": "typo"}, stage_id=0)
+
+
 def test_diffusion_ingress_defers_defaults(monkeypatch):
     monkeypatch.setenv("DIFFUSION_CACHE_BACKEND", "tea_cache")
 
