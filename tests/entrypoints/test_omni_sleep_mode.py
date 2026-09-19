@@ -125,8 +125,6 @@ def _sleep_deploy_config(*, diffusion_only: bool = False, tp_size: int = 1) -> s
                     "enable_sleep_mode": True,
                     "enforce_eager": True,
                     "dtype": "bfloat16",
-                    "max_model_len": 2048,
-                    "max_num_batched_tokens": 8192,
                     "gpu_memory_utilization": 0.4,
                 }
                 for stage_id in stage_ids

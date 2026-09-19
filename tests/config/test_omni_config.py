@@ -549,8 +549,8 @@ def test_diffusion_deploy_dtype_survives_unset_cli_overrides(cli_overrides, expe
 def test_diffusion_ingress_routes_coordination_fields_away(coordination_kwargs):
     normalize = omni_config_module.normalize_and_validate_diffusion_engine_ingress_kwargs
     assert normalize({**coordination_kwargs, "enable_sleep_mode": True}, stage_id=0) == {"enable_sleep_mode": True}
-    with pytest.raises(ValueError, match="omni_master_adress"):
-        normalize({**coordination_kwargs, "omni_master_adress": "typo"}, stage_id=0)
+    with pytest.raises(ValueError, match="omni_master_unknown_field"):
+        normalize({**coordination_kwargs, "omni_master_unknown_field": "unknown"}, stage_id=0)
 
 
 def test_diffusion_ingress_defers_defaults(monkeypatch):

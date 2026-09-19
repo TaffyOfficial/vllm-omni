@@ -29,6 +29,8 @@ def test_sleep_deploy_resolves_expected_stages(diffusion_only, tp_size):
     for stage in config.stage_configs:
         is_diffusion = diffusion_only or stage.stage_id == 1
         assert isinstance(stage, VllmOmniDiffusionStageConfig) == is_diffusion
+        # Keep BAGEL's batch budget: a single multimodal item needs 8625 tokens.
+        assert stage.scheduler_config.max_num_batched_tokens == 32768
         assert stage.model_config.enable_sleep_mode is True
         assert stage.parallel_config.tensor_parallel_size == tp_size
         assert stage.runtime_config.devices == ",".join(str(stage.stage_id * tp_size + rank) for rank in range(tp_size))
